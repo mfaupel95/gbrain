@@ -10,6 +10,7 @@ import type { Check } from '../../doctor.ts';
 // isn't imported from extract-conversation-facts.ts directly (#4135).
 import { ALLOWED_TYPES, conversationFactsEligibleSql, pageTypesForAllowed, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
 import { checkError } from '../check-fix.ts';
+import { PASS_FLOOR_THRESHOLD, PASS_MEAN_THRESHOLD } from '../../../core/cross-modal-eval/aggregate.ts';
 
 /**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
@@ -27,7 +28,7 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
     const overrides = await engine.listConfigKeys('search.');
     // Exclude search.mode itself + the upgrade-notice state key from the
     // override roster — they aren't knobs.
-    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown');
+    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown' && k !== 'search.mode_source');
 
     const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
     const loaded = await loadSearchModeConfig(engine);
@@ -42,10 +43,11 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
       return { name: 'search_mode', status: 'ok', message: context };
     }
 
-    // v0.48.2: installs from v0.46.3–v0.47.10 carry an explicit
-    // `search.reranker.model voyage:rerank-2.5` row init wrote before the
-    // bundle default caught up. It is now redundant, but `--reset` would also
-    // wipe every OTHER tuned search.* knob — name the exact key instead.
+    // An explicit `search.reranker.model` equal to the bundle default is
+    // redundant, but `--reset` would also wipe every OTHER tuned search.*
+    // knob — name the exact key instead. (Installs from v0.46.3–v0.47.10
+    // carry an init-written `voyage:rerank-2.5` row; since the default moved
+    // to rerank-3-lite that row is a real pin and keeps them on rerank-2.5.)
     const redundant: string[] = [];
     if (resetReranker !== undefined) {
       const explicitModel = await engine.getConfig('search.reranker.model');
@@ -198,7 +200,7 @@ export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Ch
  * is mid-transition and retrieval may be degraded until it drains. Warn with
  * the exact resume + status commands.
  */
-export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise<Check> {
+export async function checkEmbeddingMigrationState(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const { readMigrationState, migrationSignature, renderResumeCommand } = await import('../../../core/embedding-migration.ts');
     const marker = await readMigrationState(engine);
@@ -215,10 +217,14 @@ export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise
     const s = marker.state;
     let staleNote = '';
     try {
-      const stale = await engine.countStaleChunks({
-        signature: migrationSignature(s.to_model, s.to_dims),
-        includeNullSignature: true,
-      });
+      const signature = migrationSignature(s.to_model, s.to_dims);
+      // A remote caller's grant counts only its own sources' chunks.
+      let stale = 0;
+      if (opts.sourceIds) {
+        for (const sourceId of opts.sourceIds) stale += await engine.countStaleChunks({ sourceId, signature, includeNullSignature: true });
+      } else {
+        stale = await engine.countStaleChunks({ signature, includeNullSignature: true });
+      }
       staleNote = `; ${stale} chunk(s) not yet in the target space`;
     } catch { /* count is best-effort */ }
     return {
@@ -475,9 +481,61 @@ function judgePanelNote(event: ProbeJudgePanelFields): string {
   return panel;
 }
 
+interface ProbeFailureFields {
+  failures?: ReadonlyArray<{ question_id?: string; dimensions?: ReadonlyArray<{ dimension: string; mean?: number; scores?: ReadonlyArray<number | null>; fail_reason: string }> }>;
+  reader_model?: string;
+  receipt_dir?: string;
+}
+
+/**
+ * #7145: which judge dimension the non-PASS runs failed on, against the bar (every dimension's mean across judges
+ * >= PASS_MEAN_THRESHOLD and every judge >= PASS_FLOOR_THRESHOLD, on the 1-10 scale), what the dimension asks
+ * (`rubric`: the probe's own dimension texts, PROBE_QA_DIMENSIONS), and where to look. A dimension failing while
+ * correctness never does means the answers were right and judged on style: the reader or the rubric, not retrieval.
+ * Empty when no run recorded a failing dimension.
+ */
+function probeFailureExplanation(bad: ReadonlyArray<ProbeFailureFields>, rubric: readonly string[]): { text: string; details?: Record<string, unknown> } {
+  const tally = new Map<string, { runs: number; questions: number; means: number[]; reasons: Set<string> }>();
+  for (const event of bad) {
+    const seen = new Set<string>();
+    for (const failure of event.failures ?? []) {
+      for (const d of failure.dimensions ?? []) {
+        const key = d.dimension.trim().toLowerCase();
+        const t = tally.get(key) ?? { runs: 0, questions: 0, means: [], reasons: new Set<string>() };
+        if (!seen.has(key)) { t.runs++; seen.add(key); }
+        t.questions++;
+        if (typeof d.mean === 'number' && Number.isFinite(d.mean)) t.means.push(d.mean);
+        t.reasons.add(d.fail_reason);
+        tally.set(key, t);
+      }
+    }
+  }
+  if (tally.size === 0) return { text: '' };
+  const dims = [...tally].sort((a, b) => b[1].questions - a[1].questions).map(([dimension, t]) => ({ dimension, runs: t.runs, questions: t.questions,
+    mean_min: t.means.length ? Math.min(...t.means) : null, mean_max: t.means.length ? Math.max(...t.means) : null, fail_reasons: [...t.reasons].sort() }));
+  const asks = (dimension: string) => rubric.find(r => r.split('—')[0]!.trim().toLowerCase() === dimension)?.split('—')[1]?.trim();
+  const range = (d: typeof dims[number]) => d.mean_min === null ? '' : `, judge mean ${d.mean_min}${d.mean_max !== d.mean_min ? `-${d.mean_max}` : ''}`;
+  const parts = dims.map(d => `${d.dimension} in ${plural(d.runs, 'run')} (${plural(d.questions, 'question')}${range(d)}; ${d.fail_reasons.join(', ')})`);
+  const top = dims[0]!;
+  const question = asks(top.dimension);
+  const styleOnly = !tally.has('correctness');
+  const latest = bad[bad.length - 1]!;
+  const receipt = [...bad].reverse().find(e => typeof e.receipt_dir === 'string')?.receipt_dir;
+  const text = ` Failing judge dimension(s): ${parts.join('; ')}. The bar is a mean of at least ${PASS_MEAN_THRESHOLD} across judges and no judge below ${PASS_FLOOR_THRESHOLD}, on a 1-10 scale.`
+    + (question ? ` ${top.dimension} asks: ${question}` : '')
+    + (styleOnly ? ` Correctness never failed, so the answers matched the expected facts and were judged on ${top.dimension} alone: this points at the reader's answer style`
+      + `${latest.reader_model ? ` (reader ${latest.reader_model})` : ''} or the judges' rubric, not at retrieval or your brain.` : '')
+    + ` Next: read the answers and per-judge scores the run kept ${receipt ? `in ${receipt} (lme-output.jsonl, summary.json)` : "under the audit dir's nightly-probe/ receipts"}; `
+    + 'an answer carrying notes or reasoning means the reader ran without --reader-mode direct (an autopilot daemon started before an upgrade keeps running the old probe: restart it); '
+    + "a terse correct answer scored low means the judges' rubric needs recalibrating (models.eval.cross_modal.slot_a, slot_b and slot_c choose the judges, models.eval.longmemeval the reader).";
+  return { text, details: { failing_dimensions: dims, bar: { mean_at_least: PASS_MEAN_THRESHOLD, every_judge_at_least: PASS_FLOOR_THRESHOLD, scale: '1-10' }, correctness_failed: !styleOnly,
+    ...(latest.reader_model ? { reader_model: latest.reader_model } : {}), ...(receipt ? { receipt_dir: receipt } : {}) } };
+}
+
 export function computeNightlyQualityProbeHealthCheck(
   probeEnabled: boolean,
-  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string } & ProbeJudgePanelFields>,
+  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string } & ProbeJudgePanelFields & ProbeFailureFields>,
+  rubric: readonly string[] = [],
 ): Check {
   const name = 'nightly_quality_probe_health';
   if (!probeEnabled && events.length === 0) {
@@ -512,10 +570,12 @@ export function computeNightlyQualityProbeHealthCheck(
       `no_embed_key=${events.filter(e => e.outcome === 'no_embedding_key').length} ` +
       `rate_limited=${events.filter(e => e.outcome === 'rate_limited').length}` +
       (skipped > 0 ? ` skipped=${skipped}` : '');
+    const explained = probeFailureExplanation(bad, rubric);
     return {
       name,
       status: 'warn',
-      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.${judgePanelNote(latest)}`,
+      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.${judgePanelNote(latest)}${explained.text}`,
+      ...(explained.details ? { details: explained.details } : {}),
     };
   }
   return {

@@ -37,6 +37,8 @@ import {
   saveBackupStatus,
   currentBackupEvidence,
   isVerifiedRecoverable,
+  isRemoteTimeout,
+  isRepoAsset,
   assetBlocksRecovery,
   BACKUP_VERIFICATION_MAX_AGE_MS,
   BACKUP_RECOVERY_SCOPE,
@@ -44,7 +46,7 @@ import {
   type BackupComputedBy,
   type BackupStatus,
 } from './status-file.ts';
-import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, type RemoteProbeBudget } from './repository.ts';
+import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, BACKUP_REMOTE_TIMEOUT_KEY, budgetAllowsProbe, resolveBackupRemoteTimeoutMs, type RemoteProbeBudget } from './repository.ts';
 
 /** No silent caps: at most this many deduped git roots are probed per run;
  * anything beyond is logged as skipped. */
@@ -141,7 +143,7 @@ export async function computeBackupCoverage(
   const now = opts.now ?? new Date();
   const assets: BackupAssetVerdict[] = [];
   const remoteBudget: RemoteProbeBudget | undefined = opts.localGitProbes === true && opts.verifyRemoteRefs === true
-    ? { remaining: BACKUP_REMOTE_PROBE_CAP } : undefined;
+    ? { remaining: BACKUP_REMOTE_PROBE_CAP, timeoutMs: resolveBackupRemoteTimeoutMs(await Promise.resolve().then(() => engine.getConfig(BACKUP_REMOTE_TIMEOUT_KEY)).catch(() => null)) } : undefined;
   const previousAge = now.getTime() - Date.parse(opts.previousStatus?.checked_at ?? '');
   const previous = opts.localGitProbes === true && opts.previousStatus && !opts.previousStatus.degraded
     && Number.isFinite(previousAge) && previousAge >= 0 && !isBackupStatusStale(opts.previousStatus, now.getTime())
@@ -323,14 +325,16 @@ export async function computeBackupCoverage(
     });
     for (const { root, index } of ordered) {
       const asset = assets[index];
-      if (remoteBudget.remaining <= 0 || (remoteBudget.deadline !== undefined && Date.now() >= remoteBudget.deadline)) {
+      if (!budgetAllowsProbe(remoteBudget)) {
         if (asset.verification?.state !== 'verified') {
           asset.verification = { ...asset.verification, state: 'budget_exhausted' };
         }
         continue;
       }
       await yieldLoop();
-      assets[index] = await assessBackupRepository(root, asset.kind as 'source_repo' | 'bootstrap_workspace', asset.id, now, remoteBudget);
+      const probed = await assessBackupRepository(root, asset.kind as 'source_repo' | 'bootstrap_workspace', asset.id, now, remoteBudget);
+      // A deferred probe (the slot closed between the pre-check and the call) keeps first-pass verified evidence; a real transport failure still supersedes it.
+      assets[index] = probed.verification?.state === 'budget_exhausted' && asset.verification?.state === 'verified' ? asset : probed;
     }
   }
 
@@ -388,6 +392,7 @@ export async function computeBackupCoverage(
     failing: assets.filter((a) => a.state === 'failing').length,
     configured_repos: assets.filter(a => a.configured_remote === true).length,
     recoverable_repos: assets.filter(isVerifiedRecoverable).length,
+    remote_timeouts: assets.filter(isRemoteTimeout).length,
     pages_at_risk: pagesAtRisk,
   };
   const maturity = assets.some(assetBlocksRecovery) ? await brainMaturity(engine) : undefined;
@@ -424,6 +429,26 @@ function operatingOnHostBrain(): boolean {
   }
 }
 
+/** Minimum gap between two continuation sweeps, so a burst of doctor calls shares one probe pass. */
+export const BACKUP_CONTINUATION_THROTTLE_MS = 60_000;
+
+/**
+ * #6614/#6687: a cached verdict still owes remote probes when a configured
+ * repository was cut off by the per-call budget or holds verified evidence
+ * older than the evidence window. Real failures (unavailable, mismatch,
+ * missing_ref) are not pending, so they are not retried on every check.
+ */
+function hasPendingRepoEvidence(cached: BackupStatus | null, nowMs: number): boolean {
+  return (cached?.assets ?? []).some((a) => {
+    if (!isRepoAsset(a) || a.configured_remote !== true) return false;
+    const state = a.verification?.state;
+    if (state === 'budget_exhausted' || state === 'stale') return true;
+    if (state !== 'verified') return false;
+    const age = nowMs - Date.parse(a.verification?.checked_at ?? '');
+    return !Number.isFinite(age) || age < 0 || age > BACKUP_VERIFICATION_MAX_AGE_MS;
+  });
+}
+
 export async function getBackupStatus(
   engine: BrainEngine,
   opts: BackupCoverageOpts & { forceRefresh?: boolean },
@@ -433,7 +458,8 @@ export async function getBackupStatus(
   const nowMs = (opts.now ?? new Date()).getTime();
   const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
   const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
-    && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS);
+    && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS
+      || (remoteAge >= BACKUP_CONTINUATION_THROTTLE_MS && hasPendingRepoEvidence(cached, nowMs)));
   if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue) return currentBackupEvidence(cached, nowMs);
   try {
     const fresh = await computeBackupCoverage(engine, { ...opts, previousStatus: cached ?? undefined });

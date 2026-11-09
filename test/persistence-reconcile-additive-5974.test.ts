@@ -81,6 +81,33 @@ describe('structural drift classifier', () => {
     expect(classifyDrift(page({ compiled_truth: 'Line one.\nNew.\nLine two.' }), page(), NOW).verdict).toBe('additive_with_suggestions');
     expect(classifyDrift(page({ frontmatter: { ...page().frontmatter, access: 'public' } }), page(), NOW).verdict).toBe('review_required');
   });
+
+  test('#8109: a contact row whose only change is an activity date moving forward is auto; any other row change stays review', () => {
+    const row = (value: string, last_used: unknown, extra: Record<string, unknown> = {}) => ({ type: 'phone', value, last_used, ...extra });
+    const stored = page({ frontmatter: { contacts: [row('+15550100', '2026-10-01'), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')] } });
+    const file = (contacts: unknown[]) => page({ frontmatter: { contacts } });
+    const one = classifyDrift(file([row('+15550100', '2026-10-01'), row('+15550100', '2026-10-02'), row('+15550101', '2026-09-01')]), stored, NOW).paths;
+    expect(one).toEqual([{ path: '/frontmatter/contacts', class: 'auto', rule: 'contacts_activity_advance', reason: 'activity_dates_advanced', appended: 0, advanced: 1 }]);
+    expect(classifyDrift(file([row('+15550100', '2026-10-01'), row('+15550100', '2026-10-02'), row('+15550101', '2026-09-01')]), stored, NOW).verdict).toBe('structurally_additive');
+    // Advanced and appended together is still additive.
+    expect(classOf(file([row('+15550100', '2026-10-03'), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01'), row('+15550102', '2026-10-02')]), stored)['/frontmatter/contacts'])
+      .toBe('auto:activity_dates_advanced');
+    // Unquoted YAML dates parse to Date objects; they compare as the instants they are.
+    expect(classOf(file([row('+15550100', new Date('2026-10-02T00:00:00Z')), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')]),
+      page({ frontmatter: { contacts: [row('+15550100', new Date('2026-10-01T00:00:00Z')), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')] } }))['/frontmatter/contacts'])
+      .toBe('auto:activity_dates_advanced');
+    expect(classOf(page({ frontmatter: { last_used: new Date('2026-10-02T00:00:00Z') } }), page({ frontmatter: { last_used: '2026-10-01T00:00:00.000Z' } }))['/frontmatter/last_used'])
+      .toBe('auto:activity_date_advanced');
+    for (const [contacts, reason] of [
+      [[row('+15550100', '2026-09-30'), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550100', '2030-01-01'), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550199', '2026-10-02'), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550100', '2026-10-02', { label: 'work' }), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550100', '2026-10-01', { access: 'public' }), row('+15550100', '2026-10-01'), row('+15550101', '2026-09-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550101', '2026-09-01'), row('+15550100', '2026-10-01'), row('+15550100', '2026-10-01')], 'list_entries_changed_or_reordered'],
+      [[row('+15550100', '2026-10-02'), row('+15550101', '2026-09-01')], 'list_entries_removed'],
+    ] as const) expect(classOf(file([...contacts]), stored)['/frontmatter/contacts']).toBe(`review:${reason}`);
+  });
 });
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-reconcile-additive-'));
@@ -139,7 +166,7 @@ test('the reporter\'s additive page reconciles under --auto-additive; a replaced
       .rejects.toMatchObject({ writeError: 'source_changed' });
 
     const audit = await auditCanonicalSource(engine, f.id, { classify: true });
-    expect(audit.classified).toEqual({ structurally_additive: 0, additive_with_suggestions: 1, review_required: 1, formatting_only: 0, error: 0 });
+    expect(audit.classified).toEqual({ structurally_additive: 0, additive_with_suggestions: 1, review_required: 1, formatting_only: 0, slug_rule_mismatch: 0, error: 0 });
     expect(JSON.stringify(audit)).not.toContain('carol-example');
     expect(audit.findings.find(x => x.slug === 'people/replaced-example')).toMatchObject({ classification: 'review_required',
       drift_paths: [{ path: '/compiled_truth', class: 'review', reason: 'database_text_changed_or_removed' }] });

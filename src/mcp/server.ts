@@ -1,6 +1,7 @@
 import { noteForwardProgress } from '../core/forward-progress.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Readable, Writable } from 'node:stream';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { BrainEngine } from '../core/engine.ts';
 import { opError, type OperationMeta } from '../core/ops/contract.ts';
@@ -9,22 +10,40 @@ import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import type { ToolResult } from './dispatch.ts';
-import { findInvalidParam, schemaInvalidParams, parseStrictParamsMode } from './validate-params.ts';
+import { findInvalidParam, normalizeOptionalParams, schemaInvalidParams, parseStrictParamsMode } from './validate-params.ts';
 import { clampSurface, createStdioSurfaceState, resolveAdvertisedSurface, stdioToolListing, sessionWidenAllowed, surfaceEnvInvalidNotice, type McpAccess, type McpSurface, type SurfaceSource } from './surface.ts';
 import { noticeBlock, renderNotice, type Notice } from '../core/agent-output.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { parseResultRowsMode, resolveResultRowsMode } from './result-rows.ts';
 import { loadConfig } from '../core/config.ts';
+import { requestConfigRows, withRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
-import { installInstructionsResolver, resolveMcpInstructions } from './instructions.ts';
+import { installInstructionsResolver, MCP_SERVER_DESCRIPTION, readInstructionContent, resolveMcpInstructions } from './instructions.ts';
 import { instructionReadiness, stdioCapabilityReadiness } from './initialize-context.ts';
 import { STATUS_TOOL_DEF, STATUS_TOOL_NAME, attemptStatusRecovery, statusHeadline, statusInstructionLine, statusModeErrorResult, statusModeOf, statusPayload, statusToolResult } from './status-mode.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from './capabilities.ts';
 import { createSkillResources, type SkillResources } from './skill-resources.ts';
 import { readLocalWriter, verifyLocalWriter } from '../core/persistence/identity.ts';
-import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
+import { ambientOptsFrom } from '../core/facts/writeback-config.ts';
+import { resolveAgentWriteback } from '../core/facts/writeback-settings.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
 import { assertStdioSourceBindable } from './source-preflight.ts';
+import { readOnlyServeSkipsResidentDuties } from '../core/direct-pool-profile.ts';
+import { hookSessionCwd } from '../core/session-cwd.ts';
+
+/**
+ * Largest JSON-RPC message the stdio server reads (the SDK default is 10 MiB,
+ * and an oversized message closes the session). A page at the 24 MiB ceiling
+ * travels JSON-escaped, and newlines and quotes double, so 64 MiB carries it
+ * with room; the persistence journal caps a principal's outstanding intents at
+ * the same 64 MiB.
+ */
+export const MCP_STDIO_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/** The stdio transport `gbrain serve` connects, sized for ceiling-size page writes. */
+export function mcpStdioTransport(stdin: Readable = process.stdin, stdout: Writable = process.stdout): StdioServerTransport {
+  return new StdioServerTransport(stdin, stdout, { maxBufferSize: MCP_STDIO_MAX_MESSAGE_BYTES });
+}
 
 // initialize and tools/list read OPERATION_MANIFEST; the handler graph behind
 // dispatch.ts (src/core/operations.ts, ~760 modules) loads with the deferred
@@ -89,7 +108,8 @@ function deferredBoot(opts: { degraded: boolean }) {
 
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
-  cwd: string = process.cwd(),
+  cwd: string = hookSessionCwd(),
+  opts: { warmConfig?: boolean } = {},
 ): Promise<{
   sourceId: string;
   localFederatedSourceIds?: string[];
@@ -116,7 +136,9 @@ export async function resolveMcpStdioSourceScope(
   }
   try {
     const { resolveSourceWithTier, localFederatedSourceIds, explicitReadBinding } = await import('../core/source-resolver.ts');
-    const resolved = await resolveSourceWithTier(engine, null, cwd);
+    // GBRA-156: a tool call resolves inside the request's config snapshot (which dispatch reuses for a read op), so
+    // `warmConfig` reads the config table beside the source rows: one round trip before the op.
+    const [resolved] = await Promise.all([resolveSourceWithTier(engine, null, cwd), opts.warmConfig ? requestConfigRows(engine) : undefined]);
     const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
     // #5081: the admission set is optional; a failed lookup must not discard
     // the resolved binding (the catch below would fall back to 'default').
@@ -299,7 +321,15 @@ function stdioSurfaceSession(
   return { session, finishResult, statusResult };
 }
 
-export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; surfaceSource?: SurfaceSource; invalidSurfaceEnv?: string; sourceGuard?: boolean; onBootPhase?: (phase: string) => void; access?: McpAccess } = {}) {
+/**
+ * #7599: a read-only stdio serve on Postgres runs no resident write duty: no persistence consumer, no delegated sync, nudge or
+ * sweep kinds, no session-cursor GC and no startup sweep (serve.ts also skips the idle sweep and the resident tickers, the
+ * on-commit watcher among them); only the onboarding cache refresher runs. The long-lived serve, worker or autopilot owns
+ * them; doctor's commit_notifier and two_consumers_on_host say when none runs. A PGLite serve keeps them (readOnlyServeSkipsResidentDuties).
+ */
+const READ_ONLY_SERVE_NOTE = '[gbrain-serve] read-only: no persistence consumer, on-commit sync or sweep runs here; a read-write serve, jobs work or autopilot owns them.\n';
+
+export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; surfaceSource?: SurfaceSource; invalidSurfaceEnv?: string; sourceGuard?: boolean; onBootPhase?: (phase: string) => void; access?: McpAccess; advertise?: McpSurface } = {}) {
   const config = loadConfig();
   const bootPhase = (phase: string) => { try { opts.onBootPhase?.(phase); } catch { /* diagnostic only */ } };
   // Refuse to serve a well-formed GBRAIN_SOURCE that no active source row
@@ -334,13 +364,13 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // F4 status-only mode: never touch the lazy engine at boot (its gated
   // reconnect belongs to tool calls).
   const statusMode = statusModeOf(engine);
-  const writeback = statusMode ? null : await resolveWritebackConfig(engine, config);
+  const writeback = statusMode ? null : (await resolveAgentWriteback(engine, config)).bundle;
   const writebackOpts = writeback ? ambientOptsFrom(writeback, {
     remember: session.allowedOps ? session.allowedOps.has('remember') : true,
     extractFacts: session.allowedOps ? session.allowedOps.has('extract_facts') : true,
   }) : null;
   server = new Server(
-    { name: 'gbrain', version: VERSION },
+    { name: 'gbrain', version: VERSION, description: MCP_SERVER_DESCRIPTION },
     // listChanged: a client that handshakes during DEGRADED mode receives the
     // gate-hidden catalog (stdioVisibleTools fail-closes every publishGateKey
     // op on engine failure) and caches it — recovery sends the notification
@@ -352,16 +382,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
     },
   );
-  const listing = stdioToolListing(() => resolveAdvertisedSurface(isEngineDegraded(engine) ? null : engine, config), session, server);
+  const listing = stdioToolListing(() => resolveAdvertisedSurface(isEngineDegraded(engine) ? null : engine, config, opts.advertise ?? null), session, server);
   // F1: callable-set contract + readiness tail (or status-only line), resolved at client initialize.
   installInstructionsResolver(server, async () => {
     if (statusMode && isEngineDegraded(engine)) {
       return resolveMcpInstructions(config, process.env, { tools: { callable: n => n === STATUS_TOOL_NAME, statusLine: statusInstructionLine(statusMode) } });
     }
-    const visibleOps = await stdioVisibleTools(engine, session.surfacedOps), visible = new Set(visibleOps.map(op => op.name));
+    const visibleOps = await stdioVisibleTools(engine, session.surfacedOps), listedOps = await listing.listed(visibleOps), listed = new Set(listedOps.map(op => op.name));
     return resolveMcpInstructions(config, process.env, {
-      writeback: writebackOpts,
-      tools: { callable: n => visible.has(n), readiness: await instructionReadiness(engine, config, 'stdio'), hiddenCallable: visibleOps.length - (await listing.listed(visibleOps)).length },
+      writeback: writebackOpts, ...await readInstructionContent(engine),
+      tools: { callable: n => listed.has(n), readiness: await instructionReadiness(engine, config, 'stdio'), hiddenCallable: visibleOps.length - listedOps.length },
     });
   }, gate.initializeAnswered);
 
@@ -423,9 +453,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // The MCP SDK's response type widened in 1.29 to allow a managed-task wrapper;
   // gbrain ops are synchronous, so we return the legacy `{ content, isError? }`
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
-  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(async () => {
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(() => withRequestConfigSnapshot(engine, async () => {
     const { name, arguments: params } = request.params;
-    const [{ dispatchToolCall, dispatchRenderContext, requestMetaSessionId }, { getBrainHotMemoryMeta }] = await gate.awaitCall();
+    const [{ dispatchToolCall, dispatchRenderContext, requestMetaSessionId, hotMemoryOffIn }, { getBrainHotMemoryMeta }] = await gate.awaitCall();
     // F4: status-only mode answers gbrain_status and refuses the rest until
     // a tool call's re-probe finds the brain openable (then dispatch normally).
     if (statusMode) {
@@ -437,7 +467,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // as local CLI dispatch: GBRAIN_SOURCE, then .gbrain-source, then the
     // non-explicit fallback tiers. Non-explicit tiers may widen to federated
     // local reads; explicit/env/dotfile scopes stay scalar.
-    const sourceScope = await resolveMcpStdioSourceScope(engine);
+    const sourceScope = await resolveMcpStdioSourceScope(engine, hookSessionCwd(), { warmConfig: OPERATION_MANIFEST.find(o => o.name === name)?.mutating === false });
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
@@ -459,13 +489,14 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       OPERATION_MANIFEST.find(o => o.name === name)?.mutating === true,
     );
     return finishResult(await dispatchToolCall(engine, name, params, {
-      remote: true,
+      remote: true, admissionOrigin: 'interactive',
       // #1061: mark the transport so whoami can report {transport: 'stdio'}
       // instead of throwing unknown_transport. Trust posture unchanged —
       // stdio stays remote/untrusted.
-      transport: 'stdio',
+      transport: 'stdio', inboundFrameBytes: MCP_STDIO_MAX_MESSAGE_BYTES,
       takesHoldersAllowList: ['world'],
-      ...(sessionId ? { sessionId } : {}),
+      ...(sessionId ? { sessionId } : {}), ...(hotMemoryOffIn(request.params) ? { hotMemoryOff: true } : {}), onBehalfOf: { requestMeta: request.params?._meta },
+      mcpCaller: { client: server?.getClientVersion()?.name, meta: request.params?._meta },
       sourceId: sourceScope.sourceId,
       ...(sourceScope.localFederatedSourceIds
         ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }
@@ -486,12 +517,12 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       surface: session.surface,
       // WP4 (D2): stdio has no per-client rows; its surface is the ceiling
       // request_tools bounds its catalog by; its {surface} call widens the session.
-      surfaceCeiling: session.surface, stdioSurface: session, revealTools: listing.reveal,
+      surfaceCeiling: session.surface, stdioSurface: session, revealTools: listing.reveal, isListed: listing.isListed,
       resultRows,
     }), dispatchRenderContext);
-  }));
+  })));
 
-  const transport = new StdioServerTransport();
+  const transport = mcpStdioTransport();
   bootPhase('mcp_connect');
   await server.connect(transport);
 
@@ -503,20 +534,20 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   let ipcBinding: { close: () => void } | null = null;
   let startupSweep: { cancel: () => void } | null = null;
   const bootEngineDependents = async (): Promise<void> => {
-    // Retrieval Reflex (#1981, D9=C): the resolve/turn_context/context_pack
-    // (+ delegated sync/sweep) IPC listener. Wiring shared with `serve --http`
-    // via bindResolveIpcForServe (#4474) — best-effort; failure to bind never
-    // blocks the MCP server.
+    // Retrieval Reflex (#1981, D9=C): the resolve/turn_context/context_pack (+ delegated sync/sweep) IPC listener. Wiring
+    // shared with `serve --http` via bindResolveIpcForServe (#4474) — best-effort; failure to bind never blocks the MCP server.
     const [{ createPersistenceIpcProvider, residentPersistenceConfig }, { bindResolveIpcForServe }] = await Promise.all([import('../core/persistence/provider.ts'), import('./resolve-ipc-binding.ts')]);
     bootPhase('source_scope');
     const { sourceId: ipcSourceId } = await resolveMcpStdioSourceScope(engine);
     bootPhase('persistence_consumer');
-    const persistence = await createPersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? { engine: engine.kind });
+    const lean = readOnlyServeSkipsResidentDuties(!!session.readOnly, engine.kind);
+    const persistence = lean ? undefined : await createPersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? { engine: engine.kind });
     bootPhase('resolve_ipc_bind');
-    ipcBinding = await bindResolveIpcForServe(engine, ipcSourceId, persistence, { rememberCallable: () => !session.allowedOps || session.allowedOps.has('remember') });
+    ipcBinding = await bindResolveIpcForServe(engine, ipcSourceId, persistence, { rememberCallable: () => !session.allowedOps || session.allowedOps.has('remember'), lean });
+    import('../core/onboard/mcp-onboarding.ts').then(m => m.startOnboardingRefresher(engine, { idle: () => _stdioRpcsInFlight === 0 })).catch(() => { /* coaching is best-effort */ });
+    if (lean) return void process.stderr.write(READ_ONLY_SERVE_NOTE);
 
-    // v0.45.7 ambient recall: age out stale session cursors once per serve boot
-    // (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.
+    // v0.45.7 ambient recall: age out stale session cursors once per serve boot (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.
     gcSessionContextState(engine).catch(() => {});
 
     // Startup maintenance sweep [ENG-5][CX-P0.1+P0.3]: the serve process is
@@ -526,7 +557,6 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // connect, unref'd (can never hold the process open), all errors
     // swallowed inside armStartupSweep. Kill switch: GBRAIN_SWEEP=0 (checked
     // inside the helper). Lazy import keeps sweep code off the boot path.
-    import('../core/onboard/mcp-onboarding.ts').then(m => m.startOnboardingRefresher(engine, { idle: () => _stdioRpcsInFlight === 0 })).catch(() => { /* coaching is best-effort */ });
     bootPhase('startup_sweep');
     try {
       const { armStartupSweep } = await import('../core/sweep.ts');
@@ -617,11 +647,13 @@ export async function handleToolCall(
   const op = operations.find(o => o.name === tool);
   if (!op) throw opError('unknown_tool', `Unknown tool: ${tool}`, 'Run `gbrain --tools-json` to list the tool names.');
 
-  const validationFailure = findInvalidParam(op, params);
+  const safeParams = normalizeOptionalParams(op, params);
+  const validationFailure = findInvalidParam(op, safeParams);
   if (validationFailure) throw schemaInvalidParams(op, validationFailure, {});
 
-  const ctx = buildOperationContext(engine, params, {
+  const ctx = buildOperationContext(engine, safeParams, {
     remote: false,
+    admissionOrigin: 'interactive',
     logger: { info: console.log, warn: console.warn, error: console.error },
     ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
     ...(opts?.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
@@ -630,5 +662,5 @@ export async function handleToolCall(
       : {}),
   });
 
-  return op.handler(ctx, params);
+  return op.handler(ctx, safeParams);
 }

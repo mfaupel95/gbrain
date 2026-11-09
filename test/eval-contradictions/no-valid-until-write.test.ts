@@ -38,6 +38,10 @@ import { join } from 'node:path';
 //   - facts/withdrawal-schema.ts — its insert/update trigger reapplies an
 //     already-recorded user withdrawal when derived facts are rebuilt; it
 //     cannot invent a withdrawal or infer one from a contradiction.
+//   - facts/insert-guard-schema.ts — the statement-level form of that same
+//     insert trigger (#7105): it clamps valid_until only on rows the current
+//     INSERT wrote that match an already-recorded fact_withdrawals row, the
+//     same rule; it never reads contradiction findings.
 //   - persistence/canonical-projections.ts — restores explicit valid_until
 //     from the accepted canonical Markdown fence, including version reverts,
 //     in the guarded page publication transaction. This copies user-authored
@@ -62,18 +66,39 @@ import { join } from 'node:path';
 //     only when its loop is closed through `loops_close` or `gbrain repair
 //     loop-facts` (expired_at + valid_until with the struck fence row); the
 //     contradiction sweep and probes never call it.
+//   - repair/consolidate-ties.ts (#6023) — `gbrain repair consolidate-ties`
+//     reopens (valid_until back to NULL) only the preview-approved facts the
+//     pre-#6023 consolidate writeback closed at their own instant; local CLI,
+//     explicit-only, and the contradiction probe never calls it.
+//   - generations/adapters/fact-rows.ts (GBRA-161 PR 2) — `restoreFactRow`
+//     writes back a fact's recorded before-state (valid_until included) only in
+//     a preview-approved `gbrain repair generations --mode restore` of a
+//     consolidation chain or a fence generation; local CLI, and the
+//     contradiction probe never calls it.
+//   - repair/unwithdrawn-facts.ts (#8819) — `gbrain repair unwithdrawn-facts`
+//     writes back the ledger preimage (valid_until included) of a fact the
+//     first managed fence generation retired though no fence held it; local
+//     CLI, explicit-only, preview-bound, and the contradiction probe never
+//     calls it.
 const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/core/cycle/extract-facts.ts',
   'src/core/cycle/phases/consolidate.ts',
+  'src/core/engine-sql/facts.ts', // #7214: insertFact's supersede closes the retired interval at the replacement's valid_from
   'src/core/facts/forget.ts',
+  'src/core/facts/insert-guard-schema.ts',
   'src/core/facts/proposal-supersede.ts',
   'src/core/facts/withdrawal.ts',
   'src/core/facts/withdrawal-schema.ts',
+  'src/core/generations/adapters/fact-rows.ts',
   'src/core/persistence/canonical-projections.ts',
+  'src/core/persistence/facts-prepare.ts', // #7214: a published supersession closes the retired interval (supersededValidUntil)
   'src/core/persistence/loop-fact-retirement.ts',
+  'src/core/persistence/memory-prepare.ts', // #7214: remember (replaces or cosine) closes the retired interval (supersededValidUntil)
   'src/core/persistence/prepared-maintenance.ts',
   'src/core/postgres-engine.ts',
   'src/core/pglite-engine.ts',
+  'src/core/repair/consolidate-ties.ts',
+  'src/core/repair/unwithdrawn-facts.ts',
 ]);
 
 function walkTs(dir: string, acc: string[] = []): string[] {

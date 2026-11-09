@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn } from '../spawn.ts';
 import type { BrainEngine } from '../engine.ts';
 import { VERSION } from '../../version.ts';
 import { isLocalConfigurationError } from './configuration-error.ts';
@@ -17,6 +17,59 @@ export const CHILD_READINESS_MAX_BYTES = 64 * 1024;
 export const CHILD_READINESS_FEATURES = ['local-configuration-outcome-v1', 'postgres-cancellation-v1', 'spend-enforcement-v1'] as const;
 /** Every child must advertise these; `spend-enforcement-v1` only gates spend-authorized rows (child-job-runner.ts). */
 const REQUIRED_CHILD_FEATURES = ['local-configuration-outcome-v1', 'postgres-cancellation-v1'] as const;
+
+/**
+ * #7245: the readiness handshake runs once, when the worker starts, but every
+ * job spawns a fresh `jobs run-child` from the install on disk, so a checkout
+ * that moves under a running worker hands later jobs to another build. The
+ * worker passes its build and the features this job needs in this env var
+ * (JSON), and the child compares them before it runs the handler.
+ */
+export const CHILD_PARENT_BUILD_ENV = 'GBRAIN_JOB_PARENT_BUILD';
+
+/** The worker's build for one job child: every job needs the required features, a spend-authorized row also `spend-enforcement-v1`. */
+export function parentBuildEnvValue(spendAuthorized: boolean): string {
+  const features: string[] = [...REQUIRED_CHILD_FEATURES];
+  if (spendAuthorized) features.push('spend-enforcement-v1');
+  return JSON.stringify({ version: VERSION, protocol_version: CHILD_READINESS_PROTOCOL_VERSION, features });
+}
+
+/** The history entry prefix a job child writes when its build differs from its worker's (doctor `runtime_build_skew` reads it). */
+export const JOB_BUILD_SKEW_PREFIX = 'job_build_skew:';
+
+export interface JobChildBuildVerdict {
+  worker_version: string;
+  /** The worker needs a protocol or feature this child lacks: the child runs nothing. */
+  refused: boolean;
+  /** The one-line history entry and warning naming both builds and the decision. */
+  note: string;
+}
+
+/**
+ * Compares this job child's build with the spawning worker's. Null when the
+ * builds match, or the worker sent none (a worker older than #7245) or an
+ * unreadable value: nothing to report. A differing version alone runs the job
+ * (the compatible protocol is what both sides read); a protocol mismatch or a
+ * missing required feature refuses it, like the startup handshake does.
+ */
+export function jobChildBuildVerdict(raw: string | undefined, workerPid: number): JobChildBuildVerdict | null {
+  if (!raw) return null;
+  let parent: { version?: unknown; protocol_version?: unknown; features?: unknown };
+  try { parent = JSON.parse(raw); } catch { return null; }
+  if (!parent || typeof parent.version !== 'string' || !/^\d+(?:\.\d+){2,3}$/.test(parent.version)) return null;
+  const features = Array.isArray(parent.features) ? parent.features.filter((f): f is string => typeof f === 'string') : [];
+  const missing = features.filter(feature => !(CHILD_READINESS_FEATURES as readonly string[]).includes(feature));
+  const protocolMismatch = parent.protocol_version !== CHILD_READINESS_PROTOCOL_VERSION;
+  if (parent.version === VERSION && !protocolMismatch && !missing.length) return null;
+  const builds = `job child v${VERSION} ${protocolMismatch || missing.length ? 'refused to run' : 'ran'} under worker pid ${workerPid} v${parent.version}`;
+  if (!protocolMismatch && !missing.length) {
+    return { worker_version: parent.version, refused: false,
+      note: `${JOB_BUILD_SKEW_PREFIX} ${builds}; the readiness protocol and every feature the worker needs match, so the job ran on the child's build. Restart the worker to run one build (gbrain doctor --only runtime_build_skew).` };
+  }
+  const why = protocolMismatch ? `the worker speaks readiness protocol ${String(parent.protocol_version)} and this child ${CHILD_READINESS_PROTOCOL_VERSION}` : `this child lacks ${missing.join(', ')}`;
+  return { worker_version: parent.version, refused: true,
+    note: `${JOB_BUILD_SKEW_PREFIX} ${builds}: ${why}. The job is released without counting an attempt and the worker stops on a configuration block until it restarts on one build (gbrain doctor --only runtime_build_skew).` };
+}
 
 export interface ChildReadinessOptions {
   invocation: ChildCliInvocation;

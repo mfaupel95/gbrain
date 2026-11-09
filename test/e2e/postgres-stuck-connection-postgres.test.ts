@@ -16,10 +16,20 @@
  * read. Regression that fails it on master: `busy` stays 0 during `pg_sleep`,
  * and a statement the server never answers hangs forever instead of
  * rejecting with `CONNECTION_STUCK`.
+ *
+ * #6543 (A4): a second clock that received bytes never restart retires a
+ * statement that keeps streaming past its budget (`reason: 'age'`), and the
+ * budget is per statement: a transaction that declared a longer
+ * statement_timeout, or a reserved connection that declared 0, keeps running.
+ * (A6): reconnects of connections retired by an incident are reported through
+ * `onrecovered` / `onrecoveryfailed`. Regression that fails it on master: the
+ * trickle runs to completion, and no recovery hook fires.
  */
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { createServer, connect as tcpConnect, type Server, type Socket } from 'node:net';
 import postgres from '#postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { poolHealthSnapshot } from '../../src/core/postgres-engine/pool-stats.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const url = process.env.DATABASE_URL;
@@ -38,9 +48,9 @@ function settle(query: PromiseLike<unknown>, ms = 5000): Promise<Settled> {
   ]);
 }
 
-function pool(max: number, inflightTimeout: number | null, stucks: unknown[]) {
+function pool(max: number, inflightTimeout: number | null, stucks: unknown[], extra: Record<string, unknown> = {}, target = url!) {
   assertSafeE2eDatabaseUrl(url!);
-  const sql = postgres(url!, {
+  const sql = postgres(target, {
     max,
     prepare: false,
     onnotice: () => {},
@@ -48,9 +58,31 @@ function pool(max: number, inflightTimeout: number | null, stucks: unknown[]) {
     connection: { application_name: `gbrain-6383-stuck-${Math.random().toString(36).slice(2)}` },
     inflight_timeout: inflightTimeout,
     onstuck: (info: unknown) => { stucks.push(info); },
+    ...extra,
   } as Parameters<typeof postgres>[1]);
   opened.push(sql);
   return sql;
+}
+
+/** One 9 KB row (larger than the server's send buffer, so each is flushed) every `everyS` seconds. */
+const trickle = (rows: number, everyS: number) => `SELECT g, repeat('x', 9000) AS pad, pg_sleep(${everyS}) FROM generate_series(1, ${rows}) g`;
+
+/** A TCP relay to the test database that can stop accepting, so a reconnect is refused. */
+function relay(): Promise<{ url: string; stop: () => void; server: Server }> {
+  const target = new URL(url!);
+  const sockets = new Set<Socket>();
+  const server = createServer(client => {
+    const upstream = tcpConnect(Number(target.port || 5432), target.hostname);
+    for (const s of [client, upstream]) { sockets.add(s); s.on('error', () => {}); s.on('close', () => sockets.delete(s)); }
+    client.pipe(upstream).pipe(client);
+  });
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+    const port = (server.address() as { port: number }).port;
+    const relayed = new URL(url!);
+    relayed.hostname = '127.0.0.1';
+    relayed.port = String(port);
+    resolve({ url: relayed.toString(), server, stop: () => { server.close(); for (const s of sockets) s.destroy(); } });
+  }));
 }
 
 describe.skipIf(!url)('#6383 in-flight watchdog and live pool numbers', () => {
@@ -112,11 +144,107 @@ describe.skipIf(!url)('#6383 in-flight watchdog and live pool numbers', () => {
     expect(stucks).toEqual([]);
   });
 
+  test('#6543 A4: a statement that keeps streaming past its budget is retired with reason age, and the pool serves the next caller', async () => {
+    const stucks: Array<{ age_ms: number; queued: number; statement: string; reason: string; budget_ms: number }> = [];
+    // Idle budget 1 s (a row arrives every 0.4 s, so it never fires), age budget 2 s.
+    const sql = pool(1, 1, stucks, { inflight_max: 2 });
+    await sql`SELECT 1`;
+    const started = Date.now();
+    expect(await settle(sql.unsafe(trickle(15, 0.4)), 8000)).toEqual({ code: 'CONNECTION_STUCK' });
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(stucks).toHaveLength(1);
+    expect(stucks[0]).toMatchObject({ reason: 'age', budget_ms: 2000, queued: 0 });
+    expect(stucks[0].age_ms).toBeGreaterThanOrEqual(1900);
+    expect(await settle(sql`SELECT 'next' AS who`)).toEqual({ rows: [{ who: 'next' }] });
+  });
+
+  test('#6543 A4: a transaction that declared a longer statement_timeout streams past the pool budget unretired, and deep health does not call it over budget; its SET LOCAL ends with it', async () => {
+    const stucks: unknown[] = [];
+    const sql = pool(1, 1, stucks, { inflight_max: 2, inflight_grace: 1 });
+    await sql`SELECT 1`;
+    let midway: { inflight_oldest_ms: number; inflight_over_budget_ms: number } | null = null;
+    const probe = setTimeout(() => { midway = sql.pool as never; }, 2600);
+    const rows = await settle(sql.begin(async tx => {
+      await tx`SET LOCAL statement_timeout = '600s'`;
+      return tx.unsafe(trickle(8, 0.4));
+    }), 8000);
+    clearTimeout(probe);
+    expect('rows' in rows && rows.rows.length).toBe(8);
+    expect(stucks).toEqual([]);
+    expect(midway!.inflight_oldest_ms).toBeGreaterThan(2000);
+    expect(midway!.inflight_over_budget_ms).toBe(0);
+    expect(await settle(sql.unsafe(trickle(15, 0.4)), 8000)).toEqual({ code: 'CONNECTION_STUCK' });
+    expect(stucks).toHaveLength(1);
+  });
+
+  test('#6543 A4: a reserved connection that declared statement_timeout 0 is never retired until it resets the timeout', async () => {
+    const stucks: unknown[] = [];
+    const sql = pool(1, 1, stucks, { inflight_max: 1, inflight_grace: 1 });
+    const reserved = await sql.reserve();
+    await reserved`SET statement_timeout = 0`;
+    expect(await settle(reserved`SELECT pg_sleep(1.6), 1 AS x`)).toEqual({ rows: [{ pg_sleep: '', x: 1 }] });
+    await reserved`RESET statement_timeout`;
+    expect(await settle(reserved`SELECT pg_sleep(5)`)).toEqual({ code: 'CONNECTION_STUCK' });
+    reserved.release();
+    expect(stucks).toHaveLength(1);
+  });
+
+  test('#6543 A6: a connection closed under a statement reports onrecovered on its next startup, and a refused reconnect reports onrecoveryfailed', async () => {
+    const proxy = await relay();
+    const recovered: unknown[] = [];
+    const failed: Array<{ cause: string; code: string }> = [];
+    const sql = pool(1, null, [], { onrecovered: (i: unknown) => recovered.push(i), onrecoveryfailed: (i: { cause: string; code: string }) => failed.push(i), backoff: 0 }, proxy.url);
+    await sql`SELECT 1`;
+    const running = settle(sql`SELECT pg_sleep(5)`);
+    await new Promise(r => setTimeout(r, 200));
+    proxy.stop();
+    expect(await running).toEqual({ code: 'CONNECTION_CLOSED' });
+    expect(await settle(sql`SELECT 1`)).toEqual({ code: 'ECONNREFUSED' });
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ cause: 'closed', code: 'ECONNREFUSED' });
+    expect(recovered).toEqual([]);
+    await new Promise<void>(resolve => proxy.server.listen(Number(new URL(proxy.url).port), '127.0.0.1', () => resolve()));
+    expect(await settle(sql`SELECT 'back' AS who`)).toEqual({ rows: [{ who: 'back' }] });
+    expect(recovered).toEqual([{ connection: expect.any(Number), cause: 'closed' }]);
+    expect(failed).toHaveLength(1);
+    proxy.stop();
+  });
+
+  test('#6543 A6 engine: pg_terminate_backend under a statement counts recovered once, in getPoolDiagnostics and the deep-health snapshot', async () => {
+    assertSafeE2eDatabaseUrl(url!);
+    const engine = new PostgresEngine();
+    const admin = pool(1, null, []);
+    try {
+      await engine.connect({ engine: 'postgres', database_url: url!, poolSize: 2 });
+      const marker = `pg_sleep(4.${Math.floor(Math.random() * 900) + 100})`;
+      const sleeping = settle(engine.executeRaw(`SELECT ${marker}`), 6000);
+      let pids: Array<{ pid: number }> = [];
+      for (let i = 0; i < 20 && pids.length === 0; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        pids = await admin.unsafe<Array<{ pid: number }>>(`SELECT pid FROM pg_stat_activity WHERE query = 'SELECT ${marker}' AND pid <> pg_backend_pid()`);
+      }
+      expect(pids).toHaveLength(1);
+      await admin`SELECT pg_terminate_backend(${pids[0]!.pid})`;
+      expect('code' in (await sleeping)).toBe(true);
+      expect(engine.getPoolDiagnostics()?.recovered).toBe(0);
+      // Two statements at once need both connections, so the terminated one reconnects.
+      expect(await Promise.all([engine.executeRaw<{ x: number; pg_sleep: string }>('SELECT 1 AS x, pg_sleep(0.3)'), engine.executeRaw<{ x: number; pg_sleep: string }>('SELECT 1 AS x, pg_sleep(0.3)')]))
+        .toEqual([[{ x: 1, pg_sleep: '' }], [{ x: 1, pg_sleep: '' }]]);
+      expect(engine.getPoolDiagnostics()?.recovered).toBe(1);
+      expect(engine.getPoolDiagnostics()?.recoveryFailed).toBe(0);
+      expect(poolHealthSnapshot(engine)).toMatchObject({ recovered: 1, recovery_failed: 0 });
+    } finally {
+      await engine.disconnect();
+    }
+  });
+
   test('engine: a stuck connection is counted once, logged as one pg_connection_stuck line, and seen by getPoolDiagnostics', async () => {
     assertSafeE2eDatabaseUrl(url!);
     const previous = { grace: process.env.GBRAIN_PG_STUCK_GRACE_MS, timeout: process.env.GBRAIN_STATEMENT_TIMEOUT };
     // Budget = statement_timeout (500 ms) + grace (500 ms) = 1 s. The session below lifts its own server-side
-    // statement_timeout first, so the sleep is only ever ended by the watchdog.
+    // statement_timeout first, so the sleep is only ever ended by the watchdog. It lifts it inside a DO body, which
+    // the driver does not read (as a pooler that never applies the timeout would leave it): since #6543 a lift the
+    // driver reads (`SET statement_timeout = 0`) also lifts the watchdog for that connection.
     process.env.GBRAIN_STATEMENT_TIMEOUT = '500ms';
     process.env.GBRAIN_PG_STUCK_GRACE_MS = '500';
     const engine = new PostgresEngine();
@@ -124,7 +252,7 @@ describe.skipIf(!url)('#6383 in-flight watchdog and live pool numbers', () => {
     try {
       await engine.connect({ engine: 'postgres', database_url: url!, poolSize: 2 });
       const stuck = await settle(engine.withReservedConnection(async conn => {
-        await conn.executeRaw('SET statement_timeout = 0');
+        await conn.executeRaw("DO $$ BEGIN PERFORM set_config('statement_timeout', '0', false); END $$");
         await conn.executeRaw('SELECT pg_sleep(5)');
       }), 6000);
       expect(stuck).toEqual({ code: 'CONNECTION_STUCK' });
@@ -137,6 +265,7 @@ describe.skipIf(!url)('#6383 in-flight watchdog and live pool numbers', () => {
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain('pool=read');
       expect(lines[0]).toContain('sql=SELECT');
+      expect(lines[0]).toContain('reason=idle budget_ms=1000');
       expect(lines[0]).not.toContain('pg_sleep');
       expect(lines[0]).not.toContain(url!);
     } finally {

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts';
+import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { managedBrain } from '../helpers/managed-brain.ts';
 
 const url = process.env.DATABASE_URL;
@@ -57,6 +58,7 @@ describe.skipIf(!url)('JIT off for statements past the JIT cost thresholds (#627
   test('the remote alias-resolving page read runs with JIT off; other reads keep the server setting', async () => {
     await managedBrain(async ({ engine, ctx }) => {
       await put(ctx, 'notes/jit-example', 'JIT example');
+      await disposePersistenceConsumer(engine);
       const watch = watchJit(/WITH chosen AS/);
       try {
         expect((await engine.readPageSnapshot('notes/jit-example', { sourceId: 'default', resolveAlias: true, excludePrivate: true }))?.page.slug).toBe('notes/jit-example');

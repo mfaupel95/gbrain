@@ -20,6 +20,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { folderRestricted, isDerivationPrivate } from '../search/private-visibility.ts';
 
 export type FactVisibility = 'private' | 'world';
 
@@ -59,4 +60,38 @@ export async function resolveVisibilityParam(
   if (value === 'private') return 'private';
   if (value == null) return resolveDefaultVisibility(engine);
   return 'private';
+}
+
+/**
+ * Facts derived from a page never take a broader visibility than that page: a
+ * `visibility: private` page, a derived page that reads as private, a page
+ * carrying a privacy marker (`access: private`, a private `confidentiality`) or
+ * a page under a folder rule (`folder_restricted`, see tightenToStoredPage) yields private facts whatever the caller
+ * or the brain default asked for.
+ */
+export function tightenToPage(visibility: FactVisibility, page: { type?: string | null; frontmatter?: unknown; folder_restricted?: boolean | null } | null | undefined): FactVisibility {
+  return page && isDerivationPrivate(page) ? 'private' : visibility;
+}
+
+/** tightenToPage for a page of `sourceId` known by its slug, its folder restriction looked up (folderRestricted). */
+export async function tightenToStoredPage(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, visibility: FactVisibility,
+  page: { slug: string; type?: string | null; frontmatter?: unknown }): Promise<FactVisibility> {
+  return tightenToPage(visibility, { type: page.type, frontmatter: page.frontmatter, folder_restricted: await folderRestricted(engine, sourceId, page.slug) });
+}
+
+/**
+ * `remember` without a `visibility`: the v1 default is `world`, except where
+ * that would widen what the caller is saving into. A private target page, an
+ * operator's explicit private `facts.default_visibility` (any non-empty value
+ * other than `world`, as the writeback posture reads it) or an unreadable
+ * config resolve `private`.
+ */
+export async function resolveRememberVisibility(engine: BrainEngine, page: { type?: string | null; frontmatter?: unknown; folder_restricted?: boolean | null } | null | undefined): Promise<FactVisibility> {
+  if (page && isDerivationPrivate(page)) return 'private';
+  try {
+    const raw = (await engine.getConfig(FACTS_DEFAULT_VISIBILITY_KEY))?.trim().toLowerCase() ?? '';
+    return raw === '' || raw === 'world' ? 'world' : 'private';
+  } catch {
+    return 'private';
+  }
 }

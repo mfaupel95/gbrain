@@ -172,9 +172,10 @@ const EXPLICIT_RE = /\b(Started|Ended)\s+([a-z][a-z0-9_]*)\s+(?:\[\[([^\]|\n]+)(
 const isRelationToken = (token: string) => token.includes('_') || KNOWN_LINK_TYPES.has(token) || relationSemantics(token) !== 'reference';
 const hasExplicit = (text: string) => [...text.matchAll(EXPLICIT_RE)].some(m => isRelationToken(m[2]));
 
-interface DatedLine { date: string; text: string; dream: boolean }
+export interface DatedLine { date: string; text: string; dream: boolean }
 
-function datedLines(content: string): DatedLine[] {
+/** The dated timeline lines of `content` outside code fences. */
+export function datedLines(content: string): DatedLine[] {
   const out: DatedLine[] = [];
   let fence = false;
   for (const line of content.split('\n')) {
@@ -201,12 +202,35 @@ export interface PageForEvidence {
 /** Receives each derived transition with the stable id of the cue that produced it (`cue.*`, `unit.*`). */
 export type TransitionExplainer = (t: DerivedTransition, rule: string) => void;
 
+/**
+ * What temporal evidence reads from a page body: the dated lines of the joined body and every reference in the
+ * compiled truth outside dated lines, with the clause before it. A segmented page collects them block by block.
+ */
+export interface TemporalInputs { lines: DatedLine[]; narrative: NarrativeRef[] }
+export interface NarrativeRef { target: string; window: string }
+
+/** The references of a compiled-truth text outside dated lines, each with the clause before it (windowBefore). */
+export function narrativeRefs(truth: string): NarrativeRef[] {
+  const narrative = stripDatedLines(truth);
+  let prevEnd = 0;
+  return referencesIn(narrative).map(ref => {
+    const window = windowBefore(narrative, ref.index, prevEnd);
+    prevEnd = ref.index + 2;
+    return { target: ref.target, window };
+  });
+}
+
 export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[], explain?: TransitionExplainer): TemporalEvidence {
+  return temporalEvidenceFrom(page, { lines: datedLines(`${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`), narrative: narrativeRefs(page.compiled_truth ?? '') },
+    rows, explain);
+}
+
+export function temporalEvidenceFrom(page: Pick<PageForEvidence, 'slug' | 'frontmatter'>, inputs: TemporalInputs, rows: readonly OwnedRow[],
+  explain?: TransitionExplainer): TemporalEvidence {
   const tense = new Map<string, AssertionTense>();
   const transitions: DerivedTransition[] = [];
   const unmatched: TemporalEvidence['unmatched'] = [];
-  const content = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
-  const lines = datedLines(content);
+  const { lines } = inputs;
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
@@ -276,16 +300,21 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   }
 
   // 3. Frontmatter since/until on relationship objects ({name, since, until}).
+  //    A name matches its target exactly or as a slug prefix ("Acme" for
+  //    acme-example); when several objects in the field match one target, only
+  //    the exact matches date it, so "MSA" never dates msa-renewal beside "MSA Renewal".
   const fm = page.frontmatter ?? {};
   for (const r of temporalRows) {
     if (r.link_source !== 'frontmatter' || !r.origin_field) continue;
     const field = fm[r.origin_field];
-    const items = Array.isArray(field) ? field : [field];
-    for (const item of items) {
-      if (!item || typeof item !== 'object') continue;
+    const named = (Array.isArray(field) ? field : [field]).flatMap(item => {
+      if (!item || typeof item !== 'object') return [];
       const obj = item as Record<string, unknown>;
       const name = typeof obj.name === 'string' ? obj.name : typeof obj.slug === 'string' ? obj.slug : null;
-      if (!name || !nameMatches(name, other(r))) continue;
+      const match = name ? nameMatch(name, other(r)) : null;
+      return name && match ? [{ obj, name, exact: match === 'exact' }] : [];
+    });
+    for (const { obj, name } of named.length > 1 ? named.filter(n => n.exact) : named) {
       for (const [key, kind] of [['since', 'start'], ['until', 'end']] as const) {
         const d = normalizePartialDate(stringish(obj[key]));
         if (!d) continue;
@@ -296,16 +325,12 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   }
 
   // 4. Tense of each owned assertion row, from compiled-truth mentions only.
-  const narrative = stripDatedLines(page.compiled_truth ?? '');
-  const narrativeRefs = referencesIn(narrative);
   for (const r of temporalRows) {
     const cues = relationSemantics(r.link_type) === 'state' ? cuesFor(r.link_type!) : null;
     if (!cues) { if (relationSemantics(r.link_type) === 'state') tense.set(rowKey(r), 'present'); continue; }
-    let past = 0, present = 0, prevEnd = 0;
-    for (const ref of narrativeRefs) {
-      const window = windowBefore(narrative, ref.index, prevEnd);
-      prevEnd = ref.index + 2;
-      if (!refersTo(ref.target, other(r))) continue;
+    let past = 0, present = 0;
+    for (const { target, window } of inputs.narrative) {
+      if (!refersTo(target, other(r))) continue;
       if (cues.past.test(window) || cues.end.test(window)) past++; else present++;
     }
     tense.set(rowKey(r), past > 0 && present === 0 && r.link_source !== 'frontmatter' ? 'past' : 'present');
@@ -325,8 +350,9 @@ function stringish(v: unknown): string | null {
   return /^\d{4}-\d{2}-\d{2}T00:00:00(?:\.0+)?Z$/.test(v) ? v.slice(0, 10) : v;
 }
 
-function nameMatches(name: string, slug: string): boolean {
+function nameMatch(name: string, slug: string): 'exact' | 'prefix' | null {
   const base = slug.split('/').pop()!.toLowerCase();
   const norm = name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return norm === base || base.startsWith(`${norm}-`) || normalizeLinkTarget(name).toLowerCase() === slug.toLowerCase();
+  if (norm === base || normalizeLinkTarget(name).toLowerCase() === slug.toLowerCase()) return 'exact';
+  return base.startsWith(`${norm}-`) ? 'prefix' : null;
 }

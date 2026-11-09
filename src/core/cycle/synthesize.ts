@@ -1,7 +1,9 @@
 import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
 import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { deferPublishOrThrow, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict } from './synthesize-postprocess.ts';
+import { reportFileHolds, reverseWriteDreamRefs, writeDreamPageFile } from './derived-write-through.ts';
+import { emptySessionSourceRouting, keepSessionSourceTranscripts, withSessionSourceRouting, type SessionSourceRouting } from './synthesize-source-routing.ts';
+import { deferPublishOrThrow, finishDeferredPostprocess, loadCommittedOutputsOrDefer, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict, type RetainedOutput } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -52,7 +54,6 @@ import { deferPublishOrThrow, postprocessManagedSynthesis, withPostprocessConfli
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
@@ -75,9 +76,11 @@ import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } f
 import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
-import { stampDreamProvenance } from './dream-provenance.ts';
-import { putDerivedPage, summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
-import { findLegacyCompletion, findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
+import { stampDreamProvenance, summaryProvenanceLines } from './dream-provenance.ts';
+import { activateSynthesisGenerations } from './synthesize-generations.ts';
+import { summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
+import { DREAM_SUMMARY_KIND, publishSinglePage } from '../generations/adapters/single-page.ts';
+import { findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
 // allow-list loader to filing-rules.ts (#2397); patterns.ts and the
@@ -89,15 +92,15 @@ import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscrip
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
-import { validateSourceId } from '../utils.ts';
-import { safeSplitIndex } from '../text-safe.ts';
+import { safeSplitIndex, truncateUtf8 } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
 import { withChatPhase, estimateChatCostUsd } from '../ai/chat-usage.ts';
 import { verifyAndRepairDreamPages, normForGrounding, readVerifyEpoch, loadChildWriteEpochs, isDreamOwnedPage, type QuoteVerifyStats, type TranscriptForVerify } from './synthesize-verify.ts';
 import { dreamBreakerRefusal, loadDreamBreaker } from './dream-breaker.ts';
 import { resolveTriageDecide, type TriageDecide, type TriageDecideStats } from './triage-decide.ts';
 import { OperationError } from '../ops/contract.ts';
-import { backoffUntil, recordUnreliableTriage, responseDiagnostic, triageBackoffDetails, TRIAGE_UNRELIABLE_BACKOFF, type TriageDiagnostic } from './triage-backoff.ts';
+import { isRetryableConnError } from '../retry-matcher.ts';
+import { backoffUntil, recordUnreliableTriage, responseDiagnostic, triageBackoffDetails, TRIAGE_UNRELIABLE_BACKOFF, VerdictCacheWrites, type TriageDiagnostic, type VerdictCacheFailure } from './triage-backoff.ts';
 import { resolveGroundingDecide } from './grounding-decide.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
 
@@ -248,6 +251,12 @@ function warnUnknownModelOnce(model: string): void {
  *
  * Pure function. Tested by `test/cycle/synthesize-chunker.test.ts`.
  */
+/** #7240: the skip reason for a transcript whose child could not be queued: `submit_failed (<code>): <message>`. */
+function submitFailedReason(e: unknown): string {
+  const code = e instanceof OperationError ? e.code : (e as { code?: unknown } | null)?.code;
+  return `submit_failed${typeof code === 'string' ? ` (${code})` : ''}: ${e instanceof Error ? e.message : String(e)}`;
+}
+
 export function splitTranscriptByBudget(
   content: string,
   contentHash: string,
@@ -396,12 +405,15 @@ export async function runPhaseSynthesize(
   // calls keep their own job:* tag — the innermost AsyncLocalStorage phase
   // wins (minions/worker.ts wraps each job), and that is intentional: the
   // authoritative child spend rolls up from minion_jobs token columns below.
-  return withChatPhase('phase:synthesize', () => runPhaseSynthesizeInner(engine, opts));
+  const startedAt = Date.now(); // #6757: outputs an earlier pass deferred finish even when this pass returns before postprocessing
+  const routing = emptySessionSourceRouting(); // #7805: corpus files left out because they belong to another source, or to none yet
+  return withChatPhase('phase:synthesize', async () => withSessionSourceRouting(await finishDeferredPostprocess(engine, opts, startedAt, await runPhaseSynthesizeInner(engine, opts, routing), loadSynthConfig), routing, opts.sourceId ?? 'default'));
 }
 
 async function runPhaseSynthesizeInner(
   engine: BrainEngine,
   opts: SynthesizePhaseOpts,
+  routing: SessionSourceRouting,
 ): Promise<PhaseResult> {
   const start = Date.now();
   let ownedPrivateQueue: { queue: MinionQueue; name: string } | null = null;
@@ -492,7 +504,7 @@ async function runPhaseSynthesizeInner(
     const priorContradictionsBlock = await loadPriorContradictionsBlock(engine);
 
     // Discover: the corpus walk (or --input) plus #4419 imported conversation pages.
-    const transcripts = await withConversationPages(engine, opts, config, opts.inputFile
+    const transcripts = await keepSessionSourceTranscripts(engine, await withConversationPages(engine, opts, config, opts.inputFile
       ? loadAdHocTranscript(opts.inputFile, config.minChars, config.excludePatterns, opts.bypassDreamGuard)
       : !config.corpusDir ? [] : discoverTranscripts({
           corpusDir: config.corpusDir,
@@ -515,7 +527,7 @@ async function runPhaseSynthesizeInner(
               ].map(prefix => join(opts.brainDir, prefix)),
           // #5413: corpus files captured from gbrain's own claude-cli calls.
           selfCaptureSessionIds: claudeCliSelfSessionIds(),
-        }));
+        })), { corpusDir: config.corpusDir, sourceId: opts.sourceId ?? 'default', readOnly: opts.dryRun }, routing);
 
     if (transcripts.length === 0) {
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
@@ -531,7 +543,7 @@ async function runPhaseSynthesizeInner(
       process.stderr.write(`[dream] warning: verdict cache sweep failed: ${e instanceof Error ? e.message : String(e)}\n`);
     }
 
-    const { completed, successfulLegacyKeys, successfulV2Keys, synthesisIdentity } = await partitionCompletedSynthesis(engine, transcripts, opts.sourceId ?? 'default', maintenance, opts.dryRun);
+    const { completed, retainedSkips, successfulV2Keys, synthesisIdentity } = await partitionCompletedSynthesis(engine, transcripts, opts.sourceId ?? 'default', maintenance, opts.dryRun);
     const synthesisState = { candidates: transcripts.length - completed.size, already_synthesized: completed.size };
     const pass = await runTriagePass(engine, transcripts.filter(t => !completed.has(t.filePath)), {
       model: config.triage.model,
@@ -567,7 +579,7 @@ async function runPhaseSynthesizeInner(
       judged: pass.judged,
       cache_hits: pass.cacheHits,
       unreliable: pass.unreliable,
-      deferred: pass.deferred, ...triageBackoffDetails(pass.backoff),
+      deferred: pass.deferred, ...triageBackoffDetails(pass.backoff), ...(pass.verdictCacheFailures.length ? { verdict_cache_failures: pass.verdictCacheFailures } : {}),
       degraded: degradedCount,
       below_threshold: pass.reports.filter(r => r.score !== null && !r.worth).length,
       // F6 spend visibility: judge-call tokens for this pass's cache MISSES
@@ -674,6 +686,7 @@ async function runPhaseSynthesizeInner(
     // verified whole; older pages are verified on their newly written units.
     const verifySince = await readVerifyEpoch(engine);
     const childIds: number[] = [];
+    const summaryRevision = maintenance ? null : (await engine.readPageSnapshot(buildDreamSummarySlug(config.outputRoot, summaryDate), { sourceId: cycleSourceId, includeDeleted: true }))?.revision ?? null;
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
     /** #1978: map child job_id → source transcript path so written pages get a raw_source stamp. */
@@ -741,19 +754,12 @@ async function runPhaseSynthesizeInner(
       // completed under the pre-v2 path-based key family — single-chunk OR
       // a full chunked set — treat as already-synthesized and skip.
       // Prevents a full paid re-synthesis when the corpus root moves or
-      // the chunking outcome changes across versions.
-      const legacyCompletion = findLegacyCompletion(
-        successfulLegacyKeys,
-        t.filePath,
-        hash16,
-      );
-      if (legacyCompletion) {
-        skipReports.push({
-          filePath: t.filePath,
-          reason: legacyCompletion === 'chunked'
-            ? 'already_synthesized_legacy_chunked'
-            : 'already_synthesized_legacy_single_chunk',
-        });
+      // the chunking outcome changes across versions. #6924: a managed
+      // brain also skips completions recorded before it went managed
+      // (partitionCompletedSynthesis decides which ones count).
+      const retainedSkip = retainedSkips.get(t.filePath);
+      if (retainedSkip) {
+        skipReports.push({ filePath: t.filePath, reason: retainedSkip });
         continue;
       }
 
@@ -873,6 +879,14 @@ async function runPhaseSynthesizeInner(
       // (adversarial finding). Coalesced rows are another run's bookkeeping
       // and must not be cancelled.
       const transcriptFreshIds: number[] = [];
+      const rollbackTranscriptChunks = async (): Promise<void> => {
+        for (const id of transcriptFreshIds) {
+          try { await queue.cancelJob(id); } catch { /* best-effort rollback */ }
+          if (childIds.includes(id)) childIds.splice(childIds.indexOf(id), 1);
+          jobRawSource.delete(id);
+          chunkInfo.delete(id);
+        }
+      };
       const prompts = chunks.map((chunk, i) => buildSynthesisPrompt(
         t, chunk, i, chunks.length, priorContradictionsBlock, config.outputRoot,
         buildTriageMapBlock(triageVerdict, chunk, chunks.length),
@@ -894,8 +908,8 @@ async function runPhaseSynthesizeInner(
         label: `synthesize:${basename(t.filePath)}`,
       });
       if (!spend.allowed) {
-        process.stderr.write(`[dream] synthesize budget: ${spend.reason}; deferring ${basename(t.filePath)} and the rest of this run\n`);
-        budgetExhaustedDeferrals.push(basename(t.filePath));
+        const alone = overBudgetAloneReason(spend, t.basename);
+        if (alone) skipReports.push({ filePath: t.filePath, reason: alone }); else { process.stderr.write(`[dream] synthesize budget: ${spend.reason}; deferring ${basename(t.filePath)} and the rest of this run\n`); budgetExhaustedDeferrals.push(basename(t.filePath)); }
         continue;
       }
       for (let i = 0; i < chunks.length; i++) {
@@ -912,7 +926,8 @@ async function runPhaseSynthesizeInner(
             ? `${t.contentHash.slice(0, 6)}-c${i}`
             : t.contentHash.slice(0, 6),
           oneshot_task_prefixes: [config.reflectionsPrefix, config.originalsPrefix], // #6160: oneshot task shapes
-          require_writes: true,
+          ...(maintenance ? { dream_output: { raw_source: t.filePath, transcript_hash: t.contentHash, cycle_date: summaryDate, quote_verify: config.quoteVerify, ...(t.seat ? { seat: t.seat } : {}) } } : {}), // GBRA-60
+          require_writes: true, ...(t.corpusSource ? { corpus_source: t.corpusSource } : {}), // #7850: re-resolved when the child runs
           // #1586: scope every child tool call to the cycle's resolved source
           // so put_page writes land there instead of the hardcoded 'default'.
           ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
@@ -968,18 +983,17 @@ async function runPhaseSynthesizeInner(
           // partial chunk set would write partial pages for a transcript the
           // skip report says was skipped.
           if (isQueueQuotaExceededError(e)) {
-            for (const id of transcriptFreshIds) {
-              try { await queue.cancelJob(id); } catch { /* best-effort rollback */ }
-              const idx = childIds.indexOf(id);
-              if (idx >= 0) childIds.splice(idx, 1);
-              jobRawSource.delete(id);
-              chunkInfo.delete(id);
-            }
+            await rollbackTranscriptChunks();
             skipReports.push({ filePath: t.filePath, reason: `admission_quota: ${e.message}` });
             quotaHit = true;
             break;
           }
-          throw e;
+          // #7240: one transcript whose child cannot be queued is skipped, never the phase: rethrowing cancelled every
+          // child already queued for the other transcripts. A lost connection or a cancellation still ends the phase.
+          if (opts.signal?.aborted || isRetryableConnError(e)) throw e;
+          await rollbackTranscriptChunks();
+          skipReports.push({ filePath: t.filePath, reason: submitFailedReason(e) });
+          break;
         }
         // Self-heal (#4152 C1): an idempotency-coalesced row still `waiting`
         // in a FOREIGN dream-inline-* queue was stranded by a previously
@@ -1135,11 +1149,11 @@ async function runPhaseSynthesizeInner(
     // (source, slug) row. #1586: refs are stamped with the cycle's resolved
     // source (children write there via SubagentHandlerData.source_id;
     // cycleSourceId is hoisted above the fan-out for the daily cap).
-    // F6 rule-D visibility: track which children actually wrote pages, so a
-    // rescued/passed transcript whose child declined to write (task D) is
-    // distinguishable from a triage miss in the phase telemetry.
+    // F6 rule-D visibility: track which children wrote pages, so a rescued/passed transcript
+    // whose child declined to write (task D) is distinguishable from a triage miss in telemetry.
     const jobsWithPages = new Set<number>();
-    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages), worthProcessing);
+    const committedOutputs = maintenance ? await loadCommittedOutputsOrDefer(engine, maintenance, childIds, { jobRawSource, transcripts: worthProcessing, signal: opts.signal }) : undefined;
+    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages, committedOutputs?.outputs), worthProcessing);
     let finalizedRefs = writtenRefs;
 
     // Grounding gate: verify every page the children wrote (whole page when
@@ -1148,15 +1162,15 @@ async function runPhaseSynthesizeInner(
     // chunks or the markdown body. Fail-open (abort still unwinds); kill
     // switch: dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [];
+    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [], postprocessDeferral: Awaited<ReturnType<typeof postprocessManagedSynthesis>>['deferral'] = null;
     const sinceByTranscript = await loadChildWriteEpochs(engine, childIds, jobRawSource, verifySince);
     const grounding = config.quoteVerify ? await resolveGroundingDecide(engine) : undefined;
     if (maintenance) {
       const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
-        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, meetingTranscriptsDir: config.meetingTranscriptsDir });
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, committedOutputs, meetingTranscriptsDir: config.meetingTranscriptsDir });
       writtenRefs = processed.writtenRefs;
       finalizedRefs = processed.finalizedRefs;
-      [publishPending, postprocessConflicts] = [processed.pending, processed.conflicts];
+      [publishPending, postprocessConflicts, postprocessDeferral] = [processed.pending, processed.conflicts, processed.deferral];
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(worthProcessing.map(t => [t.filePath, { content: t.content }]));
@@ -1173,20 +1187,25 @@ async function runPhaseSynthesizeInner(
     if (!maintenance) await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0)
-      : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
+    const fileHolds: string[] = [];
+    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0) : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal, fileHolds);
 
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
-      const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
-      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
-        .catch((e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
+      const preserveSummary = !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
+      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance, summaryRevision)
+        .then(held => held && fileHolds.push(held), (e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
     // spend, no cooldown stamp (the next run must retry these transcripts).
     throwIfAborted(opts.signal, '[dream] synthesize completion');
+    const synthesisGenerations = await activateSynthesisGenerations(engine, { sourceId: cycleSourceId, maintenance, brainDir: opts.brainDir,
+      transcripts: worthProcessing, refs: writtenRefs, outcomes: childOutcomes, jobRawSource, deferred: new Set(budgetExhaustedDeferrals),
+      publicationIncomplete: publishPending > 0 || postprocessConflicts.length > 0 || postprocessDeferral !== null,
+      corpusDir: config.corpusDir, meetingDir: config.meetingTranscriptsDir });
+    fileHolds.push(...synthesisGenerations.file_holds);
 
     // CDX-8: deferred-embed closure. Oneshot children write chunks with
     // `embedding IS NULL`; the global `embed` phase only runs on SOME
@@ -1353,7 +1372,7 @@ async function runPhaseSynthesizeInner(
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
-    return withPostprocessConflicts(postprocessConflicts, withPublishPending(publishPending, ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
+    return reportFileHolds(withPostprocessConflicts(postprocessConflicts, withPublishPending(publishPending, ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
@@ -1363,6 +1382,7 @@ async function runPhaseSynthesizeInner(
       written_slugs: writtenSlugs,
       reverse_write_count: reverseWriteCount,
       child_outcomes: childOutcomes,
+      synthesis_generations: synthesisGenerations,
       // Children submitted (one per chunk for chunked transcripts; one per
       // transcript for single-chunk). Differs from transcripts_processed
       // when chunking is in play.
@@ -1420,7 +1440,7 @@ async function runPhaseSynthesizeInner(
         // child counters + triage pass usage). cost_usd null when unpriced.
         spend: spendBlock,
       },
-    })));
+    }), postprocessDeferral)), fileHolds, 'page');
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL', e instanceof Error ? (e.message || 'synthesize phase threw') : String(e),
       e instanceof OperationError ? e.suggestion : undefined), e instanceof OperationError ? { error_code: e.code } : {});
@@ -2171,7 +2191,7 @@ Quote verbatim; never paraphrase inside "quote".`;
     // buildTriageMapBlock (security review, #4152).
     const collapse = (s: string): string => s.replace(/\s+/g, ' ').trim();
     const contentType = typeof parsed.content_type === 'string'
-      ? collapse(parsed.content_type).toLowerCase().slice(0, 40) || null
+      ? truncateUtf8(collapse(parsed.content_type).toLowerCase(), 40) || null
       : null;
     const segments: TriageSegment[] = Array.isArray(parsed.segments)
       ? parsed.segments
@@ -2180,15 +2200,15 @@ Quote verbatim; never paraphrase inside "quote".`;
             && (s as { quote: string }).quote.trim().length > 0)
           .slice(0, 8)
           .map(s => ({
-            quote: collapse(s.quote).slice(0, 300),
-            ...(typeof s.note === 'string' && s.note.trim() ? { note: collapse(s.note).slice(0, 200) } : {}),
+            quote: truncateUtf8(collapse(s.quote), 300),
+            ...(typeof s.note === 'string' && s.note.trim() ? { note: truncateUtf8(collapse(s.note), 200) } : {}),
           }))
       : [];
     const entities = Array.isArray(parsed.entities)
       ? parsed.entities
           .filter((e): e is string => typeof e === 'string' && e.trim().length > 0)
           .slice(0, 12)
-          .map(e => collapse(e).slice(0, 80))
+          .map(e => truncateUtf8(collapse(e), 80))
       : [];
     const reasons = Array.isArray(parsed.reasons)
       ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
@@ -2245,6 +2265,13 @@ export function parseSynthV2Key(key: string): ParsedSynthV2Key | null {
   } catch {
     return null;
   }
+}
+
+/** A transcript over the whole synthesis cap on its own is skipped (like oversize_after_split), never a deferral of the rest; null for a cumulative denial or a 0 cap. */
+function overBudgetAloneReason(spend: { estimatedCostUsd: number; budgetUsd: number }, name: string): string | null {
+  if (spend.budgetUsd <= 0 || spend.estimatedCostUsd <= spend.budgetUsd) return null;
+  process.stderr.write(`[dream] transcript ${name} alone is estimated at $${spend.estimatedCostUsd.toFixed(4)}, over the $${spend.budgetUsd.toFixed(2)} dream.synthesize.budget_usd cap; skipping it. Raise the cap or use a cheaper synthesis model.\n`);
+  return `over_budget_alone: $${spend.estimatedCostUsd.toFixed(4)} > $${spend.budgetUsd.toFixed(2)}`;
 }
 
 // ── Triage pass (#4152) — shared by the synthesize phase and dream retriage ──
@@ -2377,6 +2404,8 @@ export interface TriagePassResult {
   tokens: { in: number; out: number };
   /** S7 decide stats, present only when the slot is not off. */
   decide?: TriageDecideStats;
+  /** Verdicts judged this pass that the database refused to cache (GBRA-130 B-6); each still decided this pass. */
+  verdictCacheFailures: VerdictCacheFailure[];
 }
 
 /**
@@ -2386,7 +2415,11 @@ export interface TriagePassResult {
  * `score` is non-null AND `triage_version === TRIAGE_VERSION` AND
  * `model === cfg.model` (switching models re-judges, bounded by maxMs) AND it
  * postdates `staleBefore` (when set) AND `force` is off. Legacy boolean-era
- * rows always miss. `maxChars`/`maxTokens` are deliberately NOT part of
+ * rows always miss. With the decide triage slot acting, the same tuple under
+ * `cfg.model` is also a hit for the decide path (triage-decide.ts, #7307), so
+ * a transcript today's triage judged is never re-sent to the decide provider.
+ * A chat_fallback_chain answer (`answeredBy`) is never stored, so it can't be
+ * a hit for either path. `maxChars`/`maxTokens` are deliberately NOT part of
  * validity — tuning them must not cold-restart the corpus; use
  * `gbrain dream retriage --force` to re-judge under new sampling knobs.
  *
@@ -2399,7 +2432,9 @@ export interface TriagePassResult {
  * Failure contract (byte-compatible with the pre-#4152 sequential loop):
  * a null judge client or an AIConfigError degrades PER TRANSCRIPT (reason
  * entry, nothing cached, phase continues); any other error aborts new pulls,
- * lets in-flight items settle, and rethrows (the phase fails).
+ * lets in-flight items settle, and rethrows (the phase fails). A verdict the
+ * database refuses to cache for one transcript does not stop the pass
+ * (`VerdictCacheWrites`, GBRA-130 B-6).
  *
  * Lock renewal: `yieldDuringPhase` ticks at most once per 30s (single-flight).
  * The cycle lock has its own background refresher (cycle.ts
@@ -2430,6 +2465,7 @@ export async function runTriagePass(
   let cursor = 0;
   let abortError: unknown = null;
   let stopped = false;
+  const verdictCache = new VerdictCacheWrites();
 
   // Coarse single-flight lock-renewal tick (at most every 30s).
   let lastTick = start;
@@ -2454,11 +2490,13 @@ export async function runTriagePass(
   const gate = (v: RescueVerdictLike, content: string) =>
     passesTriageGate(v, content, cfg.threshold, rescueCfg, cfg.decide?.gate);
 
+  // Shadow / inactive decide observes only transcripts today's triage judged this pass, never a cache hit.
+  const freshlyJudged = new Set<number>();
   const processOne = async (idx: number): Promise<void> => {
     const d = cfg.decide;
-    if (!d?.acting) { await processLlm(idx); if (d) await d.observe(transcripts[idx]); return; }
+    if (!d?.acting) { await processLlm(idx); if (d && freshlyJudged.has(idx)) await d.observe(transcripts[idx]); return; }
     const t = transcripts[idx];
-    const r = await d.triage(t, { triageVersion: TRIAGE_VERSION, force: cfg.force, staleBefore: cfg.staleBefore, signal: cfg.signal, budgetExhausted });
+    const r = await d.triage(t, { triageVersion: TRIAGE_VERSION, llmModel: cfg.model, force: cfg.force, staleBefore: cfg.staleBefore, signal: cfg.signal, budgetExhausted });
     if (!r.verdict) {
       if (r.deferred || judge) return processLlm(idx);
       reports[idx] = { filePath: t.filePath, worth: true, score: null, content_type: null, reasons: [r.reason ?? 'decide triage no-change'], cached: false };
@@ -2467,7 +2505,8 @@ export async function runTriagePass(
     if (r.cached) cacheHits++;
     else { judged++; if (cfg.shouldStop?.()) stopped = true; }
     byPath.set(t.filePath, r.verdict);
-    reports[idx] = { filePath: t.filePath, worth: gate(r.verdict, t.content).pass, score: r.verdict.score, content_type: r.verdict.content_type, reasons: r.verdict.reasons, cached: r.cached === true };
+    const g = gate(r.verdict, t.content);
+    reports[idx] = { filePath: t.filePath, worth: g.pass, ...(g.rescued ? { rescued: true, verified_segments: g.verified_segments } : {}), score: r.verdict.score, content_type: r.verdict.content_type, reasons: r.verdict.reasons, cached: r.cached === true };
   };
 
   const processLlm = async (idx: number): Promise<void> => {
@@ -2575,7 +2614,7 @@ export async function runTriagePass(
       if (triage.answeredBy) {
         process.stderr.write(`[dream] triage for ${t.basename} came from fallback model ${triage.answeredBy}; not caching in dream_verdicts\n`);
       } else {
-        await engine.putDreamVerdict(t.filePath, t.contentHash, {
+        await verdictCache.put(engine, t, {
           worth_processing: triage.worth_processing,
           reasons: triage.reasons,
           score: triage.score,
@@ -2584,7 +2623,7 @@ export async function runTriagePass(
           entities: triage.entities,
           model: cfg.model,
           triage_version: TRIAGE_VERSION,
-        });
+        }, { existing, keepExisting: existing !== null && isTriageCacheValid(existing, cfg.model), signal: cfg.signal });
       }
       byPath.set(t.filePath, {
         worth_processing: triage.worth_processing,
@@ -2607,6 +2646,7 @@ export async function runTriagePass(
         reasons: triage.reasons,
         cached: false,
       };
+      freshlyJudged.add(idx);
     } catch (e) {
       // AIConfigError at chat time = provider auth/config went bad mid-run
       // (revoked key, recipe misconfig surfacing at first real call). Skip
@@ -2649,6 +2689,7 @@ export async function runTriagePass(
     Array.from({ length: Math.min(concurrency, Math.max(1, transcripts.length)) }, () => worker()),
   );
   if (abortError !== null) throw abortError;
+  await verdictCache.backOff(engine, { model: cfg.model, triageVersion: TRIAGE_VERSION, aborted: cfg.signal?.aborted === true });
 
   // Defensive: today every claimed index either sets its report or the pass
   // rethrows above, so no holes can exist — but a future early-exit path
@@ -2669,7 +2710,7 @@ export async function runTriagePass(
     }
   }
 
-  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, backoff: backoffCount, tokens: { in: tokensIn, out: tokensOut }, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
+  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, backoff: backoffCount, tokens: { in: tokensIn, out: tokensOut }, verdictCacheFailures: verdictCache.failures, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -2772,7 +2813,7 @@ export function buildTriageMapBlock(
     lines.push('- candidate segments:');
     for (let i = 0; i < segments.length; i++) {
       const s = segments[i];
-      lines.push(`  ${i + 1}. "${s.quote.slice(0, 300)}"${s.note ? ` — ${s.note.slice(0, 200)}` : ''}`);
+      lines.push(`  ${i + 1}. "${truncateUtf8(s.quote, 300)}"${s.note ? ` — ${truncateUtf8(s.note, 200)}` : ''}`);
     }
   }
   if (chunkTotal > 1) {
@@ -2913,6 +2954,7 @@ async function collectChildPutPageSlugs(
   // collects the job ids that produced ≥1 put_page write, so the caller can
   // count zero-page children without a second subagent_tool_executions scan.
   outJobsWithPages?: Set<number>,
+  committed: RetainedOutput[] = [], // #6616: canonical slug of a managed child's committed write; unmatched keeps its raw slug
 ): Promise<Array<{ slug: string; source_id: string; raw_source?: string; first_write_at?: Date }>> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
@@ -2949,7 +2991,8 @@ async function collectChildPutPageSlugs(
     const jobId = Number(r.job_id);
     outJobsWithPages?.add(jobId);
     const ci = chunkInfo.get(jobId);
-    const slug = ci ? rewriteChunkedSlug(r.slug, ci.hash6, ci.idx) : r.slug;
+    const written = committed.find(o => Number(o.job_id) === jobId && o.input_slug === r.slug)?.request.slug ?? r.slug;
+    const slug = ci ? rewriteChunkedSlug(written, ci.hash6, ci.idx) : written;
     if (!rewritten.has(slug) || rewritten.get(slug) === undefined) {
       rewritten.set(slug, jobRawSource?.get(jobId));
     }
@@ -2966,43 +3009,11 @@ async function collectChildPutPageSlugs(
 
 // ── Reverse-write DB rows → markdown files ───────────────────────────
 
-async function reverseWriteRefs(
-  engine: BrainEngine,
-  brainDir: string,
-  refs: Array<{ slug: string; source_id: string; first_write_at?: Date }>,
-  nativeSourceId = 'default',
-  signal?: AbortSignal,
-): Promise<number> {
-  let count = 0;
-  for (const { slug, source_id, first_write_at } of refs) {
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
-    // v0.32.8 F6: validate source_id is filesystem-safe before any join().
-    validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
-    // #4077: re-check after the row reads — an abort that lands during
-    // getPage/getTags must not reach this ref's file write.
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
-    try {
-      const md = isDreamOwnedPage(page, first_write_at) ? renderPageToMarkdown(page, tags) : serializePageToMarkdown(page, tags);
-      // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide. Pages belonging to
-      // the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
-    } catch (e) {
-      // Per-slug failures are non-fatal — phase continues.
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
-    }
-  }
-  return count;
+/** Reverse-render each page a child wrote to its markdown file (`reverseWriteDreamRefs`, #6982); holds go to `held`. */
+async function reverseWriteRefs(engine: BrainEngine, brainDir: string, refs: Array<{ slug: string; source_id: string; first_write_at?: Date }>,
+  nativeSourceId = 'default', signal?: AbortSignal, held?: string[]): Promise<number> {
+  return reverseWriteDreamRefs(engine, brainDir, refs, { phase: 'synthesize', nativeSourceId, signal, held,
+    render: (page, tags, ref) => isDreamOwnedPage(page, ref.first_write_at) ? renderPageToMarkdown(page, tags) : serializePageToMarkdown(page, tags) });
 }
 
 /**
@@ -3052,6 +3063,11 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
  */
 const SUMMARY_LINK_SAMPLE_LIMIT = 20;
 
+/**
+ * Write the cycle's summary index page: the database row (unmanaged: a single-item `dream_summary` generation bound to
+ * `expectedRevision`, the summary's revision before the run's children were submitted (read here when not given), the prior page versioned first; GBRA-161 PR 5), then its file through `writeDreamPageFile` (#6982). Returns the file's `file_database_drift` entry when the file
+ * holds an edit the database lacks and was kept.
+ */
 async function writeSummaryPage(
   engine: BrainEngine,
   brainDir: string,
@@ -3062,8 +3078,11 @@ async function writeSummaryPage(
   sourceId = 'default',
   signal?: AbortSignal,
   maintenance?: MaintenanceAuthority | null,
-): Promise<void> {
+  expectedRevision?: string | null,
+): Promise<string | undefined> {
   throwIfAborted(signal, '[dream] synthesize summary');
+  const revision = expectedRevision !== undefined || maintenance ? expectedRevision ?? null
+    : (await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true }))?.revision ?? null;
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
   const failed = childOutcomes.length - completed;
 
@@ -3076,8 +3095,8 @@ async function writeSummaryPage(
   if (writtenSlugs.length > 0) {
     // #4337: deterministic, lexicographically sorted sample — small cycles
     // stay fully linked; large cycles list exactly SUMMARY_LINK_SAMPLE_LIMIT
-    // links while keeping exact totals above. The full child set stays
-    // recoverable via per-page provenance frontmatter (pointer below).
+    // links while keeping exact totals above. The provenance section below
+    // names the frontmatter query and what it misses (#6642).
     const sampledSlugs = [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT);
     lines.push(
       writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT
@@ -3088,14 +3107,7 @@ async function writeSummaryPage(
       '',
     );
     if (writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT) {
-      lines.push(
-        '## Full output provenance',
-        '',
-        `The complete ${writtenSlugs.length}-page set is recoverable in this source by querying page frontmatter for ` +
-          `\`dream_generated: true\` and \`dream_cycle_date: ${summaryDate}\`, excluding \`${summarySlug}\`. ` +
-          'Every child page carries those provenance fields; this summary intentionally links only the deterministic sample above.',
-        '',
-      );
+      lines.push(...await summaryProvenanceLines(engine, { sourceId, cycleDate: summaryDate, summarySlug, writtenSlugs }));
     }
   }
 
@@ -3107,10 +3119,10 @@ async function writeSummaryPage(
     {
       dream_generated: true,
       dream_cycle_date: summaryDate,
-      // #4337: immutable mirror — reruns preserve the first cycle date via
-      // stampDreamProvenance/renderPageToMarkdown; the summary is per-date so
-      // both keys are simply the summary's own date.
+      // #4337: immutable mirror (reruns keep the first date via stampDreamProvenance); #6773: `created` is the
+      // temporal key lint requires. The summary is per-date, so each key is simply the summary's own date.
       dream_created_cycle_date: summaryDate,
+      created: summaryDate,
       // #1978: deterministic index page — no source document of its own;
       // raw traces live on the listed pages. Explicit exemption keeps the
       // doctor raw_provenance check quiet.
@@ -3124,13 +3136,16 @@ async function writeSummaryPage(
 
   const [{ parseMarkdown }, derivation] = await Promise.all([import('../markdown.ts'), summaryDerivation(engine, sourceId, writtenSlugs)]);
   const parsed = parseMarkdown(fullMarkdown);
-  if (!maintenance) await putDerivedPage(engine, derivation, summarySlug, {
-    type: parsed.type,
-    title: parsed.title,
-    compiled_truth: parsed.compiled_truth,
-    timeline: parsed.timeline,
-    frontmatter: parsed.frontmatter,
-  }, { sourceId });
+  if (!maintenance) {
+    try {
+      await publishSinglePage(engine, { kind: DREAM_SUMMARY_KIND, sourceId, slug: summarySlug, expectedRevision: revision, derivation, page: { type: parsed.type,
+        title: parsed.title, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline, frontmatter: parsed.frontmatter, tags: parsed.tags } });
+    } catch (e) {
+      if (!(e instanceof OperationError && e.code === 'generation_fenced')) throw e;
+      process.stderr.write(`[dream] summary ${summarySlug} changed while this run composed it, so it was left as it is; the next run writes it.\n`);
+      return undefined;
+    }
+  }
 
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');
@@ -3160,13 +3175,14 @@ async function writeSummaryPage(
     return;
   }
   try {
-    const filePath = join(brainDir, `${summarySlug}.md`);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, fullMarkdown, 'utf8');
+    const file = await writeDreamPageFile(engine, brainDir, summarySlug, sourceId, { nativeSourceId: sourceId, markdown: fullMarkdown });
+    if (!file.written && file.held) return file.held;
+    if (!file.written && file.error) process.stderr.write(`[dream] summary file-write failed: ${file.error}\n`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);
   }
+  return undefined;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

@@ -40,7 +40,8 @@ describe('checkSourceConfigShape (#2829)', () => {
     // Paste-ready repair SQL is part of the hint.
     expect(result.message).toContain('UPDATE sources SET config');
     expect(result.message).toContain('jsonb_array_elements');
-    expect(result.message).toContain('IS JSON');
+    expect(result.message).toContain('gbrain_try_jsonb');
+    expect(result.message).not.toContain('IS JSON');
     // #5002: name commands that actually rewrite the config column — never the
     // "any 'gbrain sources' config write" category (set-cr-mode writes another
     // column and leaves the check red).

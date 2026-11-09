@@ -64,7 +64,8 @@ import {
   removeClaudeHooks,
 } from '../core/bootstrap/hooks.ts';
 import { removeCodexHooks, writeCodexHooks } from '../core/bootstrap/codex-hooks.ts';
-import { isRegistrationSurface, registeredSurface, stdioServeArgv } from '../core/mcp-registration.ts';
+import { ensureHookLauncher, hookLauncherPath } from '../core/setup/hook-launcher.ts';
+import { isRegistrationSurface, registeredAdvertise, registeredSurface, REGISTRATION_ADVERTISE, REGISTRATION_SURFACE, registrationAdvertise, stdioServeArgv } from '../core/mcp-registration.ts';
 import type { McpSurface } from '../mcp/surface.ts';
 import {
   guardReceiptOverwrite,
@@ -109,6 +110,7 @@ import {
 } from '../core/bootstrap/status.ts';
 import { verifyWorkspace, resolveVerifySourceId, deriveWorkspaceSourceId } from '../core/bootstrap/verify.ts';
 import { auditWritebackContract, repairWritebackContract } from '../core/bootstrap/contract.ts';
+import { INSTALL_PIN } from '../core/install-ref.ts';
 
 export const BOOTSTRAP_HELP = `gbrain bootstrap — paste-in agent install (Claude Code / Codex / opencode)
 
@@ -123,9 +125,9 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
             --status              Gate: exits nonzero until required answers exist.
             --show                Read-back payload (all answers + confirm hash).
             --confirm <hash>      Record the human's confirmation of the read-back.
-  render [--force] [--only F] [--minimal]
+  render [--force] [--only F] [--minimal] [--host openclaw|generic|auto]
                                   Render identity files from the confirmed answers.
-                                  Never clobbers; --force backs up first.
+                                  Never clobbers; --force backs up first. OpenClaw: SCHEDULES.md.
   contract [--repair]             Audit the same-turn GBrain write-back contract.
                                   --repair appends it additively and backs up AGENTS.md.
   hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]
@@ -203,9 +205,10 @@ const SUBCOMMAND_HELP: Record<string, string> = {
     '  under your own account), verify the privacy bit via the API, push.',
   hooks:
     'gbrain bootstrap hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]\n' +
-    '                       [--seat <label> | --no-seat] [--surface verbs|starter|full]\n' +
-    '  Register MCP (--surface full unless given; a replaced entry keeps its surface) (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
-    '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).',
+    '                       [--seat <label> | --no-seat] [--surface verbs|starter|full] [--adopt [--name <server>]]\n' +
+    `  Register MCP (--surface ${REGISTRATION_SURFACE} --advertise ${REGISTRATION_ADVERTISE} unless given; a replaced entry keeps its surface, full when unreadable) (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n` +
+    '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).\n' +
+    '  --adopt (Codex): record the project .codex/config.toml server you manage yourself as the wire evidence after a passing verify; writes no config.',
   verify:
     'gbrain bootstrap verify [--json]\n' +
     '  The whole install contract (round-trip, graph floor, magic moment, scans, hooks smoke). Exit 0 or not done.',
@@ -396,7 +399,8 @@ async function verifyMcpTargetsWorkspace(
   name: string,
   gbrainBin: string,
   sourceId: string,
-): Promise<{ verdict: 'match' | 'mismatch' | 'unknown'; surface?: McpSurface | null }> {
+  hookLauncher?: string,
+): Promise<{ verdict: 'match' | 'mismatch' | 'unknown'; surface?: McpSurface | null; advertise?: McpSurface | null }> {
   // Exec-lane harnesses only. opencode registrations go through the direct
   // JSONC writer whose 4-state fingerprint IS the [FIX7] check (structural,
   // no exec) — it never routes here; 'unknown' keeps a stray call honest.
@@ -416,9 +420,9 @@ async function verifyMcpTargetsWorkspace(
   if (res.code !== 0) return { verdict: 'unknown' };
   const out = `${res.stdout}\n${res.stderr}`;
   if (out.trim() === '') return { verdict: 'unknown' };
-  const hasBin = out.includes(gbrainBin);
+  const hasBin = out.includes(gbrainBin) && (!hookLauncher || out.includes(hookLauncher));
   const hasSource = out.includes(`GBRAIN_SOURCE=${sourceId}`);
-  return { verdict: hasBin && hasSource ? 'match' : 'mismatch', surface: registeredSurface(out) };
+  return { verdict: hasBin && hasSource ? 'match' : 'mismatch', surface: registeredSurface(out), advertise: registeredAdvertise(out) };
 }
 
 /** Wall-clock cap on the best-effort `opencode mcp list` probe: `mcp list`
@@ -718,7 +722,7 @@ async function runStatus(ws: string, rest: string[], home: string): Promise<numb
   if (report.runbookSkew) {
     console.log(
       `\nWARNING: runbook stamp ${report.runbookSkew.runbookStamp} != installed binary ${report.runbookSkew.binaryVersion} — ` +
-        'prefer the binary; re-fetch the runbook from the latest-stable ref.',
+        'prefer the binary; re-fetch the runbook from the stable ref.',
     );
   }
   console.log('\nSupport (relay verbatim when something is broken):');
@@ -950,25 +954,25 @@ async function runRender(ws: string, rest: string[], home: string): Promise<numb
       /* canonical fallback applies */
     }
 
-    // source_id seam [source-id collision]: render is ENGINE-FREE (D5/ENG-2)
-    // and the sources registry lives only in the DB, so render cannot detect a
-    // 'workspace' id already claimed by another checkout. It therefore passes
-    // NO sourceId: render.ts preserves an existing manifest source_id and
-    // defaults new manifests to 'workspace'; verify (which holds the engine)
-    // detects the collision and persists a derived 'workspace-<hash>' id that
-    // every consumer reads back from the manifest.
+    // source_id seam [source-id collision]: render is ENGINE-FREE (D5/ENG-2) and the sources
+    // registry lives only in the DB, so render cannot detect a 'workspace' id already claimed
+    // by another checkout. It therefore passes NO sourceId: render.ts preserves an existing
+    // manifest source_id and defaults new manifests to 'workspace'; verify (which holds the
+    // engine) detects the collision and persists a derived 'workspace-<hash>' id that every
+    // consumer reads back from the manifest.
     const res = renderWorkspace(ws, {
       force,
       ...(only.length > 0 ? { only } : {}),
       minimal,
       derived,
       createdBy: `gbrain@${VERSION}`,
+      host: flagValue(rest, '--host'),
     });
 
     if (only.length === 0 && !minimal) writeRenderReceipt(home, ws);
     abortIfInjected('render');
 
-    console.log(`rendered: ${res.written.join(', ') || '(nothing new)'}`);
+    console.log(`${res.note ? `${res.note}\n` : ''}rendered: ${res.written.join(', ') || '(nothing new)'}`);
     if (res.skipped.length > 0) console.log(`kept (already present — use --force to overwrite): ${res.skipped.join(', ')}`);
     if (res.backups.length > 0) console.log(`backups: ${res.backups.join(', ')}`);
     return 0;
@@ -1053,6 +1057,18 @@ async function runRepo(ws: string, rest: string[], home: string, runner: ExecRun
   });
 }
 
+/** `hooks --adopt` (#4082): record an operator-managed Codex project connection as the wire evidence; writes no harness config. */
+async function runAdoptHooks(ws: string, rest: string[], home: string): Promise<number> {
+  const harnessFlag = flagValue(rest, '--harness');
+  const harness = isHarness(harnessFlag) ? harnessFlag : harnessFlag ? null : detectHarness();
+  if (!harness) { console.error('--adopt needs the harness — pass --harness codex'); return 2; }
+  if (readManifest(ws).state !== 'initialized') { console.error('not an initialized agent workspace — run `gbrain bootstrap render` first'); return 1; }
+  const { adoptConnection } = await import('../core/bootstrap/adopt-connection.ts');
+  const adopted = adoptConnection(ws, home, harness, flagValue(rest, '--name') ?? undefined);
+  for (const line of adopted.lines) (adopted.code === 0 ? console.log : console.error)(line);
+  return adopted.code;
+}
+
 async function runHooks(
   ws: string,
   rest: string[],
@@ -1112,7 +1128,7 @@ async function runHooks(
   if (!gbrainBin) {
     console.error(
       'cannot resolve an absolute gbrain binary path (GUI hosts inherit no PATH) — ' +
-        'install gbrain globally (`bun install -g github:garrytan/gbrain#latest-stable`) or pass --gbrain-bin <abs path>',
+        `install gbrain globally (\`bun install -g ${INSTALL_PIN}\`) or pass --gbrain-bin <abs path>`,
     );
     return 2;
   }
@@ -1266,12 +1282,13 @@ async function runHooks(
     if (harness === 'opencode') {
       // Direct-writer lane (no exec): registrations land via the JSONC
       // writer whose 4-state fingerprint is the [FIX7] check. Scope resolves
-      // to a FILE here — user → global config (absolute binary path),
+      // to a FILE here — user → global config (hook launcher + absolute binary, #8435),
       // project → committed-candidate opencode.json (PATH-resolved command;
       // no absolute machine paths in a file that travels, and no fail-open
       // analog exists — the sharing warning below is the mitigation).
       const configPath = mcpScope === 'project' ? opencodeProjectConfigPath(ws) : opencodeGlobalConfigPath();
-      const command = stdioServeArgv(mcpScope === 'project' ? 'gbrain' : gbrainBin, surfaceFlag ?? undefined);
+      const ocLauncher = mcpScope === 'project' ? [] : [hookLauncherPath(home)];
+      const command = [...ocLauncher, ...stdioServeArgv(mcpScope === 'project' ? 'gbrain' : gbrainBin, surfaceFlag ?? undefined, registrationAdvertise({ userChoseSurface: surfaceFlag !== null }))];
       const entry = {
         kind: 'local' as const,
         name: 'gbrain',
@@ -1302,7 +1319,8 @@ async function runHooks(
           const existingKind = opencodeEntryKind(existing, 'gbrain', { sourceId });
           const priorCommand = ((existing.mcp as Record<string, { command?: unknown }> | undefined)?.gbrain)?.command;
           const prior = existingKind !== 'absent' && !surfaceFlag && Array.isArray(priorCommand) ? registeredSurface(priorCommand.join(' ')) : undefined;
-          if (prior !== undefined) entry.command = stdioServeArgv(command[0], prior);
+          if (prior !== undefined) entry.command = [...ocLauncher, ...stdioServeArgv(command[ocLauncher.length]!, prior, registeredAdvertise((priorCommand as unknown[]).join(' ')))];
+          if (ocLauncher.length) ensureHookLauncher(ocLauncher[0]!);
           if (existingKind === 'ours-other-source') {
             console.error(`existing 'gbrain' opencode entry targets a DIFFERENT workspace — replacing it.`);
           }
@@ -1423,10 +1441,12 @@ async function runHooks(
           'workspace-bound registration with `--mcp-even-if-plugin`.',
       );
     }
-    const buildArgvs = (surface?: McpSurface | null) => harness === 'claude-code'
-      ? registerClaudeMcp({ gbrainBin, scope: mcpScope, sourceId, surface, ...(gbrainHome ? { gbrainHome } : {}) })
-      : registerCodexMcp({ gbrainBin, sourceId, surface, ...(gbrainHome ? { gbrainHome } : {}) });
-    const argvs = mcpPluginOwned ? [] : buildArgvs(surfaceFlag ?? undefined);
+    const hookLauncher = harness === 'codex' || mcpScope === 'user' ? hookLauncherPath(home) : undefined;
+    const buildArgvs = (surface?: McpSurface | null, advertise?: McpSurface | null) => harness === 'claude-code'
+      ? registerClaudeMcp({ gbrainBin, scope: mcpScope, sourceId, surface, advertise, ...(gbrainHome ? { gbrainHome } : {}), ...(hookLauncher ? { hookLauncher } : {}) })
+      : registerCodexMcp({ gbrainBin, sourceId, surface, advertise, ...(gbrainHome ? { gbrainHome } : {}), ...(hookLauncher ? { hookLauncher } : {}) });
+    const argvs = mcpPluginOwned ? [] : buildArgvs(surfaceFlag ?? undefined, registrationAdvertise({ userChoseSurface: surfaceFlag !== null }));
+    if (argvs.length && hookLauncher) try { ensureHookLauncher(hookLauncher); } catch (e) { console.error(`MCP registration skipped: ${(e as Error).message}`); return 1; }
     for (const argv of argvs) {
       const mcpName = argv[3] ?? 'gbrain'; // ['<host>','mcp','add',<name>,…]
       const res = await runner(argv);
@@ -1448,7 +1468,7 @@ async function runHooks(
         // [FIX7] "already registered" is NOT proof the registration is OURS.
         // Verify it targets this workspace's serve; if it points elsewhere,
         // remove + re-add rather than blessing a foreign/stale registration.
-        const { verdict, surface: priorSurface } = await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId);
+        const { verdict, surface: priorSurface, advertise: priorAdvertise } = await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId, hookLauncher);
         if (verdict === 'match') {
           console.log('MCP server already registered for this workspace — kept.');
         } else if (verdict === 'mismatch') {
@@ -1474,7 +1494,7 @@ async function runHooks(
             );
             return 1;
           }
-          const re = await runner(surfaceFlag || priorSurface === undefined ? argv : buildArgvs(priorSurface)[0]);
+          const re = await runner(surfaceFlag ? argv : buildArgvs(priorSurface === undefined ? 'full' : priorSurface, priorAdvertise)[0]);
           if (re.code !== 0 && !/already exists|already registered/i.test(re.stderr + re.stdout)) {
             console.error(`MCP re-registration failed (${argv.join(' ')}): ${re.stderr.trim() || `exit ${re.code}`}`);
             return 1;
@@ -1484,7 +1504,7 @@ async function runHooks(
           // is NOT ours. Re-verify and abort rather than bless a foreign
           // endpoint that would intercept memory ops. (Only the recorded
           // warn-then-continue step-2 smoke did this before; here it's fatal.)
-          const post = (await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId)).verdict;
+          const post = (await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId, hookLauncher)).verdict;
           if (post === 'mismatch') {
             console.error(
               `after replacing '${mcpName}', it STILL targets a different workspace/binary — ` +
@@ -1511,7 +1531,7 @@ async function runHooks(
     if (!mcpSkipped && !mcpPluginOwned) try {
       const listBin = harness === 'claude-code' ? 'claude' : 'codex';
       const scopeLabel = harness === 'claude-code' ? mcpScope : 'user-global';
-      const { verdict } = await verifyMcpTargetsWorkspace(runner, harness, 'gbrain', gbrainBin, sourceId);
+      const { verdict } = await verifyMcpTargetsWorkspace(runner, harness, 'gbrain', gbrainBin, sourceId, harness === 'codex' || mcpScope === 'user' ? hookLauncherPath(home) : undefined);
       if (verdict === 'match') {
         console.log(`MCP registered with ${harness} (scope: ${scopeLabel}) — verified targeting this workspace.`);
       } else if (verdict === 'mismatch') {
@@ -1552,7 +1572,7 @@ async function runHooks(
         try {
           r = cloudCarrier
             ? writeCommittedClaudeHooks(ws, { env: hookEnv })
-            : writeClaudeHooks(ws, { gbrainBin, env: hookEnv });
+            : writeClaudeHooks(ws, { gbrainBin, hookLauncher: ensureHookLauncher(hookLauncherPath(home)), env: hookEnv });
         } catch (e) {
           // Fail-closed on an unparseable settings file (either carrier): MCP
           // (step 1) still landed; record that, surface the fix, and exit
@@ -1589,7 +1609,7 @@ async function runHooks(
         // command carries NO GBRAIN_SOURCE — hooks.json is machine-global, a
         // baked source would stamp every codex session on this machine with
         // this repo's source; session-end resolves from the payload instead.
-        const r = writeCodexHooks({ gbrainBin });
+        const r = ((): ReturnType<typeof writeCodexHooks> => { try { return writeCodexHooks({ gbrainBin, hookLauncher: ensureHookLauncher(hookLauncherPath(home)) }); } catch (e) { return { ok: false, hooksPath: '', configPath: '', notes: [(e as Error).message] }; } })();
         if (r.ok) {
           hooksWritten = true;
           console.log(
@@ -2086,7 +2106,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
         code = await runRepo(ws, rest, home, runner);
         break;
       case 'hooks':
-        code = await runHooks(ws, rest, home, runner, opts.probeSpawn);
+        code = rest.includes('--adopt') ? await runAdoptHooks(ws, rest, home) : await runHooks(ws, rest, home, runner, opts.probeSpawn);
         break;
       case 'verify':
         code = await runVerify(ws, rest, home);

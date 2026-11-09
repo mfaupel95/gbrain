@@ -47,8 +47,9 @@ import { dirname, resolve } from 'path';
 import { hostname } from 'os';
 import type { BrainEngine } from '../engine.ts';
 import { tryAcquireDbLock, waitForDbLockTakeover, inspectLock, isLockHolderLive, type DbLockHandle } from '../db-lock.ts';
-import { currentBrainId, readWorkers } from './worker-registry.ts';
+import { currentBrainId, readWorkers, workerRegistryReadFailure } from './worker-registry.ts';
 import { autopilotOperatorPauseMarkerPath, autopilotPaused } from '../autopilot-paths.ts';
+import { gbrainPath } from '../config.ts';
 import { registerSignalOwner, triggerCleanupAndExit } from '../process-cleanup.ts';
 import { resolveEnvNumber } from '../env-number.ts';
 import { pidFileContents, processStartStamp } from './supervisor-pid.ts';
@@ -76,7 +77,7 @@ export interface SupervisorOpts {
   concurrency: number;
   /** Queue name (passed to child). Default: 'default'. */
   queue: string;
-  /** PID file path. Default: `${HOME}/.gbrain/supervisor.pid` (parent dir auto-created). */
+  /** PID file path. Default: `<gbrain home>/supervisor-<brain-id>.pid`, GBRAIN_HOME honoured (parent dir auto-created). */
   pidFile: string;
   /** Max consecutive crashes before giving up. Default: 10. */
   maxCrashes: number;
@@ -145,7 +146,6 @@ export interface SupervisorOpts {
 export const DEFAULT_PID_FILE: string = (() => {
   const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
   if (envOverride && envOverride.length > 0) return envOverride;
-  const home = process.env.HOME ?? '/tmp';
   // #1849: key the default pidfile on the brain id so two DIFFERENT brains
   // under one HOME don't share `supervisor.pid` and falsely block each other's
   // pidfile guard. Derived from config (no DB connect), so it's safe to
@@ -154,7 +154,7 @@ export const DEFAULT_PID_FILE: string = (() => {
   // singleton authority; this just removes the common-case footgun.
   let brainId = 'default';
   try { brainId = currentBrainId(); } catch { /* fallback 'default' */ }
-  return `${home}/.gbrain/supervisor-${brainId}.pid`;
+  return gbrainPath(`supervisor-${brainId}.pid`);
 })();
 
 const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
@@ -335,7 +335,7 @@ export interface QueueSubmitState {
   depth?: number;
   /** Age of the oldest waiting job on the queue, or null when depth is 0. */
   oldest_waiting_age_seconds?: number | null;
-  /** A supervisor DB lock is live, a registered worker serves the queue, or a live-lock active job proves one exists. */
+  /** A supervisor DB lock is live, a registered worker serves the queue, or a live-lock active job proves one exists. Absent when the worker registry is unreadable and nothing else proves a worker (liveness unknown). */
   worker_alive?: boolean;
   /** The autopilot pause marker is present — nothing will start until it clears. */
   paused?: boolean;
@@ -427,14 +427,14 @@ async function probeQueueStateInner(
   } catch {
     // Pre-migration brains lack the locks table — registry/active signals stand.
   }
-  let registeredWorker = false;
+  // An unreadable registry leaves the other signals standing, but their absence is then unknown liveness, not "no worker".
+  let registeredWorker = false, registryErrno: string | null = null;
   try {
     registeredWorker = readWorkers().some((w) => w.queue === queue);
-  } catch {
-    // Registry dir unreadable — remaining signals stand.
-  }
+  } catch (e) { registryErrno = workerRegistryReadFailure(e).errno; }
 
   const workerAlive = supervisorLive || registeredWorker || sig.activeHealthy > 0;
+  const livenessUnknown = !workerAlive && registryErrno !== null;
   const paused = autopilotPaused();
 
   // Same operator knob the doctor's queue_health depth check reads.
@@ -445,11 +445,8 @@ async function probeQueueStateInner(
       ? 'system paused by the operator (gbrain autopilot resume clears it) — job will not start until the pause clears'
       : 'system paused for migration — job will not start until the pause clears');
   }
-  if (!workerAlive) {
-    warnings.push(
-      `no live worker detected for queue '${queue}' — job will wait until one starts (gbrain jobs work --queue ${queue})`,
-    );
-  }
+  if (livenessUnknown) warnings.push(`worker liveness unknown for queue '${queue}': the worker registry is unreadable (${registryErrno}); check gbrain jobs supervisor status`);
+  else if (!workerAlive) warnings.push(`no live worker detected for queue '${queue}' — job will wait until one starts (gbrain jobs work --queue ${queue})`);
   if (sig.waiting > threshold) {
     warnings.push(`waiting depth ${sig.waiting} exceeds GBRAIN_QUEUE_WAITING_THRESHOLD (${threshold})`);
   }
@@ -457,7 +454,7 @@ async function probeQueueStateInner(
   const state: QueueSubmitState = {
     depth: sig.waiting,
     oldest_waiting_age_seconds: oldestAge,
-    worker_alive: workerAlive,
+    ...(livenessUnknown ? {} : { worker_alive: workerAlive }),
   };
   if (paused) state.paused = true;
   if (warnings.length > 0) state.warning = warnings.join('; ');
@@ -536,7 +533,8 @@ export function supervisorLockId(queue: string): string {
  *   - `no_lock`  — no live lock holder (nothing to assert).
  *   - `single`   — the live lock holder IS the local pidfile holder. Healthy.
  *   - `mismatch` — a live lock holder differs from the local pidfile holder:
- *                  a second supervisor likely ran with a different --max-rss.
+ *                  a second supervisor likely ran with a different --max-rss. PR #6463: the same pid whose `pidfileHost`
+ *                  (recorded in the PID file at lock time) equals the lock holder's host is `single` despite a drifted `localHost`.
  */
 export function classifySupervisorSingleton(args: {
   lockLive: boolean;
@@ -544,13 +542,13 @@ export function classifySupervisorSingleton(args: {
   lockHolderPid: number | null;
   localHost: string;
   localPid: number | null;
+  pidfileHost?: string | null;
 }): 'no_lock' | 'single' | 'mismatch' {
   if (!args.lockLive || args.lockHolderHost === null || args.lockHolderPid === null) {
     return 'no_lock';
   }
-  if (args.localPid === null) return 'mismatch';
-  const matches = args.lockHolderHost === args.localHost && args.lockHolderPid === args.localPid;
-  return matches ? 'single' : 'mismatch';
+  if (args.localPid === null || args.lockHolderPid !== args.localPid) return 'mismatch';
+  return args.lockHolderHost === args.localHost || (args.pidfileHost != null && args.lockHolderHost === args.pidfileHost) ? 'single' : 'mismatch';
 }
 
 export class MinionSupervisor {

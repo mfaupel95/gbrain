@@ -5,37 +5,29 @@
  * `g_token_env` / `gh_token_env` name is caught here instead.
  */
 import type { GoogleService } from '../google/types.ts';
-import type { GmailClient, CalendarClient, PeopleClient } from '../google/google-clients.ts';
+import { probeGoogleAccount, type GoogleAccountProbe, type GoogleIdentityClients } from '../google/api-access.ts';
 import type { GitHubClient, GitHubSourceConfig } from '../github-source.ts';
 import type { ConnectorAccount } from './connector-state.ts';
+import { CredentialError } from '../creds/errors.ts';
 
 /**
  * Google: the first enabled service whose granted scope can name the account
- * (Gmail profile, Calendar primary calendar, People `me`). Null when none can.
+ * (Gmail profile, Calendar primary calendar, People `me`), else the OAuth
+ * userinfo endpoint (#7073), with every per-service failure kept in the
+ * result. When nothing names the account, the failure is rethrown instead of
+ * reported as an account change (#7004): api_not_enabled first, then any
+ * other credential error, then the first other failure (a network error stays
+ * a transient failure, never an account refusal). `email` is null only when
+ * every attempt answered without an address.
  */
-export async function resolveGoogleAccount(clients: { gmail: GmailClient; calendar: CalendarClient; people: PeopleClient },
-  services: readonly GoogleService[], signal?: AbortSignal): Promise<string | null> {
-  const opts = signal ? { signal } : {};
-  const attempts: Array<[GoogleService, () => Promise<string | undefined>]> = [
-    ['gmail', async () => (await clients.gmail.getProfile(opts)).emailAddress],
-    ['calendar', async () => (await clients.calendar.fetchJSON<{ id?: string }>('https://www.googleapis.com/calendar/v3/calendars/primary', 'calendar-json', opts)).id],
-    ['contacts', async () => {
-      const me = await clients.people.fetchJSON<{ emailAddresses?: Array<{ value?: string; metadata?: { primary?: boolean } }> }>(
-        'https://people.googleapis.com/v1/people/me?personFields=emailAddresses', 'people', opts);
-      return (me.emailAddresses?.find(address => address.metadata?.primary) ?? me.emailAddresses?.[0])?.value;
-    }],
-  ];
-  for (const [service, attempt] of attempts) {
-    if (!services.includes(service)) continue;
-    signal?.throwIfAborted();
-    try {
-      const email = (await attempt())?.trim().toLowerCase();
-      if (email && email.includes('@')) return email;
-    } catch (error) {
-      if (signal?.aborted) throw error;
-    }
-  }
-  return null;
+export async function resolveGoogleAccount(clients: GoogleIdentityClients, services: readonly GoogleService[], signal?: AbortSignal): Promise<GoogleAccountProbe> {
+  const probe = await probeGoogleAccount(clients, services, signal ? { signal } : {});
+  if (probe.email) return probe;
+  const failures = Object.values(probe.errors);
+  const refusal = failures.find(error => error instanceof CredentialError && error.code === 'api_not_enabled')
+    ?? failures.find(error => error instanceof CredentialError) ?? failures[0];
+  if (refusal !== undefined) throw refusal;
+  return probe;
 }
 
 /**

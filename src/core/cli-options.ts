@@ -10,6 +10,7 @@
  */
 
 import type { ProgressOptions } from './progress.ts';
+import { opError } from './ops/contract.ts';
 
 export interface CliOptions {
   quiet: boolean;
@@ -29,6 +30,8 @@ export interface CliOptions {
    * the reranker. Has no effect on other commands.
    */
   explain: boolean;
+  /** `--timings` on `gbrain search/query`: per-phase `timings_ms` and model-call `cost` (cli/search-timings.ts). */
+  timings?: boolean;
   /**
    * `--brain <id>` — which BRAIN (database) this invocation targets: 'host'
    * or a mount id from ~/.gbrain/mounts.json. Parsed here (stripped before
@@ -47,6 +50,12 @@ export interface CliOptions {
   writeWaitMs?: number | null;
   /** #5232: `--accept-pending` (true) / `--no-accept-pending` (false); unset = GBRAIN_ACCEPT_PENDING. */
   acceptPending?: boolean | null;
+  /**
+   * GBRA-218: `--as <member>` — preview an operation's reads as that member
+   * (src/cli/main.ts validates the member and sets the caller-access record).
+   * Unset when the flag is absent. `gbrain access` owns its own `--as`.
+   */
+  as?: string;
 }
 
 export const DEFAULT_CLI_OPTIONS: CliOptions = {
@@ -58,11 +67,13 @@ export const DEFAULT_CLI_OPTIONS: CliOptions = {
   brain: null,
 };
 
-/** `--wait` takes seconds (`--wait 45`, `--wait 2.5`), 0 to 600. A malformed value throws. */
+/** `--wait` takes seconds (`--wait 45`, `--wait 2.5`), 0 to 600. A malformed value is a usage error (exit 2). */
 function parseWaitSeconds(val: string | undefined): number {
   const seconds = val !== undefined && /^\d+(?:\.\d+)?$/.test(val) ? Number(val) : NaN;
   if (!Number.isFinite(seconds) || seconds > 600) {
-    throw new Error(`--wait requires a number of seconds from 0 to 600 (got ${val === undefined ? 'nothing' : JSON.stringify(val)}).`);
+    throw opError('invalid_params',
+      `--wait requires a number of seconds from 0 to 600, no units (got ${val === undefined ? 'nothing' : JSON.stringify(val)}).`,
+      'Give --wait seconds with no unit, for example --wait 45 or --wait 300 for five minutes.');
   }
   return Math.round(seconds * 1000);
 }
@@ -128,6 +139,18 @@ export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
  */
 export const EXPLAIN_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask', 'call']);
 
+/** Commands whose result formatter reads the global `--timings`; every other command gets the flag back in place. */
+export const TIMINGS_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask']);
+
+/**
+ * #6625: command routes whose own parser reads `--wait` (a duration such as
+ * `5m`, not the #5232 write wait in seconds). For these the global parser
+ * hands every `--wait` back, appended in the space-separated spelling;
+ * everyone else keeps the global write wait. Matched on the leading plain
+ * tokens, so `sources writer movement` owns it and `sources list` does not.
+ */
+export const WAIT_OWNING_ROUTES: readonly (readonly string[])[] = [['sources', 'writer', 'movement']];
+
 export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: string[] } {
   const cliOpts: CliOptions = { ...DEFAULT_CLI_OPTIONS };
   // #3013: --timeout can't be resolved inline — whether the GLOBAL parser
@@ -138,7 +161,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   type Slot =
     | { plain: string }
     | { timeoutValue: string; equalsForm: boolean }
-    | { explainFlag: true };
+    | { explainFlag: true }
+    | { timingsFlag: true }
+    | { waitValue: string | undefined }
+    | { asValue: string };
   const slots: Slot[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -186,6 +212,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       slots.push({ timeoutValue: a.slice('--timeout='.length), equalsForm: true });
       continue;
     }
+    if (a === '--timings') {
+      slots.push({ timingsFlag: true });
+      continue;
+    }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
     // #4541: like --timeout, whether the global parser claims it depends on
     // the command, which is only known after the full scan — slot it.
@@ -209,13 +239,21 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     }
     // #5232 write wait + pending opt-in. Global like --timeout so every write
     // lane (generated ops, call, capture, remember, takes) reads one value.
+    // #6625: slotted like --timeout, since `sources writer movement` owns its own --wait.
     if (a === '--wait') {
-      cliOpts.writeWaitMs = parseWaitSeconds(argv[i + 1]);
+      slots.push({ waitValue: argv[i + 1] });
       i++;
       continue;
     }
     if (a.startsWith('--wait=')) {
-      cliOpts.writeWaitMs = parseWaitSeconds(a.slice('--wait='.length));
+      slots.push({ waitValue: a.slice('--wait='.length) });
+      continue;
+    }
+    // GBRA-218: --as <member>. Slotted like --wait: `gbrain access check` owns its own --as list.
+    if (a === '--as' || a.startsWith('--as=')) {
+      const value = a === '--as' ? argv[++i] : a.slice('--as='.length);
+      if (value === undefined || value.length === 0 || value.startsWith('-')) throw new Error('--as requires a member id (gbrain access member list).');
+      slots.push({ asValue: value });
       continue;
     }
     if (a === '--accept-pending' || a === '--no-accept-pending') {
@@ -247,6 +285,8 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   // everyone else gets it back in place (extract/whoknows/onboard own it).
   const commandClaimsExplain =
     commandSlot !== undefined && EXPLAIN_CLAIMING_COMMANDS.has(commandSlot.plain);
+  const leading = slots.filter((s): s is { plain: string } => 'plain' in s).map(s => s.plain);
+  const routeOwnsWait = WAIT_OWNING_ROUTES.some(route => route.every((token, i) => leading[i] === token));
 
   const rest: string[] = [];
   const handback: string[] = [];
@@ -287,6 +327,22 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       } else {
         deferredExplain.push('--explain');
       }
+      continue;
+    }
+    if ('timingsFlag' in s) {
+      if (commandSlot !== undefined && TIMINGS_CLAIMING_COMMANDS.has(commandSlot.plain)) cliOpts.timings = true;
+      else rest.push('--timings');
+      continue;
+    }
+    if ('asValue' in s) {
+      if (commandSlot?.plain === 'access') rest.push('--as', s.asValue);
+      else cliOpts.as = s.asValue;
+      continue;
+    }
+    if ('waitValue' in s) {
+      if (!routeOwnsWait) cliOpts.writeWaitMs = parseWaitSeconds(s.waitValue);
+      else if (s.waitValue === undefined) handback.push('--wait');
+      else handback.push('--wait', s.waitValue);
       continue;
     }
     if (commandOwnsTimeout) {

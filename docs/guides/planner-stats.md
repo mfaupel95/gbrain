@@ -30,6 +30,19 @@ default; Postgres brains are unaffected (autovacuum owns statistics there).
     consumer is idle;
   - the full ANALYZE that import and sync already run at the end resets every
     table's pending count.
+- A new index on an expression (for example `lower(title)`) has no statistics
+  of its own until its whole table is analyzed; a column-list ANALYZE skips it.
+  Schema migrations analyze the table right after they build an index
+  (`building <index> on ~N rows, then analyzing <table>`). If that ANALYZE
+  fails, the migration still completes with the valid index and prints a
+  warning naming `gbrain repair planner-stats --apply`. A brain whose index
+  was built before this (an upgraded brain with the v240 name-lookup indexes:
+  a 50-name `entity names` batch on a 55k-page brain took 5.4 s instead of
+  1.2 s) gets the statistics at the next maintenance point above (import,
+  managed sync, link drain, dream cycle, idle consumer); a search's first read
+  never runs this check. An expression whose values are all null still gets
+  statistics, and an empty table or a partial index matching no rows is not
+  flagged.
 - If a table's last ANALYZE took longer than `planner.first_read_budget_ms`
   (default 2000), a read does not wait for it: the table is analyzed right after
   the read answers.
@@ -37,15 +50,50 @@ default; Postgres brains are unaffected (autovacuum owns statistics there).
 ## Check and repair
 
 ```bash
-gbrain doctor                          # planner_stats_stale names each stale table
-gbrain repair planner-stats            # preview: stale tables and pending row counts
+gbrain doctor                          # planner_stats_stale names each stale table and expression index
+gbrain repair planner-stats            # preview: stale tables, pending row counts, indexes without statistics
 gbrain repair planner-stats --apply    # ANALYZE them now (works with auto-analyze off)
 ```
 
+Doctor reports an expression index without statistics on its own line,
+`expression index <name> (on <table>) has no statistics`, separate from the
+row-delta count. On both engines the check covers the hot tables above and
+skips an index whose statistics the database role cannot see (unknown, not
+absent).
+
+On Postgres nothing collects an existing index's statistics automatically:
+autovacuum analyzes a table only after 10% of its rows change, so a quiet
+brain keeps the gap. Doctor warns, and an operator runs
+`gbrain repair planner-stats --apply` on the brain host (one whole-table
+ANALYZE per table, 60 s statement timeout, deferred while another session
+holds the table).
+
 On Postgres, `planner_stats_stale` reads `pg_stat_user_tables` and warns only
 when a table is over the same threshold and neither ANALYZE nor autoanalyze ran
-in the last hour; the repair runs each ANALYZE with a 60 s statement and 2 s
-lock timeout.
+in the last hour; the repair runs each ANALYZE with a 60 s statement timeout.
+
+### ANALYZE never waits on a vacuum (Postgres)
+
+ANALYZE takes the same table lock as VACUUM and autovacuum, and Postgres
+cancels an autovacuum once another session has waited `deadlock_timeout`
+(1 s by default) for that lock. On a large `content_chunks` an ANALYZE after
+every embed drain could cancel every autovacuum of the table before it
+finished, leaving millions of dead rows in every index (#7083). So every
+ANALYZE gbrain runs on Postgres on its own (the import, sync, reindex and
+embed refreshes, the search guard, `gbrain repair planner-stats --apply`
+and the ANALYZE after a migration builds an index) first locks the table with `NOWAIT`: when a vacuum, another
+ANALYZE or an index build holds it, the ANALYZE is deferred with a warning
+(the repair reports the table `deferred`) and never waits. The embed
+drain's chunk refresh also skips a drain that changed fewer than 50 + 10% of
+the table's chunks once the chunk statistics exist; autovacuum's own analyze
+covers what small drains add up to.
+
+`planner_stats_stale` also warns when a hot table of at least 100,000 rows
+holds more dead rows than autovacuum's vacuum threshold and no vacuum has
+completed on it for 24 hours: something keeps cancelling its autovacuum.
+Look for `canceling autovacuum task` in the server log and the statement
+logged next to it; once nothing cancels it, autovacuum finishes on its own,
+or the database operator runs `VACUUM (VERBOSE) <table>` in a quiet window.
 
 Postgres can also lose the statistics outright: `pg_upgrade` carries none and
 resets the modification counters, so autovacuum never collects them again
@@ -53,7 +101,7 @@ until 10% of a table changes. Without the page columns search filters read,
 search plans as nested loops over every page (50-60 s per search at 5,000
 pages instead of 0.5 s). gbrain guards this two ways, both through the same
 refresh as import and sync (`ANALYZE pages(...)` and
-`ANALYZE content_chunks(model, modality, page_id)`, 30 s bounded):
+`ANALYZE content_chunks(model, modality, page_id, body_generation)`, 30 s bounded):
 
 - The first search of each process checks in the background and collects them
   when the database role owns the tables. The search does not wait for it.

@@ -15,6 +15,9 @@
  * disappears promotes within two leases and drains back after the owner has
  * been live for three ticks. Fails on the base branch: no heartbeat table,
  * no election, and the CLI's own pid stamps the claims whatever the switch.
+ * #6543: with the switch on and a serve whose heartbeat renews while it
+ * claims nothing, `--no-delegate` runs the sync's own consumer and drains its
+ * rows (before: waiter-only behind the wedged serve, nothing claimed).
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
@@ -25,8 +28,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { PersistenceConsumer } from '../../src/core/persistence/consumer.ts';
-import { WaiterOnlyConsumer } from '../../src/core/persistence/consumer-election.ts';
-import { consumerIdentity, listHostConsumers, resetConsumerIdentityForTest, startConsumerHeartbeat } from '../../src/core/persistence/consumer-heartbeat.ts';
+import { resetOwnConsumerForTest, WaiterOnlyConsumer } from '../../src/core/persistence/consumer-election.ts';
+import { maybeDelegateManagedSyncToServe } from '../../src/commands/sync-delegate.ts';
+import { consumerIdentity, listHostConsumers, resetConsumerIdentityForTest, startConsumerHeartbeat, type ListedConsumer } from '../../src/core/persistence/consumer-heartbeat.ts';
 import { claimOwner, setClaimOwnerForTest } from '../../src/core/persistence/claim-phase.ts';
 import { localHostIdentity } from '../../src/core/persistence/identity.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
@@ -156,20 +160,61 @@ describe.skipIf(!hasDatabase())('two consumers on one host (Postgres, #6317)', (
     }), 300_000);
   }
 
+  test('#6543: --no-delegate with single_consumer on, beside a heartbeating serve that claims nothing: the sync runs its own consumer and drains its own rows', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_SYNC_BULK_SIZE: '8' }, async () => {
+    await engine.setConfig('persistence.single_consumer', 'true');
+    resetWriteSwitches();
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('DELETE FROM persistence_consumers');
+    // The #6543 wedge: a serve whose heartbeat keeps renewing (not restart_required) while it claims nothing.
+    const wedged = startConsumerHeartbeat(engine, hostId, { kind: 'serve', mode: 'full', identity: { pid: process.pid + 300_000, nonce: 'wedged-serve', pid_ns: original.pid_ns },
+      everyMs: 2_000, report: () => ({ restart_required: false, root_barrier_age_ms: null }) });
+    await wedged.renew();
+    const stderr: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => { stderr.push(String(chunk)); return (write as (...a: unknown[]) => boolean)(chunk, ...rest); }) as typeof process.stderr.write;
+    try {
+      const f = await fixture(20);
+      const outcome = await maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--no-pull', '--no-delegate'], { sourceId: f.id, noPull: true });
+      expect(outcome).toEqual({ kind: 'own_consumer', reason: 'opted_out', line: null });
+      startPersistenceConsumer(engine, { engine: 'postgres' });
+      await waitFor(async () => (persistenceConsumerStatus(engine) as { consumer_election?: { mode: string } }).consumer_election?.mode === 'full',
+        { timeoutMs: 15_000, intervalMs: 50, label: 'the opted-out sync runs its own full consumer (base branch: waiter_only behind the wedged serve)' });
+      await waitFor(async () => stderr.some(line => line.includes('reason=two_consumers_on_host') && line.includes(`serve pid ${process.pid + 300_000}`)),
+        { timeoutMs: 10_000, intervalMs: 50, label: 'the forced consumer names the serve beside it' });
+      const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 2 });
+      expect(result.drain?.outcome).toBe('synced');
+      const rows = await imports(f.id);
+      expect(rows).toHaveLength(20);
+      expect(rows.every(row => row.state === 'committed' && row.owner_pid === process.pid)).toBe(true);
+    } finally {
+      process.stderr.write = write;
+      resetOwnConsumerForTest();
+      await disposePersistenceConsumer(engine);
+      await wedged.stop();
+    }
+  }), 180_000);
+
   test('T1b: two starters within one renewal both start full; doctor reports the persistent overlap once both are over 30 s old', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     await engine.setConfig('persistence.single_consumer', 'true');
     resetWriteSwitches();
     await engine.executeRaw('DELETE FROM persistence_consumers');
     const make = () => new PersistenceConsumer(engine, { engine: 'postgres' }, preparePersistedMutation, { hostId, pollMs: 1_000_000, onError: () => {} });
     // "Both probe before either has written a row" is the precondition, not a race to win: each starter's first read
-    // waits until the other's first read has started, so neither sees the row the other's start-up writes.
+    // returns only once the other's first read has returned too. Holding the issue alone was not enough: the starter
+    // whose SELECT came back first started its heartbeat, whose first renewal writes its `full` row, and on a loaded
+    // host the other starter's already-issued SELECT could still execute after that write and see a live owner.
+    const firstReads: Promise<ListedConsumer[]>[] = [];
     const bothRead = Promise.withResolvers<void>();
-    let firstReads = 0;
     const readTogether = () => {
       let first = true;
       return async (signal: AbortSignal) => {
-        if (first) { first = false; if (++firstReads === 2) bothRead.resolve(); await bothRead.promise; }
-        return listHostConsumers(engine, hostId, { signal });
+        if (!first) return listHostConsumers(engine, hostId, { signal });
+        first = false;
+        const mine = listHostConsumers(engine, hostId, { signal });
+        if (firstReads.push(mine) === 2) bothRead.resolve();
+        await bothRead.promise;
+        await Promise.all(firstReads);
+        return mine;
       };
     };
     const a = new WaiterOnlyConsumer(engine, { engine: 'postgres' }, make, { kind: 'jobs', hostId, readConsumers: readTogether(), pollMs: 1_000_000, idleMaxMs: 1_000_000, heartbeatEveryMs: 1_000_000, log: () => {} });

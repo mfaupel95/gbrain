@@ -1,5 +1,23 @@
+import { requireMaintainerPoliciesSql } from '../derived-state-maintainers.ts';
+
 /** NULL marks a legacy snapshot whose deletion state was not recorded. */
 export const PAGE_VERSION_DELETION_SCHEMA_SQL = `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN;`;
+
+/** A tag write moves its page's revision; under RLS the writer needs the page (#7637, derived-state-maintainers.ts). */
+export const TAG_REVISION_FUNCTION_SQL = `CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $fn$
+    BEGIN
+      IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
+        RETURN NULL;
+      END IF;
+      ${requireMaintainerPoliciesSql('pages', ['SELECT', 'UPDATE'], '      ')}
+      IF TG_OP <> 'INSERT' THEN
+        UPDATE pages SET knowledge_revision = gen_random_uuid() WHERE id = OLD.page_id;
+      END IF;
+      IF TG_OP <> 'DELETE' AND (TG_OP = 'INSERT' OR (NEW.page_id, NEW.tag) IS DISTINCT FROM (OLD.page_id, OLD.tag)) THEN
+        UPDATE pages SET knowledge_revision = gen_random_uuid() WHERE id = NEW.page_id;
+      END IF;
+      RETURN NULL;
+    END $fn$`;
 
 /**
  * Shared by migration 150 and both schema blobs, so Postgres also replays it
@@ -10,6 +28,9 @@ export const PAGE_VERSION_DELETION_SCHEMA_SQL = `ALTER TABLE page_versions ADD C
  * row needs a value: `sources` is backfilled here (a handful of rows), an
  * empty `pages` (fresh install) is constrained here, and existing pages are
  * backfilled in committed batches by page-state/revision-backfill-schema.ts.
+ * A segmented page (Wave B) has NULL body columns, so its body identity is
+ * `body_generation`, read only when both sides are NULL: the column is
+ * migration-only (v248), and before it the body columns are NOT NULL.
  */
 export const PAGE_STATE_SCHEMA_STATEMENTS = [
   `DO $do$ BEGIN
@@ -50,17 +71,21 @@ export const PAGE_STATE_SCHEMA_STATEMENTS = [
     PRIMARY KEY (source_incarnation, slug)
   )`,
   `CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+    DECLARE body_moved boolean := false;
     BEGIN
       IF OLD.knowledge_revision IS NULL THEN
         NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
         NEW.text_projection_revision := NULL;
         RETURN NEW;
       END IF;
+      IF NEW.compiled_truth IS NULL AND OLD.compiled_truth IS NULL THEN
+        body_moved := NEW.body_generation IS DISTINCT FROM OLD.body_generation;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
          (OLD.source_id, OLD.slug, OLD.type, OLD.page_kind, OLD.title, OLD.compiled_truth,
-          OLD.timeline, OLD.frontmatter, OLD.deleted_at) THEN
+          OLD.timeline, OLD.frontmatter, OLD.deleted_at) OR body_moved THEN
         IF NEW.knowledge_revision = OLD.knowledge_revision AND NOT (
           COALESCE(current_setting('gbrain.materializing_revision', true), '') = OLD.knowledge_revision::text
           AND (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.frontmatter, NEW.deleted_at)
@@ -78,19 +103,7 @@ export const PAGE_STATE_SCHEMA_STATEMENTS = [
   `DROP TRIGGER IF EXISTS pages_knowledge_revision ON pages`,
   `CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision()`,
-  `CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
-    BEGIN
-      IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
-        RETURN NULL;
-      END IF;
-      IF TG_OP <> 'INSERT' THEN
-        UPDATE pages SET knowledge_revision = gen_random_uuid() WHERE id = OLD.page_id;
-      END IF;
-      IF TG_OP <> 'DELETE' AND (TG_OP = 'INSERT' OR (NEW.page_id, NEW.tag) IS DISTINCT FROM (OLD.page_id, OLD.tag)) THEN
-        UPDATE pages SET knowledge_revision = gen_random_uuid() WHERE id = NEW.page_id;
-      END IF;
-      RETURN NULL;
-    END $fn$`,
+  TAG_REVISION_FUNCTION_SQL,
   `DROP TRIGGER IF EXISTS tags_knowledge_revision ON tags`,
   `CREATE TRIGGER tags_knowledge_revision AFTER INSERT OR DELETE OR UPDATE ON tags
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_tag_revision()`,

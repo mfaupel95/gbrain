@@ -29,7 +29,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from 'fs';
-import { isAbsolute, join, relative, sep } from 'path';
+import { isAbsolute, join, relative } from 'path';
 import { createHash } from 'crypto';
 import {
   LABELED_CREDENTIAL_PATTERNS,
@@ -38,6 +38,7 @@ import {
   danglingLabel,
   labeledEchoEligible,
   labeledValueIsCredential,
+  neutralizeRedactionMarkers,
   newTableScanState, tableCredentialCells,
 } from './secret-scan-labeled.ts';
 
@@ -87,16 +88,27 @@ export interface ScanOpts {
    * transcript audit only. Default false.
    */
   labeledCredentials?: boolean;
+  /** Work counters the scan fills in (secret-scan-work.ts); absent means no counting. */
+  work?: ScanWork;
 }
 
-/** Name of the per-workspace allowlist override file. */
-export const SCAN_ALLOW_FILENAME = '.gbrain-scan-allow';
+export {
+  SCAN_ALLOW_FILENAME, ALLOWLIST_FINGERPRINT_MIN_HEX, loadWorkspaceAllowlist, globToRegExp, matchesGlob, valueAllowlisted, pathAllowlisted,
+} from './secret-scan-allowlist.ts';
+import { valueAllowlisted, pathAllowlisted } from './secret-scan-allowlist.ts';
+import { PUSH_SCAN_MAX_FILE_BYTES } from './page-size-policy.ts';
+import {
+  ASSIGNMENT_QUOTED_SOURCE, ASSIGNMENT_UNQUOTED_SOURCE, HIGH_ENTROPY_MIN_BITS_PER_CHAR, HIGH_ENTROPY_REQUIRES_DIGIT_RE,
+  HIGH_ENTROPY_REQUIRES_NON_DIGIT_RE, assignmentKey, assignmentValueIsSecretShaped,
+} from './secret-scan-assignment.ts';
+import type { ScanWork } from './secret-scan-work.ts';
+export { createScanWork, type ScanWork } from './secret-scan-work.ts';
 
 // ── Patterns ────────────────────────────────────────────────────────────────
 //
 // Each core pattern is compiled with a left boundary group `(^|[^A-Za-z0-9_])`
 // so prefixes embedded inside longer identifiers ("risk-assessment…",
-// "task-…") never fire. Order matters: 'anthropic' precedes 'openai' and the
+// "task-…") never fire, plus an escape-boundary twin (ESCAPE_BOUNDARY, #7978). Order matters: 'anthropic' precedes 'openai' and the
 // per-line claimed-span set prevents a `sk-ant-…` key from double-reporting
 // as a generic `sk-` match.
 //
@@ -123,6 +135,10 @@ interface CompiledPattern {
   validate?: (value: string, head: string) => boolean;
   /** Runs only on the line after one that ends in a dangling credential label of this form. */
   continuation?: 'single' | 'pair';
+  /** The text the regex reads instead of the line, the same length (offsets and reported values come from the line). */
+  subject?: (line: string) => string;
+  /** An ESCAPE_BOUNDARY twin: runs only on a line ESCAPE_IN_LINE_RE matches. */
+  afterEscape?: boolean;
 }
 
 interface CorePattern {
@@ -135,6 +151,11 @@ interface CorePattern {
    * literal keyword (e.g. `Bearer `) that must NOT be part of the value.
    */
   prebuilt?: boolean;
+  /**
+   * Prebuilt rules only: the same two-group source anchored on ESCAPE_BOUNDARY
+   * instead (#7978). A default-boundary rule gets that twin automatically.
+   */
+  escaped?: string;
   /** RegExp flags. Default `'g'`; a case-insensitive shape uses `'gi'`. */
   flags?: string;
   /**
@@ -165,6 +186,30 @@ interface CorePattern {
  * `private_key_pem` bodies).
  */
 const SECURITY_WAVE_SINCE = '0.60.31.0';
+
+/**
+ * `since` for the AI-provider key rules added by #7959 (`openrouter`, `groq`,
+ * `xai`, `perplexity`, `replicate`).
+ */
+const PROVIDER_KEYS_SINCE = '0.60.502.0';
+
+/**
+ * #7978: a JSON escape (`\\n`, `\\t`, `\\u0022`) or a percent-escape (`%22`)
+ * ends on a word character, so the default boundary never fired after one and
+ * a key opening an escaped JSON string or a URL-encoded value went unclaimed
+ * in every lane. Each rule gets a twin anchored here, compiled right after it
+ * under the same name (attribution order unchanged) and run only on lines
+ * holding such an escape, so every other line runs the old pattern list. A
+ * backslash or `%` that does not start an escape is not a boundary. #8266 adds
+ * `\xNN`, `\UXXXXXXXX`, a quoted-printable `=3D` and a terminal color code
+ * (`ESC[…m`, raw or written `\u001b[`, `\x1b[`, `\033[`).
+ */
+const ESCAPE_BOUNDARY = '(?:\\\\(?:[bfnrt]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|U[0-9A-Fa-f]{8})|%[0-9A-Fa-f]{2}|=3[Dd]|(?:\\x1b|\\\\(?:u001[bB]|x1[bB]|033))\\[[0-9;]{0,32}m)';
+const ESCAPE_IN_LINE_RE = /\\[bfnrtuxU0]|%[0-9A-Fa-f]{2}|=3[Dd]|\x1b\[/;
+const JWT_VALUE = '(eyJ[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096})';
+const BEARER_ANCHOR = '[Bb](?:earer|EARER)\\s+)((?=(?:[A-Za-z0-9._~+/=-]|\\\\/){20})[A-Za-z0-9._~+/=-]*(?:\\\\/[A-Za-z0-9._~+/=-]*)*)';
+const BASIC_HEADER = 'authorization\\s{0,16}:\\s{0,16}basic\\s{1,16})([A-Za-z0-9+/=]{4,2048})(?![A-Za-z0-9+/=])';
+const BASIC_BARE = 'basic\\s{1,16})([A-Za-z0-9+/=]{16,2048})(?![A-Za-z0-9+/=])';
 
 /**
  * Placeholder passwords in documentation URLs: `<password>`, `${VAR}`,
@@ -235,6 +280,15 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // DigitalOcean personal access (dop_), OAuth (doo_) and refresh (dor_)
   // tokens: v1 + 64 lowercase hex, hard right edge.
   { name: 'digitalocean', source: 'do[opr]_v1_[a-f0-9]{64}(?![A-Za-z0-9])', since: SECURITY_WAVE_SINCE },
+  // AI-provider keys (#7959): each a fixed-length body with a hard right edge,
+  // so a longer run of the same characters is never cut into a false key.
+  // OpenRouter: v1 + 64 lowercase hex. The dashes after `sk-or` and `v1` stop
+  // the bare sk- rule above, which is why it needs its own entry.
+  { name: 'openrouter', source: 'sk-or-v1-[a-f0-9]{64}(?![A-Za-z0-9])', since: PROVIDER_KEYS_SINCE },
+  { name: 'groq', source: 'gsk_[A-Za-z0-9]{52}(?![A-Za-z0-9])', since: PROVIDER_KEYS_SINCE },
+  { name: 'xai', source: 'xai-[A-Za-z0-9_]{80}(?![A-Za-z0-9_])', since: PROVIDER_KEYS_SINCE },
+  { name: 'perplexity', source: 'pplx-[A-Za-z0-9]{48}(?![A-Za-z0-9])', since: PROVIDER_KEYS_SINCE },
+  { name: 'replicate', source: 'r8_[A-Za-z0-9_-]{37}(?![A-Za-z0-9_-])', since: PROVIDER_KEYS_SINCE },
   // gbrain's own tokens: generateToken (core/utils.ts) mints 'gbrain_' plus an
   // optional OAuth infix (at_ access / rt_ refresh / cs_ client secret /
   // code_ auth code) plus 32 random bytes hex. Without this entry the scanner
@@ -258,10 +312,9 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // front of it); a segment over 4096 chars is the accepted miss.
   {
     name: 'jwt',
-    source:
-      '(^|[^A-Za-z0-9_-])' +
-      '(eyJ[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096})',
+    source: `(^|[^A-Za-z0-9_-])${JWT_VALUE}`,
     prebuilt: true,
+    escaped: `(${ESCAPE_BOUNDARY})${JWT_VALUE}`,
   },
   // ── Catch-alls: LAST, so vendor/JWT attribution above claims the span first.
   // Bearer: prebuilt two-group layout — the `Bearer ` keyword is the anchor
@@ -273,8 +326,9 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // skipped before the regex runs.
   {
     name: 'bearer',
-    source: '((?:^|[^A-Za-z0-9_])[Bb](?:earer|EARER)\\s+)([A-Za-z0-9._~+/=-]{20,})',
+    source: `((?:^|[^A-Za-z0-9_])${BEARER_ANCHOR}`,
     prebuilt: true,
+    escaped: `(${ESCAPE_BOUNDARY}${BEARER_ANCHOR}`,
     precheck: (line) => line.includes('earer') || line.includes('EARER'),
   },
   // Connection strings with inline credentials: the value is exactly the
@@ -344,8 +398,9 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // family.
   {
     name: 'basic_auth',
-    source: '((?:^|[^A-Za-z0-9_])authorization\\s{0,16}:\\s{0,16}basic\\s{1,16})([A-Za-z0-9+/=]{4,2048})(?![A-Za-z0-9+/=])',
+    source: `((?:^|[^A-Za-z0-9_])${BASIC_HEADER}`,
     prebuilt: true,
+    escaped: `(${ESCAPE_BOUNDARY}${BASIC_HEADER}`,
     flags: 'gi',
     precheck: (line) => BASIC_PRECHECK_RE.test(line),
     validate: basicValueDecodesToUserPass,
@@ -353,8 +408,9 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   },
   {
     name: 'basic_auth',
-    source: '((?:^|[^A-Za-z0-9_])basic\\s{1,16})([A-Za-z0-9+/=]{16,2048})(?![A-Za-z0-9+/=])',
+    source: `((?:^|[^A-Za-z0-9_])${BASIC_BARE}`,
     prebuilt: true,
+    escaped: `(${ESCAPE_BOUNDARY}${BASIC_BARE}`,
     flags: 'gi',
     precheck: (line) => BASIC_PRECHECK_RE.test(line),
     validate: basicValueDecodesToUserPass,
@@ -414,8 +470,8 @@ const PEM_LINE_MAX = 128;
 const PEM_LINE_MIN = 16;
 const PEM_INDENT_MAX = 16;
 const PEM_RFC1421_LINE_MAX = 256;
-const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
-const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
 
 type PemClaimKind = 'block' | 'forward' | 'backward';
 
@@ -481,7 +537,7 @@ function atCut(t: string, i: number): boolean {
 }
 
 /** FORWARD claim end for a BEGIN fence ending at `headerEnd` (== headerEnd when no body line follows). */
-function pemForwardEnd(t: string, headerEnd: number): number {
+export function pemForwardEnd(t: string, headerEnd: number): number {
   const n = t.length;
   const cap = headerEnd + PEM_BODY_MAX_CHARS;
   let pos = lineEndAfter(t, headerEnd);
@@ -513,7 +569,7 @@ function pemForwardEnd(t: string, headerEnd: number): number {
 }
 
 /** BACKWARD claim start for an END fence at `endStart`, never below `floor`; -1 when no body line precedes it. */
-function pemBackwardStart(t: string, endStart: number, floor: number): number {
+export function pemBackwardStart(t: string, endStart: number, floor: number): number {
   let p = endStart;
   while (endStart - p < PEM_INDENT_MAX && p > floor && isIndentCode(t.charCodeAt(p - 1))) p--;
   let le = lineEndBefore(t, p, floor);
@@ -594,124 +650,48 @@ export function privateKeySpans(text: string): Array<{ start: number; end: numbe
   return pemClaims(text).map((c) => ({ start: c.start, end: c.end }));
 }
 
-// Opt-in: `secret|token|password|api key`-shaped assignment whose value has
-// high Shannon entropy. Keyword-anchored (compiled inline below so the group
-// layout matches the core patterns: group 1 = anchor, group 2 = value).
-//
-// The left boundary is [^A-Za-z0-9] rather than the core patterns'
-// [^A-Za-z0-9_]: `_` has to read as a SEPARATOR here, or `api_access_token`
-// and `SMTP_PASSWORD` cannot match their own keyword. The core patterns keep
-// `_` as a word character on purpose (a vendor prefix inside a longer
-// identifier must not fire); this rule is keyword-anchored, so the same
-// reasoning inverts. The keyword is also allowed trailing identifier
-// segments before the assignment, or `AWS_SECRET_ACCESS_KEY=` cannot match:
-// the keyword `SECRET` is not adjacent to the `=`, `_ACCESS_KEY` is. The
-// entropy gate still decides, so a wider anchor costs nothing on prose.
-//
-// The value floor is 12, not 20. A 16-character SMTP password sat under the
-// old floor and stayed plaintext in the receipt on disk even once the keyword
-// matched — the value length was doing gating the entropy check is there to
-// do. Real passwords are frequently 12-16 characters; secrets that long with
-// 3.5 bits/char of entropy are not prose.
-//
-// The value must ALSO contain at least one digit. Identifier-shaped values
-// (`DefaultAzureCredential`, `/usr/local/bin/aws-vault`, an env-var NAME
-// assigned to an `apiKeyEnvVar`) clear the entropy gate on mixed case and
-// separators alone and were being redacted out of ordinary code. Real
-// machine-minted secrets essentially always carry digits; a digitless
-// passphrase is the accepted miss. A 40-hex git sha assigned to a `token:`
-// key still redacts (digits + entropy) — documented, acceptable.
-//
-// Both quantifiers after the keyword are BOUNDED. The trailing identifier
-// segments used to be `[A-Za-z0-9_-]*`: because the left boundary admits `-`
-// and `_` and that class contains them too, every `-`/`_` in a run like
-// `-apikey-apikey…` or `_token_token…` was a fresh keyword start whose
-// suffix ran to end-of-line and backtracked — quadratic (210 KB of
-// `-apikey` took ~35 s, 180 KB of `_token` ~15 s). At `{0,64}` a start does
-// constant work; no real credential key carries 64 identifier characters
-// after its keyword. The value is capped at 4096 for the same
-// constant-work-per-occurrence guarantee (the jwt segments share the cap):
-// a value longer than that is redacted only through its first 4096 chars —
-// the accepted miss, well above any real token or base64 key blob.
-//
-// The 3.5 bits/char floor is judged on the bias-corrected (Miller-Madow)
-// estimate, not the raw per-character Shannon entropy. The raw figure of an
-// n-character string can never exceed log2(n) (3.58 at 12 characters, 3.91
-// at 15) and drops sharply with a single repeated character, so the raw
-// floor rejected 68% of uniformly random 12-character alphanumeric secrets,
-// 9% at 15 and 5% at 16: exactly the 12-16 character passwords the 12-char
-// value floor exists to catch (a 15-character value such as `!dcG4Gmw1qGRbR3`
-// after a password key stayed plaintext).
-// Miller-Madow adds (distinct - 1) / (2 n ln 2), which cuts those misses
-// below 1% at every length from 12 up and is negligible on long values.
-// Because the correction can lift an all-digit value past the floor, the
-// value must also carry a non-digit: counters, timestamps and numeric ids
-// (`token_count=1234567890123`) never reached 3.5 raw bits (log2(10) = 3.32)
-// and still never redact.
-const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 3.5;
-const HIGH_ENTROPY_REQUIRES_DIGIT_RE = /[0-9]/;
-const HIGH_ENTROPY_REQUIRES_NON_DIGIT_RE = /[^0-9]/;
-
-// PUNCTUATED VALUES. The rule is two compiled patterns sharing the name and
-// the group-2-is-value contract. QUOTED: after an opening `"` or `'`, the
-// value is any run of non-quote, non-whitespace characters (a password like
-// `ab!#%…<…` is one value). UNQUOTED: the legacy class plus the password
-// punctuation `!#$%*@^~.?<>` — not `&` (it would swallow sibling query
-// parameters), not `()[]{}` (so `token = getToken(x)` never matches), not `:`,
-// and not `,` / `;` (the false-positive measurement found SQL `SET` lists
-// such as `execution_token=NULL,claim_expires_at=NULL,error_code=$3` read as
-// one value; a password carrying them is matched only when quoted) — and the
-// last character excludes `.?!`, so `TOKEN=<tok>.` claims the token without
-// the sentence's full stop and its bare echoes still scrub.
-// Both keep the 12-4096 bounds and the digit + entropy gates.
-const ASSIGNMENT_KEY =
-  '(?:^|[^A-Za-z0-9])(?:secret|token|passwd|password|passphrase|credential|api[_-]?key|apikey)[A-Za-z0-9_-]{0,64}["\']?\\s*[:=]\\s*';
-const ASSIGNMENT_QUOTED_SOURCE = `(${ASSIGNMENT_KEY}["'])([^"'\\s]{12,4096})`;
-const ASSIGNMENT_UNQUOTED_SOURCE =
-  `(${ASSIGNMENT_KEY})([A-Za-z0-9+/_=\\-!#$%*@^~.?<>]{11,4095}[A-Za-z0-9+/_=\\-#$%*@^~<>])`;
-/** The legacy (pre-punctuation) value class, whole-value form. */
-const LEGACY_ASSIGNMENT_VALUE_RE = /^[A-Za-z0-9+/_=-]+$/;
-/** A dotted member path in code (`process.env.DB_PASSWORD_2`): every segment an identifier. */
-const DOTTED_IDENTIFIER_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+// The opt-in `high_entropy_assignment` shapes and gates live in secret-scan-assignment.ts.
 
 /**
- * Assignment-value validate: reject values that are references, not secrets
- * — a URL (`scheme://`), a relative or home path (`./`, `~/`), a shell
- * expansion (`${`, `$(`), an already-redacted token, an absolute path (`/`
- * plus a character outside the legacy class, such as the `.` of a file
- * name), and a dotted member path whose every segment is an identifier
- * (`process.env.X`, `config.secrets.key2`: the `.` admitted for passwords
- * would otherwise turn code into a value). A leading `/` on a pure base64
- * value still fires: one random base64 secret in 64 starts with `/`, and the
- * legacy rule redacted those. A dotted password whose every segment starts
- * with a letter is the accepted miss.
+ * One compiled set per option combination. scanInternal is synchronous and
+ * resets each pattern's lastIndex before every line, so the 'g' regexes are
+ * safe to share; recompiling them per call cost a search response about a
+ * millisecond per scanned field (GBRA-156).
  */
-function assignmentValueIsSecretShaped(value: string): boolean {
-  if (/^[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\//.test(value)) return false;
-  if (value.startsWith('./') || value.startsWith('~/') || value.startsWith('${') || value.startsWith('$(')) return false;
-  if (value.startsWith('<REDACTED:') || DOTTED_IDENTIFIER_RE.test(value)) return false;
-  return !(value.startsWith('/') && !LEGACY_ASSIGNMENT_VALUE_RE.test(value));
-}
+const compiledPatterns = new Map<string, CompiledPattern[]>();
 
 function compilePatterns(opts: ScanOpts): CompiledPattern[] {
-  const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
-    name: p.name,
-    // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- p.source is a compile-time literal from CORE_PATTERNS (never caller input); every pattern uses bounded quantifiers, pinned by test/secret-scan-perf.test.ts
-    re: new RegExp(p.prebuilt ? p.source : `(^|[^A-Za-z0-9_])(${p.source})`, p.flags ?? 'g'),
-    ...(p.precheck ? { precheck: p.precheck } : {}),
-    ...(p.validate ? { validate: p.validate } : {}),
-  }));
+  const key = `${opts.highEntropy === true}|${opts.labeledCredentials === true}`;
+  let compiled = compiledPatterns.get(key);
+  if (!compiled) compiledPatterns.set(key, compiled = buildPatterns(opts));
+  return compiled;
+}
+
+function buildPatterns(opts: ScanOpts): CompiledPattern[] {
+  const out: CompiledPattern[] = CORE_PATTERNS.flatMap((p) => {
+    const shared = { name: p.name, ...(p.precheck ? { precheck: p.precheck } : {}), ...(p.validate ? { validate: p.validate } : {}) };
+    const twin = p.prebuilt ? p.escaped : `(${ESCAPE_BOUNDARY})(${p.source})`;
+    return [
+      // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- p.source is a compile-time literal from CORE_PATTERNS (never caller input); every pattern uses bounded quantifiers, pinned by test/secret-scan-perf.test.ts
+      { ...shared, re: new RegExp(p.prebuilt ? p.source : `(^|[^A-Za-z0-9_])(${p.source})`, p.flags ?? 'g') },
+      // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- compile-time literal (ESCAPE_BOUNDARY + p.source); bounded quantifiers
+      ...(twin ? [{ ...shared, re: new RegExp(twin, p.flags ?? 'g'), afterEscape: true }] : []),
+    ];
+  });
   if (opts.highEntropy) {
     // Group layout matches the core shape: group 1 = the keyword anchor
     // through the `=`/`:` (and opening quote), group 2 = value.
     for (const source of [ASSIGNMENT_QUOTED_SOURCE, ASSIGNMENT_UNQUOTED_SOURCE]) {
-      out.push({
-        name: 'high_entropy_assignment',
-        // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- compile-time literal; bounded quantifiers, pinned by test/secret-scan-perf.test.ts
-        re: new RegExp(source, 'gi'),
-        entropyGated: true,
-        validate: assignmentValueIsSecretShaped,
-      });
+      for (const afterEscape of [false, true]) {
+        out.push({
+          name: 'high_entropy_assignment',
+          // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- compile-time literal; bounded quantifiers, pinned by test/secret-scan-perf.test.ts
+          re: new RegExp(source(assignmentKey(afterEscape ? ESCAPE_BOUNDARY : '(?:^|[^A-Za-z0-9])')), 'gi'),
+          entropyGated: true,
+          validate: assignmentValueIsSecretShaped,
+          ...(afterEscape ? { afterEscape } : {}),
+        });
+      }
     }
   }
   if (opts.labeledCredentials) {
@@ -722,6 +702,7 @@ function compilePatterns(opts: ScanOpts): CompiledPattern[] {
         re: new RegExp(p.source, 'gi'),
         ...(p.continuation ? { continuation: p.continuation } : { precheck: (line: string) => LABELED_PRECHECK_RE.test(line) }),
         validate: (value: string, head: string) => labeledValueIsCredential(value, p.form, head),
+        subject: neutralizeRedactionMarkers,
       });
     }
   }
@@ -732,10 +713,27 @@ function compilePatterns(opts: ScanOpts): CompiledPattern[] {
  * Bias-corrected (Miller-Madow) Shannon entropy in bits/char: the raw
  * estimate plus (distinct - 1) / (2 n ln 2). The entropy gate of
  * `high_entropy_assignment` reads this. Exported for tests.
+ *
+ * One histogram pass: the distinct count is the histogram's size, so the
+ * former second pass (`new Set(s).size`, ~80 % of the gate's time on a
+ * 4096-char value) is gone. The arithmetic is unchanged and the result is
+ * byte-identical to `shannonEntropy(s) + (new Set(s).size - 1) / (2 n ln 2)`
+ * (test/secret-scan-entropy-equivalence.test.ts): the same `for…of` code
+ * points, the same insertion-ordered sum, the same `s.length` (UTF-16 units)
+ * denominator. `work` counts the characters handed to the gate here, at the
+ * call, so a second call per candidate doubles `gateChars`.
  */
-export function correctedEntropy(s: string): number {
+export function correctedEntropy(s: string, work?: ScanWork): number {
+  if (work) work.gateChars += s.length;
   if (s.length === 0) return 0;
-  return shannonEntropy(s) + (new Set(s).size - 1) / (2 * s.length * Math.LN2);
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let bits = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits + (counts.size - 1) / (2 * s.length * Math.LN2);
 }
 
 /** Shannon entropy in bits/char. Exported for tests. */
@@ -749,114 +747,6 @@ export function shannonEntropy(s: string): number {
     bits -= p * Math.log2(p);
   }
   return bits;
-}
-
-// ── Allowlist ───────────────────────────────────────────────────────────────
-
-/**
- * Load `<workspaceRoot>/.gbrain-scan-allow`: one glob-or-fingerprint per
- * line, `#` comments and blank lines ignored. Absent/unreadable file → []
- * (the shipped default allowlist is EMPTY [CX2-15]).
- */
-export function loadWorkspaceAllowlist(workspaceRoot: string): string[] {
-  try {
-    const p = join(workspaceRoot, SCAN_ALLOW_FILENAME);
-    if (!existsSync(p)) return [];
-    return readFileSync(p, 'utf-8')
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith('#'));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Minimal anchored glob → RegExp. `**` crosses `/`, `*` stays within a path
- * segment, `?` is one non-slash char. Shared by the scan allowlist and the
- * workspace-push deny-glob backstop (one glob dialect everywhere).
- */
-const GLOB_REGEX_CACHE = new Map<string, RegExp>();
-
-export function globToRegExp(glob: string): RegExp {
-  const cached = GLOB_REGEX_CACHE.get(glob);
-  if (cached) return cached;
-  let g = glob;
-  if (g.endsWith('/')) g += '**'; // `foo/` means everything under foo/
-  let re = '';
-  for (let i = 0; i < g.length; i++) {
-    const c = g[i];
-    if (c === '*') {
-      if (g[i + 1] === '*') {
-        i++;
-        if (g[i + 1] === '/') {
-          re += '(?:.*/)?';
-          i++;
-        } else {
-          re += '.*';
-        }
-      } else {
-        re += '[^/]*';
-      }
-    } else if (c === '?') {
-      re += '[^/]';
-    } else if ('\\^$.|+()[]{}'.includes(c)) {
-      re += '\\' + c;
-    } else {
-      re += c;
-    }
-  }
-  const compiled = new RegExp(`^${re}$`);
-  GLOB_REGEX_CACHE.set(glob, compiled);
-  return compiled;
-}
-
-/**
- * Gitignore-flavored match: a glob WITHOUT `/` matches the basename at any
- * depth (`*.pem` catches `sub/dir/key.pem`); a glob WITH `/` is anchored at
- * the workspace root (`.gbrain/**`). Paths are normalized to `/` separators.
- */
-export function matchesGlob(glob: string, relPath: string): boolean {
-  const norm = relPath.split(sep).join('/');
-  if (!glob.includes('/')) {
-    const base = norm.slice(norm.lastIndexOf('/') + 1);
-    return globToRegExp(glob).test(base);
-  }
-  return globToRegExp(glob).test(norm);
-}
-
-function isFingerprintEntry(entry: string): boolean {
-  return entry.startsWith('sha256:');
-}
-
-/**
- * Minimum fingerprint-prefix length (hex chars) an allowlist entry must carry
- * to suppress a finding. 16 hex = 64 bits: an 8-hex (32-bit) floor was low
- * enough that a short allowlist entry could collide with an UNRELATED secret's
- * hash and silently un-report it. The emitted fingerprint is exactly 16 hex,
- * so a copy-pasted fingerprint still matches at the floor.
- */
-export const ALLOWLIST_FINGERPRINT_MIN_HEX = 16;
-
-/**
- * True when the full sha256 hex of a matched value is allowlisted (≥16-hex
- * prefix). Exported so the sensitivity scan (context/sensitivity-scan.ts)
- * honors the SAME `.gbrain-scan-allow` fingerprint mechanics for its
- * non-secret families (PII, blocklist, pattern-file) — one escape hatch,
- * one dialect.
- */
-export function valueAllowlisted(fullHex: string, allowlist: string[]): boolean {
-  for (const entry of allowlist) {
-    if (!isFingerprintEntry(entry)) continue;
-    const prefix = entry.slice('sha256:'.length).toLowerCase();
-    if (prefix.length >= ALLOWLIST_FINGERPRINT_MIN_HEX && fullHex.startsWith(prefix)) return true;
-  }
-  return false;
-}
-
-/** True when a file path is allowlisted by any glob entry. */
-export function pathAllowlisted(relPath: string, allowlist: string[]): boolean {
-  return allowlist.some((entry) => !isFingerprintEntry(entry) && matchesGlob(entry, relPath));
 }
 
 // ── Scanning ────────────────────────────────────────────────────────────────
@@ -885,6 +775,8 @@ interface RawHit extends LineSpan {
   line: number; // 1-based
   /** Absolute offset of `value` within the scanned text (redactFindings splices on it). */
   abs: number;
+  /** Absolute offset where the match that made this claim starts, its anchor included (<= abs). */
+  from: number;
   lineText: string;
   spans: LineSpans;
   /**
@@ -926,7 +818,7 @@ function scanPemBlocks(text: string, claims: PemClaim[]): RawHit[] {
     }
     const value = text.slice(c.start, c.end);
     const span: LineSpan = { pattern: 'private_key_pem', value, start: 0 };
-    const hit: RawHit = { ...span, line, abs: c.start, lineText: value, spans: { all: [span] } };
+    const hit: RawHit = { ...span, line, abs: c.start, from: c.start, lineText: value, spans: { all: [span] } };
     if (c.kind === 'forward' && c.end > c.headerEnd) hit.legacyValue = text.slice(c.start, c.headerEnd);
     hits.push(hit);
   }
@@ -948,6 +840,7 @@ function insideClaim(claims: PemClaim[], start: number, end: number): boolean {
 
 function scanInternal(text: string, opts: ScanOpts): RawHit[] {
   const patterns = compilePatterns(opts);
+  const work = opts.work;
   // PEM blocks first: their full-span value must be redacted before any
   // per-line replacement can touch the region (base64 bodies never match the
   // named patterns, so order is a belt-and-suspenders guarantee).
@@ -986,39 +879,55 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
     // ENG-12: a line wholly inside a private-key claim is already redacted by
     // it; hits on it would only double-report (one key, one finding).
     if (pem.length > 0 && insideClaim(pem, lineStart, lineStart + line.length)) continue;
+    if (work) { work.linesScanned++; work.lineChars += line.length; }
     const spans: LineSpans = { all: [] };
+    let escaped: boolean | undefined;
     // Claimed-character bitmap behind the first-wins dedupe: allocated on the
     // line's FIRST hit only (most lines have none), then O(value) to test and
     // to mark. Same answer as scanning every prior span for an intersection.
     let taken: Uint8Array | null = null;
-    const claim = (pattern: string, value: string, start: number): void => {
+    const claim = (pattern: string, value: string, start: number, from: number): void => {
+      if (work) work.claims++;
       taken!.fill(1, start, start + value.length);
       // A hit entirely inside a private-key claim (a vendor-shaped run in a
       // key body on a line the claim only partly covers) still takes its
       // characters for the first-wins dedupe but is not reported.
       if (pem.length > 0 && insideClaim(pem, lineStart + start, lineStart + start + value.length)) return;
       spans.all.push({ pattern, value, start });
-      hits.push({ pattern, value, start, abs: lineStart + start, line: i + 1, lineText: line, spans });
+      hits.push({ pattern, value, start, abs: lineStart + start, from: lineStart + from, line: i + 1, lineText: line, spans });
     };
     for (const p of patterns) {
       if (p.continuation && p.continuation !== dangling) continue;
+      if (p.afterEscape && !(escaped ??= ESCAPE_IN_LINE_RE.test(line))) continue;
       if (p.precheck && !p.precheck(line)) continue;
       p.re.lastIndex = 0;
+      const subject = p.subject ? p.subject(line) : line;
       let m: RegExpExecArray | null;
-      while ((m = p.re.exec(line)) !== null) {
-        const value = m[2];
+      for (;;) {
+        if (work) work.regexExecs++;
+        m = p.re.exec(subject);
+        if (m === null) break;
+        if (work) work.candidates[p.name] = (work.candidates[p.name] ?? 0) + 1;
         const start = m.index + m[1].length;
+        const value = subject === line ? m[2] : line.slice(start, start + m[2].length);
         const end = start + value.length;
         // Zero-width safety: never loop forever on a pathological pattern.
         if (m[0].length === 0) p.re.lastIndex++;
         // The entropy gate judges the WHOLE matched value (the rule fired on
         // the assignment's value), before any overlap split.
         if (p.entropyGated && (!HIGH_ENTROPY_REQUIRES_DIGIT_RE.test(value) || !HIGH_ENTROPY_REQUIRES_NON_DIGIT_RE.test(value))) continue;
-        if (p.entropyGated && correctedEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
-        if (p.validate && !p.validate(value, m[1])) continue;
+        if (p.entropyGated) {
+          if (correctedEntropy(value, work) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
+          if (work) work.gatePassed++;
+        }
+        if (p.validate) {
+          if (work) work.validateCalls++;
+          if (!p.validate(value, subject === line ? m[1] : line.slice(m.index, start))) continue;
+        }
         if (!taken) {
           taken = new Uint8Array(line.length);
         } else if (anyTaken(taken, start, end)) {
+          if (work) work.unionSplits++;
           // UNION COVERAGE. An earlier pattern already claimed part of this
           // span. Attribution stays first-wins — a FULLY covered span is
           // skipped, so `Bearer <vendor key>` reports the vendor only — but
@@ -1030,15 +939,15 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
           // the surrounding `db_url_credentials` span was dropped).
           for (let a = start, k = start; k <= end; k++) {
             if (k < end && !taken[k]) continue;
-            if (a < k) claim(p.name, line.slice(a, k), a);
+            if (a < k) claim(p.name, line.slice(a, k), a, m.index);
             a = k + 1;
           }
           continue;
         }
-        claim(p.name, value, start);
+        claim(p.name, value, start, m.index);
       }
     }
-    for (const c of cells) if (!taken || !anyTaken(taken, c.start, c.start + c.value.length)) { taken ??= new Uint8Array(line.length); claim('labeled_credential', c.value, c.start); }
+    for (const c of cells) if (!taken || !anyTaken(taken, c.start, c.start + c.value.length)) { taken ??= new Uint8Array(line.length); claim('labeled_credential', c.value, c.start, c.start); }
   }
   return hits;
 }
@@ -1129,6 +1038,9 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/** Every named rule the default scan applies (the opt-in `high_entropy_assignment` and `labeled_credential` heuristics excluded), sorted. */
+export const NAMED_SECRET_RULES: readonly string[] = [...new Set([...CORE_PATTERNS.map((p) => p.name), 'private_key_pem'])].sort();
+
 const PATTERN_SINCE: ReadonlyMap<string, string> = new Map([
   ...CORE_PATTERNS.flatMap((p): Array<[string, string]> => (p.since ? [[p.name, p.since]] : [])),
   ['private_key_pem', SECURITY_WAVE_SINCE],
@@ -1173,11 +1085,27 @@ export function scanText(text: string, opts: ScanOpts = {}): SecretFinding[] {
   return out;
 }
 
+/**
+ * `scanText` with each claim's absolute span [start, end) in `text` (UTF-16
+ * offsets of the claimed value) and `from`, where the match that made it
+ * starts: its anchor (`Bearer `, `Authorization: Basic `, an assignment
+ * key) or the boundary character before the value. An allowlisted claim keeps
+ * its span with `finding: null`, so the windowed scan (secret-scan-stream.ts)
+ * can still drop a seam's partial copy of it.
+ */
+export function scanTextSpans(text: string, opts: ScanOpts = {}): Array<{ start: number; end: number; from: number; finding: SecretFinding | null }> {
+  const allowlist = opts.allowlist ?? [];
+  return scanInternal(text, opts).map((hit) => {
+    const fullHex = sha256Hex(hit.value);
+    return { start: hit.abs, end: hit.abs + hit.value.length, from: hit.from, finding: valueAllowlisted(fullHex, allowlist) ? null : toFinding(hit, fullHex) };
+  });
+}
+
 /** Bytes to sniff for NUL when deciding content is binary. */
 export const BINARY_SNIFF_BYTES = 8192;
 
 /** scanFiles skips anything larger (the push gate applies the same cap). */
-export const SCAN_MAX_FILE_BYTES = 25 * 1024 * 1024;
+export const SCAN_MAX_FILE_BYTES = PUSH_SCAN_MAX_FILE_BYTES;
 
 /** True when the first BINARY_SNIFF_BYTES of the buffer contain a NUL byte. */
 export function looksBinaryBuffer(buf: Uint8Array): boolean {
@@ -1252,27 +1180,29 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
 // reports — a claimed value's bytes at a position the scanner did not claim
 // (embedded past its left boundary inside a longer identifier) are left
 // as-is, and the corpus write and the push gate see the same findings.
-// Vendor-prefixed values lose nothing by staying outside the echo pass: they
-// re-match on their own wherever they recur.
 //
 // THE ECHO PASS. A `bearer` token is claimed only where its `Bearer ` keyword
 // anchors it and a `high_entropy_assignment` value only where its keyword
 // does, yet transcripts routinely echo the same value bare (`Authorization:
 // Bearer <tok>` in a tool call, then `<tok>` alone in the reply; a pasted
-// `PASSWORD=<v>` line, then `<v>` in prose). So the values those two patterns
+// `PASSWORD=<v>` line, then `<v>` in prose). A vendor or JWT value recurs
+// glued to a word (`token_<key>`, `prefix<key>`) where no boundary lets it
+// re-match (#7978). So the values those patterns (and `labeled_credential`)
 // claim form an ECHO DICTIONARY (value → pattern) and every remaining
 // occurrence — bare, or embedded inside a longer identifier — is redacted as
 // that pattern's token too. Three bounds keep the pass cheap and
 // collision-safe: a value must clear its pattern's floor
-// (ECHO_MIN_CHARS_BEARER = 20, ECHO_MIN_CHARS_ENTROPY = 12 — the rules' own
+// (ECHO_MIN_CHARS_BEARER = ECHO_MIN_CHARS_VENDOR = 20, ECHO_MIN_CHARS_ENTROPY = 12 — the rules' own
 // floors, restated so a pattern edit alone can never widen the pass to
 // short, collision-prone values; an opted-in `labeled_credential` value
 // needs ECHO_MIN_CHARS_LABELED = 8 and must not be a stoplisted word, so
 // `pwd: 1234` never scrubs every later "1234"), must be at most
 // ECHO_MAX_VALUE_CHARS long,
-// and only the first ECHO_MAX_UNIQUE unique values in claim order — ONE cap
-// across both patterns — join. A value past either cap is still redacted at
-// its claimed span; only its echoes are the accepted miss.
+// and only the first ECHO_MAX_UNIQUE unique bearer, assignment and labeled
+// values plus the first ECHO_MAX_UNIQUE_VENDOR unique vendor or jwt values, in
+// claim order, join (two caps, so planted vendor strings never crowd out a
+// bearer token's echo). A value past a cap is still redacted at its claimed
+// span; only its echoes are the accepted miss.
 //
 // The pass is a streaming merge over the ORIGINAL text: per value, the
 // position of its next occurrence at or beyond the emit cursor (found by
@@ -1299,7 +1229,7 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
 // message bodies, speaker labels, title, metadata values) must scrub an echo
 // in one field of a value claimed in ANOTHER. `planRedaction` scans one
 // field and adds its eligible values to a caller-supplied shared map under
-// the same floors and the same single cap; `applyRedaction` splices later and
+// the same floors and the same caps; `applyRedaction` splices later and
 // reads the map as it stands THEN — so a caller plans every field first and
 // applies afterwards, and a value claimed in the last field is scrubbed from
 // the first. `redactFindings` is the one-shot composition for a single text.
@@ -1317,6 +1247,15 @@ export const ECHO_MIN_CHARS_BEARER = 20;
 export const ECHO_MIN_CHARS_ENTROPY = 12;
 
 /**
+ * Floor for a vendor-shape or `jwt` value (every core rule but the four
+ * catch-alls) to take part in the echo pass (#7978): bearer's floor, so a
+ * short, collision-prone value never scrubs its later lookalikes.
+ */
+export const ECHO_MIN_CHARS_VENDOR = 20;
+const NON_ECHO_CORE_PATTERNS = new Set(['bearer', 'db_url_credentials', 'url_credentials', 'basic_auth']);
+const VENDOR_ECHO_PATTERNS = new Set(CORE_PATTERNS.map((p) => p.name).filter((name) => !NON_ECHO_CORE_PATTERNS.has(name)));
+
+/**
  * A claimed value longer than this is redacted at its claimed span but does
  * not join the echo dictionary. Bounds the per-candidate compare of the
  * substring sweeps; no real bearer token or assignment value is this long,
@@ -1325,12 +1264,20 @@ export const ECHO_MIN_CHARS_ENTROPY = 12;
 export const ECHO_MAX_VALUE_CHARS = 512;
 
 /**
- * Cap on the unique values (bearer + high_entropy_assignment together, claim
- * order, first N) the echo pass will look for. Keeps the pass a bounded
- * number of linear sweeps; an echo of a value past the cap is the
- * documented, accepted miss.
+ * Cap on the unique bearer, high_entropy_assignment and labeled_credential
+ * values (together, claim order, first N) the echo pass will look for. Keeps
+ * the pass a bounded number of linear sweeps; an echo of a value past the cap
+ * is the documented, accepted miss.
  */
 export const ECHO_MAX_UNIQUE = 64;
+
+/**
+ * Separate cap on the unique vendor-shape and `jwt` values (claim order, first
+ * N) in the echo dictionary. Planted vendor-shaped strings fill only this cap,
+ * never ECHO_MAX_UNIQUE, so they cannot crowd out a later bearer token or
+ * assignment value whose bare echo only the dictionary scrubs (#7978).
+ */
+export const ECHO_MAX_UNIQUE_VENDOR = 32;
 
 /** Echo dictionary: claimed value → the pattern that claimed it first. */
 export type EchoDictionary = Map<string, string>;
@@ -1338,7 +1285,7 @@ export type EchoDictionary = Map<string, string>;
 export interface RedactOpts extends ScanOpts {
   /**
    * Shared echo dictionary. `planRedaction` ADDS the eligible values it
-   * claims (shared floors, one cap, claim order); `applyRedaction` reads the
+   * claims (shared floors and caps, claim order); `applyRedaction` reads the
    * map at apply time. Pass one map across every field of a document for
    * session-wide echo coverage. Default: a fresh map per `planRedaction`.
    */
@@ -1355,6 +1302,8 @@ export interface RedactionPlan {
   text: string;
   /** Claimed spans, sorted by absolute offset. */
   claimed: Array<{ abs: number; end: number; pattern: string }>;
+  /** The caller's work counters, carried to `applyRedaction` (echo sweeps are counted there). */
+  work?: ScanWork;
 }
 
 function addEchoValue(into: EchoDictionary, pattern: string, value: string): void {
@@ -1366,10 +1315,15 @@ function addEchoValue(into: EchoDictionary, pattern: string, value: string): voi
         ? ECHO_MIN_CHARS_ENTROPY
         : pattern === 'labeled_credential'
           ? ECHO_MIN_CHARS_LABELED
-          : Infinity;
-  if (value.length < floor || value.length > ECHO_MAX_VALUE_CHARS) return;
-  if (into.has(value) || into.size >= ECHO_MAX_UNIQUE) return;
+          : VENDOR_ECHO_PATTERNS.has(pattern) ? ECHO_MIN_CHARS_VENDOR : Infinity;
+  if (value.length < floor || value.length > ECHO_MAX_VALUE_CHARS || into.has(value)) return;
+  const vendor = VENDOR_ECHO_PATTERNS.has(pattern);
+  let used = 0;
+  for (const claimedBy of into.values()) if (VENDOR_ECHO_PATTERNS.has(claimedBy) === vendor) used++;
+  if (used >= (vendor ? ECHO_MAX_UNIQUE_VENDOR : ECHO_MAX_UNIQUE)) return;
   into.set(value, pattern);
+  const unescaped = value.replaceAll('\\/', '/');
+  if (unescaped !== value) addEchoValue(into, pattern, unescaped);
 }
 
 /**
@@ -1391,7 +1345,7 @@ export function planRedaction(text: string, opts: RedactOpts = {}): RedactionPla
     addEchoValue(echoValues, hit.pattern, hit.value);
   }
   claimed.sort((a, b) => a.abs - b.abs);
-  return { redactions, echoValues, text, claimed };
+  return { redactions, echoValues, text, claimed, ...(opts.work ? { work: opts.work } : {}) };
 }
 
 /**
@@ -1435,6 +1389,7 @@ export function applyRedaction(plan: RedactionPlan): string {
   const { text, claimed, echoValues } = plan;
   if (claimed.length === 0 && echoValues.size === 0) return text;
   const sweep = echoValues.size > 0 ? startEchoSweep(text, echoValues) : null;
+  if (sweep && plan.work) plan.work.echoSweeps++;
   const parts: string[] = [];
   // Copy text[from, to) through, splicing the echo occurrences inside it. At
   // each step the leftmost (then longest) occurrence at or beyond the cursor

@@ -4,6 +4,7 @@ import type { ParsedPage } from '../import-file.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { stableJson } from '../persistence/digest.ts';
+import { bodyUnread } from '../page-body/page-shape.ts';
 import { assertPageRevision, type PageSnapshot } from './types.ts';
 
 /** Imported bytes are prepared outside transactions; publication still needs CAS. */
@@ -25,9 +26,13 @@ export async function assertImportBase(tx: BrainEngine, slug: string, sourceId: 
 const canonicalFields = (p: Page | ParsedPage) => ({ type: p.type, title: p.title, compiled_truth: p.compiled_truth,
   timeline: p.timeline ?? '', frontmatter: p.frontmatter });
 
-/** Content hashes omit volatile metadata; a prepared no-op must compare all canonical fields. */
+/**
+ * Content hashes omit volatile metadata; a prepared no-op must compare all canonical fields. A stored body left unread
+ * (over the single-string ceiling) differs from any parsed body, which is within it (GBRA-287: reading it threw
+ * `page_body_segmented` and blocked the source's sync).
+ */
 export function sameCanonicalImport(existing: PageSnapshot | null, parsed: ParsedPage): boolean {
-  if (!existing) return false;
+  if (!existing || bodyUnread(existing.page)) return false;
   const tags = [...new Set([...existing.tags, ...parsed.tags])].sort();
   return stableJson(canonicalFields(existing.page)) === stableJson(canonicalFields(parsed)) && stableJson([...existing.tags].sort()) === stableJson(tags);
 }
@@ -36,11 +41,12 @@ export function sameCanonicalImport(existing: PageSnapshot | null, parsed: Parse
  * #5158: the stored content_hash digests frontmatter in insertion order, so a
  * file whose keys were only reordered hashes differently. This key-sorted
  * comparison of every canonical field and the exact tag set recognizes it as
- * unchanged without touching the stored hash formula.
+ * unchanged without touching the stored hash formula. A stored body left unread
+ * (over the single-string ceiling) differs from any parsed body, which is within it.
  */
 export async function sameContentAnyKeyOrder(engine: Pick<BrainEngine, 'getTags'>, existing: Page, existingTags: string[] | null,
   parsed: ParsedPage, sourceId: string): Promise<boolean> {
-  if (existing.deleted_at || existing.type !== parsed.type || existing.title !== parsed.title
+  if (existing.deleted_at || bodyUnread(existing) || existing.type !== parsed.type || existing.title !== parsed.title
     || existing.compiled_truth !== parsed.compiled_truth || (existing.timeline ?? '') !== (parsed.timeline ?? '')) return false;
   if (stableJson(canonicalFields(existing)) !== stableJson(canonicalFields(parsed))) return false;
   const tags = existingTags ?? await engine.getTags(existing.slug, { sourceId });

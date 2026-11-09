@@ -65,8 +65,8 @@ describe('effects drain latency (PGLite)', () => {
     const prepared = (await readProjectionSnapshot(engine, slug, sourceId, { allowUnsealed: true }))!;
     await installPageProjection(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Widget Co renewal notes.' }], { seal: true });
     const sealed = (await readProjectionSnapshot(engine, slug, sourceId))!;
-    expect(await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Widget Co renewal notes.',
-      embedding: new Float32Array(1536).fill(0.1), model: MODEL }], `${MODEL}:1536`)).toBe(true);
+    expect((await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Widget Co renewal notes.',
+      embedding: new Float32Array(1536).fill(0.1), model: MODEL }], `${MODEL}:1536`)).complete).toBe(true);
     await engine.executeRaw("UPDATE persistence_effects SET state='committed', outcome='{}'::jsonb WHERE kind<>'embedding'");
     // Clone the committed request and its queued no-op effect: every clone is its own request, as an import leaves them.
     const columns = async (table: string, skip: string[]) => (await engine.executeRaw<{ c: string }>(

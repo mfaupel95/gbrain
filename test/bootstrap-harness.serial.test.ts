@@ -58,6 +58,8 @@ import type { GBrainConfig } from '../src/core/config.ts';
 import { VERSION } from '../src/version.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { SourceTargetError } from '../src/core/source-resolver.ts';
+import { renderBrainFirstSnippet } from '../src/core/setup/brain-first.ts';
+import { hookLauncherPath } from '../src/core/setup/hook-launcher.ts';
 
 const TOKEN_A = `gbrain_${'a'.repeat(64)}`;
 const TOKEN_B = `gbrain_${'b'.repeat(64)}`;
@@ -149,6 +151,7 @@ function makeFake(opts: {
       });
     }) as unknown as typeof fetch,
     probeIdentity: async (_url: string, probeToken: string): Promise<ConnectProbeResult> => {
+      if (!health.ok) return { ok: false, reason: 'unreachable', message: 'fetch failed: ECONNREFUSED' };
       // Token-aware like a REAL serve: only tokens this fixture knows about
       // authenticate — the apply-time canary (a random same-format token)
       // must fail with reason 'auth' or every apply trips the impostor guard.
@@ -163,6 +166,7 @@ function makeFake(opts: {
     userSettingsPath: userSettings,
     codexConfig,
     opencodeConfig,
+    opencodeAgentsPath: join(dir, 'opencode', 'AGENTS.md'),
     mint: async (o) => {
       mintCalls.push(o as { name: string; scopes: string[]; sourceGrant?: string[] });
       const m = mintQueue[mintIdx++];
@@ -330,6 +334,9 @@ describe('full apply', () => {
     const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
     expect(cmd).toContain('GBRAIN_HOOK_LANE=harness');
     expect(cmd).toContain('GBRAIN_SOURCE=default');
+    // #8428: the harness lane's hooks start gbrain through the launcher in its own directory, never the session's.
+    expect(cmd).toContain(`${hookLauncherPath(f.home)} /opt/fake/gbrain hook`);
+    expect(hooksJson).toContain(hookLauncherPath(f.home));
 
     const state = readHarnessReceiptState(f.home);
     expect(state.state).toBe('ok');
@@ -460,6 +467,41 @@ describe('full apply', () => {
     expect(readFileSync(f2.codexConfig, 'utf8')).toContain('http://192.168.1.50:3131/mcp');
   });
 
+  test('registrar mode wires no Codex capture hook, the same recorded consent as the Claude lane (MCP only)', async () => {
+    const f = makeFake();
+    const code = await applyHarness(flags(['--url', 'http://192.168.1.50:3131/mcp', '--token', TOKEN_A, '--harness', 'codex']), f.deps);
+    expect(code).toBe(0);
+    expect(f.out.join('\n')).toContain('No hooks are wired by this invocation.');
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json'))).toBe(false);
+    expect(readFileSync(f.codexConfig, 'utf8')).not.toContain('gbrain:codex-hooks-trust');
+  });
+
+  test('--no-capture declines the Codex SessionEnd capture hook (capture is its own consent item)', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex', '--no-capture']), f.deps)).toBe(0);
+    // The per-turn rule hook is not capture: it stays, and no SessionEnd capture group is written.
+    const declined = readFileSync(join(dirname(f.codexConfig), 'hooks.json'), 'utf8');
+    expect(declined).not.toContain('hook session-end');
+    expect(declined).not.toContain('SessionEnd');
+    expect(declined).toContain('GBRAIN_HOOK_LANE=turn-rule');
+    const g = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex']), g.deps)).toBe(0);
+    expect(g.out.join('\n')).toMatch(/Codex session-transcript capture/);
+    expect(readFileSync(join(dirname(g.codexConfig), 'hooks.json'), 'utf8')).toContain('hook session-end --harness codex');
+  });
+
+  test('codex lane wires the per-turn rule hook, trusted, beside the brain-first block; the consent block names it', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex']), f.deps)).toBe(0);
+    expect(f.out.join('\n')).toContain('The per-turn brain-first rule hook (UserPromptSubmit');
+    const hooks = readFileSync(join(dirname(f.codexConfig), 'hooks.json'), 'utf8');
+    expect(hooks).toContain('GBRAIN_HOOK_LANE=turn-rule');
+    expect(hooks).toContain('hook user-prompt');
+    expect(readFileSync(f.codexConfig, 'utf8')).toContain('user_prompt_submit');
+    expect(await removeHarness(flags(['--remove', '--harness', 'codex']), f.deps)).toBe(0);
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json')) ? readFileSync(join(dirname(f.codexConfig), 'hooks.json'), 'utf8') : '').not.toContain('GBRAIN_HOOK_LANE=turn-rule');
+  });
+
   test('--project must exist [F4]', async () => {
     const f = makeFake();
     const code = await applyHarness(flags(['--project', '/definitely/not/a/dir']), f.deps);
@@ -488,6 +530,35 @@ describe('full apply', () => {
     expect(code).toBe(1);
     expect(f.out.join('\n')).toMatch(/no_pglite_path.*MCP tools are the active seam/s);
     expect(f.err.join('\n')).toMatch(/GBRAIN_HOME \/ DATABASE_URL/);
+  });
+});
+
+describe('skills index exit codes (GBRA-194)', () => {
+  test('a requested skills index that is not written makes apply exit 1 and lands in --json', async () => {
+    const f = makeFake();
+    await withEnv({ GBRAIN_HOME: dirname(f.home), GBRAIN_SKILL_LOADING: undefined }, async () => {
+      const code = await applyHarness(flags(['--harness', 'claude-code', '--skill-loading', 'spring', '--json']), f.deps);
+      expect(code).toBe(1);
+      expect(f.err.join('\n')).toContain('skills index was not written');
+      const doc = JSON.parse(f.out.filter(l => l.trim().startsWith('{')).join('\n') || '{}') as { status?: string; skills_index?: Array<{ action: string; reason?: string }> };
+      expect(doc.status).toBe('failed');
+      expect(doc.skills_index?.[0]).toMatchObject({ action: 'preserve', reason: 'launcher_unusable' });
+    });
+  });
+
+  test('a skills index that cannot be removed makes --remove exit 1 and keeps the receipt', async () => {
+    const f = makeFake();
+    await withEnv({ GBRAIN_HOME: dirname(f.home), GBRAIN_SKILL_LOADING: undefined }, async () => {
+      expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+      writeFileSync(join(f.home, 'skill-loading.json'), '{not json');
+      const removeDeps: HarnessDeps = {
+        ...f.deps,
+        runner: async (argv: string[]) => (argv[0] === 'claude' && argv[2] === 'get' ? { code: 0, stdout: `Type: http\nURL: ${URL}`, stderr: '' } : { code: 0, stdout: '', stderr: '' }),
+      };
+      expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), removeDeps)).toBe(1);
+      expect(readHarnessReceiptState(f.home).state).not.toBe('absent');
+      expect(readFileSync(join(f.home, 'skill-loading.json'), 'utf8')).toBe('{not json');
+    });
   });
 });
 
@@ -725,6 +796,41 @@ describe('outside-voice hardening (X-batch)', () => {
     await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.not.toThrow(/pass --source/);
     expect(f.mintCalls).toHaveLength(0);
     expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  // #6661 (D25): the refusal's pre-mint carries the harness grant; a bare `--scopes read,write` token got join_brain refused.
+  test('LIVE_SERVE refusal prints the stop/mint/rescope/start/--token sequence with the full harness grant', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    const err = await applyHarness(flags(['--harness', 'codex']), f.deps).then(() => null, (e: unknown) => e as { code: string; message: string; details: { steps: string[]; scopes: string[]; operations: string[] } });
+    expect(err?.code).toBe('LIVE_SERVE');
+    const { steps, scopes, operations } = err!.details;
+    expect(scopes).toEqual(['read', 'write', 'skills_member_self']);
+    expect(operations).toEqual(expect.arrayContaining(['join_brain', 'sync_brain_skills', 'leave_brain', 'put_page', 'query']));
+    const { operations: all } = await import('../src/core/operations.ts');
+    const byName = new Map(all.map(op => [op.name, op]));
+    expect(operations.filter(name => byName.get(name)?.localOnly || !['read', 'write'].includes(byName.get(name)?.scope ?? ''))).toEqual([]);
+    expect(steps).toEqual([
+      'stop the serve that holds this brain',
+      'gbrain auth create bootstrap-harness --scopes read,write,skills_member_self',
+      `gbrain auth rescope --token bootstrap-harness --operations ${operations.join(',')}`,
+      'start `gbrain serve --http` again',
+      're-run this `gbrain bootstrap harness` command with --token <the token step 2 printed>',
+    ]);
+    for (const step of steps) expect(err!.message).toContain(step);
+    expect(f.mintCalls).toHaveLength(0);
+  });
+
+  test('LIVE_SERVE refusal on a memory-only re-run with --source carries the memory-only grant and the source floor', async () => {
+    const f = makeFake({ pgliteLive: true, mintQueue: [] });
+    const err = await applyHarness(flags(['--harness', 'codex', '--skills', 'memory-only', '--source', 'wiki', '--token-name', 'hx']), f.deps)
+      .then(() => null, (e: unknown) => e as { code: string; details: { steps: string[]; operations: string[] } });
+    expect(err?.code).toBe('LIVE_SERVE');
+    expect(err!.details.steps[1]).toBe('gbrain auth create hx --scopes read,write');
+    expect(err!.details.steps[2]).toMatch(/^gbrain auth rescope --token hx --operations \S+ --sources wiki$/);
+    expect(err!.details.operations).not.toContain('join_brain');
   });
 
   test('live PGLite serve + --token + no --source: wires unpinned with a warning (the documented PGLite lane)', async () => {
@@ -1453,7 +1559,8 @@ describe('ambient-writeback instruction blocks (kind: instructions, WP3)', () =>
     // speaks for the LOCAL brain — a block here would order agents to save
     // into the remote brain without its brain-scoped opt-in).
     expect(readFileSync(f.codexConfig, 'utf8')).toContain('http://192.168.1.50:3131/mcp');
-    expect(existsSync(agentsPath(f))).toBe(false);
+    // Only the read-side brain-first block lands (it orders no writes).
+    expect(readFileSync(agentsPath(f), 'utf8')).toBe(renderBrainFirstSnippet('codex', { kind: 'mcp', server: 'gbrain' }));
     expect(instrTargets(f.home)).toEqual([]);
     expect(f.out.join('\n')).toContain('registrar mode: ambient-writeback instruction blocks are NOT installed');
   });
@@ -1496,8 +1603,9 @@ describe('ambient-writeback instruction blocks (kind: instructions, WP3)', () =>
     // preload-pinned GBRAIN_HOME scratch has no config.json → off).
     expect(await applyHarness(flags(), f.deps)).toBe(0);
     // Non-block content restored EXACTLY; the files are never deleted.
-    expect(readFileSync(memoryPath(f), 'utf8')).toBe('# mine\n');
-    expect(readFileSync(agentsPath(f), 'utf8')).toBe('# agents\n');
+    // The brain-first block (default on, independent of writeback) stays.
+    expect(readFileSync(memoryPath(f), 'utf8')).toBe(`# mine\n${renderBrainFirstSnippet('claude-code', { kind: 'mcp', server: 'gbrain' })}`);
+    expect(readFileSync(agentsPath(f), 'utf8')).toBe(`# agents\n${renderBrainFirstSnippet('codex', { kind: 'mcp', server: 'gbrain' })}`);
     expect(instrTargets(f.home)).toEqual([]);
     expect(f.out.join('\n')).toMatch(
       /ambient writeback off — enable with `gbrain config set memory\.auto_writeback salient` and re-run\./,
@@ -1788,5 +1896,75 @@ describe('harness hooks without their marker (#6092, #6171)', () => {
     f.out.length = 0;
     await statusHarness(parseHarnessArgs(['--status']), f.deps);
     expect(f.out.join('\n')).toContain(`hook entries in ${f.userSettings}: 5 gbrain (5 without the _gbrain marker)`);
+  });
+});
+
+// #6661 option B: on PGLite a stopped serve is the normal state for a --token run, so nothing answering is
+// pending verification (exit 13, JSON status pending_verify) instead of a hard stop; everything else still fails.
+describe('--token on PGLite with no serve answering: pending_verify (#6661)', () => {
+  const pglite = () => ({ engine: 'pglite' } as GBrainConfig);
+
+  test('wires, skips the smoke without rolling back, records verify_pending and names the re-run as the fix', async () => {
+    const f = makeFake({ health: { ok: false } });
+    f.deps.loadFileConfig = pglite;
+    const code = await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A, '--json']), f.deps);
+    expect(code).toBe(13);
+    const doc = JSON.parse(f.out.at(-1)!) as { status: string; code: string; smoke_ok: boolean; targets: HarnessTarget[]; fix: { argv: string[]; next: string; inputs: Array<{ name: string }>; verify: { argv: string[] } } };
+    expect(doc.status).toBe('pending_verify');
+    expect(doc.code).toBe('pending_verify');
+    expect(doc.smoke_ok).toBe(false);
+    expect(doc.targets.every(t => t.state === 'confirmed')).toBe(true);
+    expect(doc.fix.next).toBe('tell_user_to_run');
+    expect(doc.fix.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--yes', '--harness', 'codex', '--token', '<TOKEN>', '--source', 'default']);
+    expect(JSON.stringify(doc)).not.toContain(TOKEN_A);
+    expect(doc.fix.inputs.map(i => i.name)).toEqual(['TOKEN']);
+    expect(doc.fix.verify.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--status', '--json']);
+    expect(readFileSync(f.codexConfig, 'utf8')).toContain(`Authorization = "Bearer ${TOKEN_A}"`);
+    const state = readHarnessReceiptState(f.home);
+    expect(state.state === 'ok' && state.receipt.verify_pending?.reason).toBe('serve_unreachable');
+
+    // --status stays partial (exit 1) while pending, even once the serve answers and the token verifies.
+    f.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), f.deps)).toBe(1);
+    expect(JSON.parse(f.out.join('\n'))).toMatchObject({ status: 'partial', serve_ok: false, verify_pending: { reason: 'serve_unreachable' } });
+    const up = makeFake();
+    up.deps.gbrainHome = f.home;
+    up.deps.codexConfig = f.codexConfig;
+    up.deps.loadFileConfig = pglite;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), up.deps)).toBe(1);
+    expect(JSON.parse(up.out.join('\n'))).toMatchObject({ status: 'partial', serve_ok: true, token_verified: true });
+
+    // The fix's re-run with the serve up passes its smoke, writes a fresh receipt without the marker, and status is green.
+    const rerun = doc.fix.argv.slice(3).map(a => (a === '<TOKEN>' ? TOKEN_A : a));
+    expect(await applyHarness(parseHarnessArgs(rerun), up.deps)).toBe(0);
+    const after = readHarnessReceiptState(f.home);
+    expect(after.state === 'ok' && after.receipt.verify_pending).toBeUndefined();
+    up.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), up.deps)).toBe(0);
+  });
+
+  test('a serve that holds the brain but does not answer at this url (wrong --url/--port) still fails with no writes', async () => {
+    const f = makeFake({ health: { ok: false }, pgliteLive: true });
+    f.deps.loadFileConfig = pglite;
+    expect(await applyHarness(flags(['--harness', 'codex', '--port', '9999', '--token', TOKEN_A]), f.deps)).toBe(1);
+    expect(f.err.join('\n')).toMatch(/no healthy gbrain serve/);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('without --token, on Postgres, or when something non-gbrain answers, the health failure is still a hard stop', async () => {
+    const noToken = makeFake({ health: { ok: false } });
+    noToken.deps.loadFileConfig = pglite;
+    expect(await applyHarness(flags(['--harness', 'codex']), noToken.deps)).toBe(1);
+    const postgres = makeFake({ health: { ok: false } });
+    postgres.deps.loadFileConfig = () => ({ engine: 'postgres' } as GBrainConfig);
+    expect(await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), postgres.deps)).toBe(1);
+    const answered = makeFake();
+    answered.deps.loadFileConfig = pglite;
+    answered.deps.fetchFn = (async () => new Response('nope', { status: 404 })) as unknown as typeof fetch;
+    expect(await applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), answered.deps)).toBe(1);
+    for (const f of [noToken, postgres, answered]) {
+      expect(f.err.join('\n')).toMatch(/no healthy gbrain serve/);
+      expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+    }
   });
 });

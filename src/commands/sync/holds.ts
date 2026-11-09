@@ -18,11 +18,12 @@ import type { BrainEngine } from '../../core/engine.ts';
 import { serr } from '../../core/console-prefix.ts';
 import { currentCompanyBrainSync } from '../../core/company-brain/profile.ts';
 import { RECOVERY_VERSION } from '../../core/frontmatter-recovery.ts';
-import { MAX_FILE_SIZE, contentRefusalFromReceipt, isContentRefusal, type ContentRefusal } from '../../core/import-screen.ts';
+import { importSizeLimit, contentRefusalFromReceipt, isContentRefusal, type ContentRefusal } from '../../core/import-screen.ts';
 import { slugConflictHoldMessage, type ImportResult } from '../../core/import-file.ts';
 import { classifyImportHold, parseMarkdown } from '../../core/markdown.ts';
+import { noncanonicalPrivateHold } from '../../core/persistence/visibility-request.ts';
 import { readSourceFileSync } from '../../core/minions/source-filesystem.ts';
-import { maintenanceTransaction } from '../../core/persistence/attribution.ts';
+import { maintenanceBeliefTransaction } from '../../core/belief/writers.ts';
 import type { SyncRename } from '../../core/persistence/sync-discovery.ts';
 import {
   addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, gitHoldItem, holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds,
@@ -31,6 +32,9 @@ import {
 import { DEFAULT_SOURCE_ID, hasMalformedPathSegment, isCodeFilePath, resolveSlugForPath, sanitizePathForDisplay, slugifyPath } from '../../core/sync.ts';
 import type { SyncActivePack } from './sync-run.ts';
 import { isPathContained } from '../../core/path-confine.ts';
+import { bytePathHoldGone } from '../../core/sync-byte-paths.ts';
+import { bindOrigin } from '../../core/persistence/origin-guard.ts';
+import { CLASSIC_FILE_HOLD_CODES, classifyClassicFile, type ClassicFileHold } from '../../core/classic-file-holds.ts';
 
 /** The file at a repo-relative path from git or a hold row, or null when it is missing or resolves outside the source root. */
 function fileUnderRoot(root: string, path: string): string | null {
@@ -85,7 +89,7 @@ export async function openLegacyHolds(engine: BrainEngine, sourceId: string | un
 
 /** sha256 of the exact string legacy import reads (BOM stripped), or null when the file is over the size limit. */
 function readImportContent(filePath: string): { content: string; upstreamVersion: string } | null {
-  if (lstatSync(filePath).size > MAX_FILE_SIZE) return null;
+  if (lstatSync(filePath).size > importSizeLimit(filePath)) return null;
   const content = readSourceFileSync(filePath, 'utf-8').replace(/^\uFEFF/, '');
   return { content, upstreamVersion: createHash('sha256').update(content).digest('hex') };
 }
@@ -100,17 +104,42 @@ function currentVersion(filePath: string): string | null | undefined {
  * retry request, an older frontmatter reader or fence screen, and holds whose
  * verdict depends on database state or the working tree). A held file that is
  * gone or no longer synced clears.
+ * GBRA-133: a symlink, permission or absent-from-worktree hold is re-classified
+ * every run and re-screened when its verdict changed (the link replaced by a
+ * file, a chmod, a restore), with no commit needed; gone when the path left
+ * the commit. `gitRoot` bounds a symlink target as in or out of the repository.
  * `selected` is null for a path outside this run's scope (left alone).
  */
-export function planHoldRescreen(holds: LegacyHolds, input: { root: string; touched: ReadonlySet<string>; selected: (path: string) => boolean | null }): void {
+export function planHoldRescreen(holds: LegacyHolds, input: { root: string; gitRoot?: string; touched: ReadonlySet<string>; selected: (path: string) => boolean | null }): void {
   for (const path of holds.retryPaths) if (!holds.existing.has(path)) holds.retryTaken.push(path);
   for (const [path, record] of holds.existing) {
+    // GBRA-133: an unsupported_path hold stays while its exact bytes name a file, and clears once they do not.
+    const byteGone = bytePathHoldGone(input.root, path);
+    if (byteGone !== null) {
+      if (byteGone) holds.gone.push(path);
+      if (holds.retryPaths.has(path)) holds.retryTaken.push(path);
+      continue;
+    }
     if (input.touched.has(path)) {
       if (holds.retryPaths.has(path)) holds.retryTaken.push(path);
       continue;
     }
     const selected = input.selected(path);
     if (selected === null) continue;
+    if (CLASSIC_FILE_HOLD_CODES.has(record.code)) {
+      const now = selected ? classifyClassicFile(input.root, path, input.gitRoot ?? input.root) : null;
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- path is a repo-relative hold path; lstat reads metadata only
+      const present = (() => { try { return !!lstatSync(join(input.root, path)); } catch { return false; } })();
+      if (!selected || (!now && !present)) {
+        holds.gone.push(path);
+      } else if (!holds.active || (now && now.code === record.code && now.reason === record.meta.reason && !holds.retryPaths.has(path))) {
+        continue;
+      } else {
+        holds.rescreen.push(path);
+      }
+      if (holds.retryPaths.has(path)) holds.retryTaken.push(path);
+      continue;
+    }
     const filePath = fileUnderRoot(input.root, path);
     if (!selected || !filePath) {
       holds.gone.push(path);
@@ -138,10 +167,11 @@ export function screenLegacyFile(filePath: string, relPath: string, activePack?:
   } catch {
     return { refusal: null, upstreamVersion: null };
   }
-  if (!read) return { refusal: { code: 'file_too_large', message: `File too large (${lstatSync(filePath).size} bytes, max ${MAX_FILE_SIZE}).` }, upstreamVersion: null };
+  if (!read) return { refusal: { code: 'file_too_large', message: `File too large (${lstatSync(filePath).size} bytes, max ${importSizeLimit(filePath)}).` }, upstreamVersion: null };
   if (hasMalformedPathSegment(relPath) || isCodeFilePath(relPath)) return { refusal: null, upstreamVersion: read.upstreamVersion };
   const parsed = parseMarkdown(read.content, relPath, { validate: true, ...(activePack ? { activePack } : {}) });
-  const refusal = classifyImportHold(parsed, { expectedSlug: slugifyPath(relPath) || null, slugConflictMessage: (_found, expected) => slugConflictHoldMessage(relPath, expected) });
+  const refusal = classifyImportHold(parsed, { expectedSlug: slugifyPath(relPath) || null, slugConflictMessage: (_found, expected) => slugConflictHoldMessage(relPath, expected) })
+    ?? noncanonicalPrivateHold(read.content, parsed.frontmatter);
   return { refusal, upstreamVersion: read.upstreamVersion };
 }
 
@@ -193,6 +223,17 @@ export async function holdRefusedImport(engine: BrainEngine, holds: LegacyHolds 
   try {
     const upstreamVersion = refusal.code === 'file_too_large' || !existsSync(filePath) ? null : readImportContent(filePath)?.upstreamVersion ?? null;
     await recordLegacyHold(engine, holds, { path, refusal, upstreamVersion });
+    return true;
+  } catch (e) {
+    serr(`  Could not record the hold for ${sanitizePathForDisplay(path)} (${e instanceof Error ? e.message : String(e)}); it counts as a failure this run.`);
+    return false;
+  }
+}
+
+/** GBRA-133: holds a path classic sync cannot read as a regular file (or that is absent from the working tree); false when the hold cannot be recorded. */
+export async function holdClassicFile(engine: BrainEngine, holds: LegacyHolds, path: string, refusal: ClassicFileHold): Promise<boolean> {
+  try {
+    await recordLegacyHold(engine, holds, { path, refusal, upstreamVersion: null });
     return true;
   } catch (e) {
     serr(`  Could not record the hold for ${sanitizePathForDisplay(path)} (${e instanceof Error ? e.message : String(e)}); it counts as a failure this run.`);
@@ -289,6 +330,58 @@ export function applyHoldsToManifest(holds: LegacyHolds | null, filtered: { adde
   }
 }
 
+/** GBRA-133 S-51: the hold code of a rename pair whose identity the database refused to read. */
+const UNREADABLE_RENAME = 'rename_identity_unreadable';
+
+/**
+ * GBRA-133 S-51: holds each pair the identity confirmation could not read (SQLSTATE 22021/22P05). `to` is not
+ * imported and the page at `from` keeps its id, links, facts and timeline; the hold records that page, so the pair
+ * moves with its id if a later decision confirms it.
+ */
+export async function holdUnreadableRenames(engine: BrainEngine, holds: LegacyHolds, root: string, pairs: Array<{ from: string; to: string; cause: unknown }>): Promise<void> {
+  for (const pair of pairs) {
+    const [page] = await engine.executeRaw<{ id: number | string; slug: string; revision: string }>(
+      `SELECT id, slug, knowledge_revision::text AS revision FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND (source_path=$2 OR slug=$3)
+        ORDER BY (source_path=$2) DESC LIMIT 1`, [holds.sourceId, pair.from, resolveSlugForPath(pair.from) || '']);
+    const filePath = fileUnderRoot(root, pair.to);
+    const state = (pair.cause as { code?: unknown } | null)?.code;
+    await recordLegacyHold(engine, holds, {
+      path: pair.to, upstreamVersion: filePath ? currentVersion(filePath) ?? null : null,
+      renameFrom: page ? { sourcePath: pair.from, slug: page.slug, pageId: Number(page.id), revision: page.revision } : undefined,
+      refusal: { code: UNREADABLE_RENAME, message: `${pair.to} replaces ${pair.from} in this sync, but the database refused to compare its title or id`
+        + `${typeof state === 'string' ? ` (SQLSTATE ${state})` : ''}, so sync could not tell whether it is the same page; it held ${pair.to} and kept the old page.` },
+    });
+  }
+}
+
+/**
+ * GBRA-133 S-51: a held pair whose file this run imports or re-screens is decided again before the hold replay turns
+ * it into a rename. Confirmed: the replay moves the page with its id. Downgraded: the old page is deleted and the file
+ * imports as a new page, as for any unconfirmed pair. Still unreadable: it stays held and is not imported.
+ */
+export async function redecideUnreadableRenames(engine: BrainEngine, holds: LegacyHolds, root: string, filtered: { added: string[]; modified: string[]; deleted: string[] },
+  decide: (pair: { from: string; to: string; pageId: number }) => Promise<'confirmed' | 'downgraded' | 'held'>): Promise<void> {
+  if (!holds.active) return;
+  const existing = holds.existing as Map<string, GitHoldRecord>;
+  for (const [path, record] of existing) {
+    const origin = record.meta.rename_from;
+    const lists = [filtered.added, filtered.modified, holds.rescreen];
+    if (record.code !== UNREADABLE_RENAME || !origin || !lists.some(list => list.includes(path))) continue;
+    const verdict = await decide({ from: origin.sourcePath, to: path, pageId: origin.pageId });
+    if (verdict === 'confirmed') continue;
+    if (verdict === 'downgraded') {
+      const { rename_from: _settled, ...meta } = record.meta;
+      existing.set(path, { ...record, meta });
+      if (!filtered.deleted.includes(origin.sourcePath)) filtered.deleted.push(origin.sourcePath);
+      continue;
+    }
+    for (const list of lists) { const at = list.indexOf(path); if (at >= 0) list.splice(at, 1); }
+    const filePath = fileUnderRoot(root, path);
+    await recordLegacyHold(engine, holds, { path, upstreamVersion: filePath ? currentVersion(filePath) ?? null : null, renameFrom: origin,
+      refusal: { code: UNREADABLE_RENAME, message: record.message } });
+  }
+}
+
 /** The rename a hold on `to` (or on an earlier destination of the same origin) still owes. */
 function pendingRename(holds: LegacyHolds, from: string, to: string): SyncRename | undefined {
   return holds.existing.get(to)?.meta.rename_from
@@ -353,9 +446,10 @@ export async function moveHeldRenames(engine: BrainEngine, holds: LegacyHolds | 
       continue;
     }
     try {
-      await maintenanceTransaction(engine, async tx => {
-        if (await tx.updateSlug(origin.slug, resolveSlugForPath(record.path), { sourceId: holds.sourceId }) === 0) return;
-        await tx.executeRaw('UPDATE pages SET source_path=$1 WHERE id=$2 AND source_id=$3', [record.path, origin.pageId, holds.sourceId]);
+      const slug = resolveSlugForPath(record.path);
+      await maintenanceBeliefTransaction(engine, { sourceId: holds.sourceId, slugs: [origin.slug, slug], op: 'sync_rename' }, async tx => {
+        if (await tx.updateSlug(origin.slug, slug, { sourceId: holds.sourceId }) === 0) return;
+        await bindOrigin(tx, { sourceId: holds.sourceId, pageId: origin.pageId, sourcePath: record.path });
       });
     } catch { /* the walk imports the file as an ordinary add; the old page stays until a full walk proves it gone */ }
   }
@@ -370,7 +464,7 @@ export async function settleFullSyncHolds(engine: BrainEngine, holds: LegacyHold
   if (!holds) return;
   for (const path of holds.existing.keys()) {
     if (input.failed.has(path)) continue;
-    if (input.walked.has(path) || !fileUnderRoot(input.root, path)) await clearLegacyHold(engine, holds, path);
+    if (bytePathHoldGone(input.root, path) ?? (input.walked.has(path) || !fileUnderRoot(input.root, path))) await clearLegacyHold(engine, holds, path);
   }
   holds.retryTaken.push(...holds.retryPaths);
   await settleLegacyHolds(engine, holds);

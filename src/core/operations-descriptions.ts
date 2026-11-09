@@ -46,28 +46,31 @@ export const GET_RECENT_TRANSCRIPTS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_PAGES_DESCRIPTION =
-  "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows (remote max 100); a full page may be truncated: continue with updated_after + updated_after_slug from the last row.";
+  "List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. Default 50; truncated: continue with updated_after + updated_after_slug from the last row.";
 
 export const QUERY_DESCRIPTION =
-  "Hybrid search plus multi-query expansion for concept or landscape questions (expansion recovers synonym-phrased matches). Still top-K; return_unit returns whole sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no expansion LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent` on the host. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. fields: \"full\" adds diagnostics.";
+  "Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. expand: one LLM call (expansion recovers synonyms; rarely helps). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper. Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.";
 
 export const SEARCH_DESCRIPTION =
-  "Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. Results are NOT proof of coverage: concepts or landscape, use `query`; exhaustive lists, list_pages. return_unit returns whole sections or conversations. Personal: get_recent_salience; saved facts: recall. fields: \"full\" adds diagnostics.";
+  "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape or people/companies/projects by topic: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.";
+
+/** `search`'s `match` param (Cat 40 Hard F2). */
+export const SEARCH_MATCH_DESCRIPTION = 'keyword: every match, paged.';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const FIND_CONTRADICTIONS_DESCRIPTION =
-  "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. " +
-  "Remote or source-scoped callers receive {contradictions: [], note} with an availability note. " +
-  "For eligible local callers, return suspected-contradiction findings from the most recent " +
+  "Return suspected-contradiction findings from the most recent " +
   "`gbrain eval suspected-contradictions` probe run, optionally filtered by slug " +
   "and/or severity. Use this when the user asks 'what's inconsistent in my " +
   "brain', 'show me contradictions about Acme', 'high-severity issues only', or " +
   "wants to act on the probe's findings without re-running it. Returns " +
   "{contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. " +
-  "An eligible read loads the stored run without triggering a new probe; users run " +
+  "Remote, source-scoped or min_trust callers get only findings whose two sides they can read now " +
+  "(each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. " +
+  "Reads the stored run without triggering a new probe; users run " +
   "`gbrain eval suspected-contradictions` for that.";
 
 export const FIND_TRAJECTORY_DESCRIPTION =
@@ -102,7 +105,8 @@ export const CODE_CALLERS_DESCRIPTION =
   "every caller (the people who'd be affected by your change). Returns direct " +
   "callers from the tree-sitter call graph. Use during plan-mode to size " +
   "the change. Defaults to source-scoped; for multi-source brains pass source_id " +
-  "or all_sources=true. " +
+  "or all_sources=true. `resolved:false` marks a call matched by name only: the resolver links calls within one " +
+  "file, so a cross-file call stays unresolved and may name a different symbol with the same name. " +
   "Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. " +
   "Example: `{symbol:'parseMarkdown', count:4, callers:[{from_symbol_qualified:'callerInA', " +
   "to_symbol_qualified:'parseMarkdown', edge_type:'calls', resolved:true}]}`.";
@@ -200,4 +204,4 @@ export const SKILL_CLIENT_GUIDANCE = {
  * test/operations-descriptions.test.ts.
  */
 export const CAPTURE_DESCRIPTION =
-  "Quick note (\"just remember this\"): auto-slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.";
+  "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. put_page controls slug or type; remember is for facts about entities.";

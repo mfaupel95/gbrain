@@ -16,12 +16,15 @@
 import type { BrainEngine } from '../engine.ts';
 import { digest } from './digest.ts';
 import { parseSourceConfig } from '../sources-load.ts';
+import { assertNever } from '../types.ts';
 
 export const CONNECTOR_STATE_OP = 'managed-connector-state';
 
 export type ConnectorAccount =
   | { kind: 'google'; email: string }
-  | { kind: 'github'; installationId: number | null; login: string | null };
+  | { kind: 'github'; installationId: number | null; login: string | null }
+  | { kind: 'meetings'; provider: string; userId: string; email: string | null }
+  | { kind: 'slack'; teamId: string; enterpriseId: string | null };
 
 export interface ConnectorPendingEntry {
   /** The page slug, or `__managed_connector_checkpoint__` for a checkpoint save. */
@@ -40,6 +43,29 @@ export interface ConnectorRunCounts {
   stopped_on_wait_budget: boolean;
   dropped_upstream: number;
   finished_at: string;
+  /** #6831: items the pages guard refused as purged content this run; each was skipped and the run went on. */
+  purged_skipped?: number;
+}
+
+/** #6831: one connector item whose content matches a page purge tombstone, skipped instead of written. */
+export interface ConnectorPurgedItem {
+  slug: string;
+  /** The refused receipt, or null when the item was screened out before admission. */
+  request_id: string | null;
+  at: string;
+}
+
+/**
+ * #6831: the last connector run that ended on an error instead of finishing.
+ * `consecutive` counts runs in a row that ended this way; a run that finishes clears it.
+ */
+export interface ConnectorRunFailure {
+  code: string;
+  message: string;
+  slug: string | null;
+  request_id: string | null;
+  at: string;
+  consecutive: number;
 }
 
 export type UpgradeRecovery = 'resumed' | 'rewalking_once' | 'none';
@@ -61,10 +87,32 @@ export interface ConnectorState {
    * connector sources that have one; checkpoint-row existence never counts.
    */
   first_attempt_at?: string | null;
+  /**
+   * #6803: the last account check refused with `connector_account_changed`.
+   * Autopilot skips the source (unavailable-path) while the connector config
+   * still digests to `config_digest`; a sync that passes the check clears it.
+   */
+  account_mismatch?: ConnectorAccountMismatch | null;
+  /** #6831: the most recent purged items connector runs skipped (newest first, at most CONNECTOR_PURGED_LIMIT). */
+  purged_items?: ConnectorPurgedItem[];
+  /** #6831: set while the source's connector runs keep ending on an error; cleared by a run that finishes. */
+  last_failure?: ConnectorRunFailure | null;
+}
+
+/** #6831: how many skipped purged items the state row keeps. */
+export const CONNECTOR_PURGED_LIMIT = 20;
+/** #6831: this many connector runs in a row that ended on an error read as a stopped source in `sources status` and doctor. */
+export const CONNECTOR_STOPPED_RUNS = 3;
+
+export interface ConnectorAccountMismatch {
+  at: string;
+  detail: 'account_changed' | 'account_unresolved';
+  /** `connectorConfigDigest` of the config the refused run read (credential settings included). */
+  config_digest: string;
 }
 
 export const emptyConnectorState = (): ConnectorState => ({ version: 1, account: null, pinned_at: null, continuity_unverified: false,
-  pending: [], upgrade_recovery: 'none', resumed_from: null, last_run: null, first_attempt_at: null });
+  pending: [], upgrade_recovery: 'none', resumed_from: null, last_run: null, first_attempt_at: null, account_mismatch: null, purged_items: [], last_failure: null });
 
 export function connectorStateKey(sourceId: string, incarnation: string): string {
   return digest({ sourceId, incarnation });
@@ -146,13 +194,32 @@ export async function attemptedConnectorSourceIds(engine: Pick<BrainEngine, 'exe
 /** Account pins compare the resolved identity only; the recorded display never includes credentials. */
 export function sameConnectorAccount(a: ConnectorAccount, b: ConnectorAccount): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === 'google') return a.email === (b as typeof a).email;
-  const other = b as typeof a;
-  return (a.installationId ?? null) === (other.installationId ?? null) && (a.login ?? null)?.toLowerCase() === (other.login ?? null)?.toLowerCase();
+  switch (a.kind) {
+    case 'google': return a.email === (b as typeof a).email;
+    case 'github': {
+      const other = b as typeof a;
+      return (a.installationId ?? null) === (other.installationId ?? null) && (a.login ?? null)?.toLowerCase() === (other.login ?? null)?.toLowerCase();
+    }
+    case 'meetings': {
+      const other = b as typeof a;
+      return a.provider === other.provider && a.userId === other.userId;
+    }
+    case 'slack': {
+      const other = b as typeof a;
+      return a.teamId === other.teamId && (a.enterpriseId ?? null) === (other.enterpriseId ?? null);
+    }
+    default: return assertNever(a);
+  }
 }
 
 export function describeConnectorAccount(account: ConnectorAccount): string {
-  if (account.kind === 'google') return account.email;
-  return [account.installationId !== null ? `installation ${account.installationId}` : null, account.login ? `login ${account.login}` : null]
-    .filter(Boolean).join(', ') || 'no installation or login';
+  switch (account.kind) {
+    case 'google': return account.email;
+    case 'github': return [account.installationId !== null ? `installation ${account.installationId}` : null, account.login ? `login ${account.login}` : null]
+      .filter(Boolean).join(', ') || 'no installation or login';
+    case 'meetings': return `${account.provider} user ${account.userId}${account.email ? ` (${account.email})` : ''}`;
+    case 'slack': return `Slack workspace ${account.teamId}${account.enterpriseId ? ` (enterprise ${account.enterpriseId})` : ''}`;
+    default: return assertNever(account);
+  }
 }
+

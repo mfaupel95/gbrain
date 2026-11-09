@@ -37,6 +37,8 @@ export interface NewerMention extends TrustFields {
   /** The referrer preview `referenced_by` shows: page text, not evidence; fetch the page. */
   preview: string;
   quarantined?: true;
+  /** F3: the page's own frontmatter `status`, only when set (`context_pack` only; never rendered in the text block). */
+  page_status?: string;
 }
 
 export interface NewerMentions {

@@ -59,10 +59,12 @@ gbrain search "<relevant terms>" --limit 10
 ```
 
 For concept-shaped or synonym-phrased claims, escalate to `gbrain query
-"<question>"` (LLM expansion recovers phrasings `search` misses). Also grep
-the brain repo checkout directly — resolve it once from config:
+"<question>"` (LLM expansion recovers phrasings `search` misses). To list
+every indexed page carrying the claim, use a keyword search (it pages every
+match); grep the checkout only for edits not yet synced:
 
 ```bash
+gbrain search '"<wrong claim terms>"' --match keyword
 BRAIN_DIR=$(gbrain config get sync.repo_path)
 grep -ri "<wrong claim terms>" "$BRAIN_DIR/people/" "$BRAIN_DIR/companies/" "$BRAIN_DIR/concepts/" 2>/dev/null
 ```
@@ -167,8 +169,8 @@ The wrong fact may have propagated into OTHER brain pages, synthesis output,
 or memory files.
 
 ```bash
-grep -ri "<wrong claim terms>" "$BRAIN_DIR" 2>/dev/null | grep -v ".git"
-gbrain search "<wrong claim terms>" --limit 20
+gbrain search '"<wrong claim terms>"' --match keyword
+grep -ri "<wrong claim terms>" "$BRAIN_DIR" 2>/dev/null | grep -v ".git"   # edits not yet synced
 ```
 
 Fix ALL instances, not just the first one found. Re-sync after repo edits.

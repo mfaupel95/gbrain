@@ -14,7 +14,8 @@ USAGE
 SETUP
   mcp grant <name> --help           Grant hosted access; private credential handoff
   mcp verify --help                 Verify connection, permissions, and memory
-  setup claude-code [--dry-run]      Give an agent memory: brain + MCP + hooks, verified (--remove undoes)
+  setup claude-code|codex [--dry-run]
+                                     Give an agent memory: brain + MCP + hooks, verified (--remove undoes)
   init [--pglite|--supabase|--url]   Create brain (PGLite default, no server)
   init --prefer-postgres [--allow-docker]
                                      Postgres-first install ladder (env URL >
@@ -25,6 +26,7 @@ SETUP
   migrate --to <postgres|pglite>     Move the brain between engines (PGLite -> Postgres graduates: plan, then --yes --expect)
   migrate embeddings --to <p:model>  Re-embed onto another embedding provider
   embeddings enable --embedding-model <p:model>  Turn on embeddings in place (keeps pages/facts)
+  embeddings prewarm [--dry-run]     Load the vector indexes into shared_buffers when they fit (Postgres)
   upgrade                            Self-update
   check-update [--json]              Check for new versions
   repair [<kind>] [--apply]          Preview/apply residual repairs (timeline, visibility, safe-chunks)
@@ -32,17 +34,25 @@ SETUP
   doctor [--json] [--fast] [--probe-pglite]  Health check (resolver, skills, pgvector, RLS, embeddings; --probe-pglite runs the scratch-store probe)
   integrations [subcommand]          Manage integration recipes (senses + reflexes)
 
+MEMORY (facts agents recall; MEMORY_VERBS v1)
+  remember "<fact>" --entity <slug>  Save a fact the user stated, with --provenance; world-visible
+                                     facts are pushed into new agent sessions (private: recall only)
+  recall [<entity>] [--query <q>]    Find saved facts
+  forget <fact-id>                   Withdraw a fact
+
 PAGES
   get <slug>                         Read a page
   put <slug> [< file.md]             Write/update a page
   delete <slug>                      Delete a page
   list [--type T] [--tag T] [--limit N]
                                      List pages
+  find <glob|prefix|name> [--type T] [--source S] [--limit N]
+                                     Find pages by slug, path or title
 
 SEARCH
   search <query>                     Keyword search (tsvector)
-  query <question> [--no-expand]     Hybrid search (RRF + expansion)
-  ask <question> [--no-expand]       Alias for query
+  query <question> [--expand]        Hybrid search (RRF; expansion per search mode)
+  ask <question> [--expand]          Alias for query
 
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory
@@ -103,6 +113,7 @@ TOOLS
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   backfill <kind|list>               v0.30.1: run a registered backfill (effective-date, ...)
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  beliefs <enable|status|...>        Belief ledger coverage: enable, disable, status, reconcile, backfill
   salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
   anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
   feedback <status|reset>            retrieval feedback: learned page weights; rate answers with gbrain rate
@@ -115,6 +126,7 @@ TOOLS
   facts relink [--dry-run]           Link facts saved without an entity to the entity they name
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
   report --type <name> --content ... Save timestamped report to brain/reports/
+  questions pin|list|status|refresh|unpin  Pinned questions: cited answers kept current (owner-private)
 
 OPEN LOOPS (Gmail/Calendar/Contacts connector — v0.47)
   google setup [--account <email>]   One command: BYO OAuth → source → first sync → first digest
@@ -125,7 +137,8 @@ OPEN LOOPS (Gmail/Calendar/Contacts connector — v0.47)
   creds list|remove|export|import    Generic credential vault (redacted output; encrypted bundles)
 
 BRAIN (capture / ideate / explore — v0.37/v0.38)
-  capture [content] [--file PATH]    Single entrypoint for getting content into the brain
+  capture [content] [--file PATH]    Single entrypoint for getting content into the brain (a page;
+                                     a fact to recall later is \`remember\`)
         [--stdin] [--slug s] [--type t]   Inline content / file / stdin; writes to inbox/ by default
         [--source ID] [--quiet|--json]    Multi-source brains: route to a non-default source
   brainstorm <question> [--json]     Bisociation idea generator (hybrid search + far-set + judge)
@@ -148,6 +161,8 @@ SOURCES (multi-repo / multi-brain)
                                      current, federate, set-cr-mode, webhook, harden, ...)
   sync --all                         Sync all sources with a local_path
   sync --source <id>                 Sync one specific source
+  git commit-push -m <m> -- <paths>  Commit + push only those paths in a shared checkout
+                                     (lock, in-memory merge, no rebase/stash); --pull, --push-only
   repos ...                          DEPRECATED alias for 'sources' (v0.19.0)
 
 CODE INDEXING (v0.19.0 / v0.20.0 Cathedral II)
@@ -178,6 +193,8 @@ JOBS (Minions)
 
 ADMIN
   stats                              Brain statistics
+  stats --by source,type [--since 30d] [--collapse-aliases]
+                                     Live page counts per source and type
   health                             Brain health dashboard
   history <slug> [--json]            Page version history
   revert <slug> <version-id>         Revert to version
@@ -193,6 +210,8 @@ ADMIN
     --surface verbs|starter|full     Tool surface: the 7 memory verbs, the ~20-op
                                      starter set, or every op (default full).
                                      On --http this is the per-client CEILING.
+    --advertise verbs|starter|full   List only this surface in tools/list (plus
+                                     request_tools); the rest stays callable.
     --access read-only|full          stdio: list and dispatch only read operations
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds, 60-7776000 (default: 3600)

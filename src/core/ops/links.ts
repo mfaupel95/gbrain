@@ -1,5 +1,10 @@
-import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
-import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks } from './backlinks-paged.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { remoteTargetHidden } from '../persistence/page-visibility.ts';
+import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+import { MANAGED_LINK_SOURCES } from '../links-fence.ts';
+import { backlinkTypeFilter, readBacklinkPage, withLinkPageStatus } from './backlinks-paged.ts';
+import { cutLinkPage, finishLinkPage, linkId, parseLinkListing, reportLinkPage } from './link-paging.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -26,16 +31,16 @@ import {
   assertSourceInCallerScope,
 } from './context.ts';
 import { listWantedPages } from '../wanted-links-store.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterForCaller } from '../search/private-visibility.ts';
 import type { OperationContext } from './contract.ts';
 import type { Link, PageReadPolicy } from '../types.ts';
 import { ALL_SOURCES } from '../source-id.ts';
 import { PageMissingError } from '../engine-errors.ts';
-import { TRAVERSE_PATH_ROW_CAP } from '../engine-constants.ts';
+import { LINK_READ_CONTEXT_MAX_CHARS, LINK_READ_DEFAULT_LIMIT, LINK_READ_MAX_LIMIT, TRAVERSE_PATH_ROW_CAP, TRAVERSE_WALK_ROW_CAP } from '../engine-constants.ts';
 // #4224: flag-gated cross-source identity union for the link read ops.
 import { unionLinksAcrossIdentity } from '../entity-identity.ts';
 import { TEMPORAL_EDGE_PARAMS, STARTER_STATUS_PARAM, STARTER_AS_OF_PARAM, resolveEdgeTemporal, filterTemporalLinks, reportTemporal } from './edge-temporal.ts';
-import { isCalendarDate, relationSemantics, temporalLinkTypes } from '../link-validity.ts';
+import { isCalendarDate, relationSemantics, relationshipFilterSql, temporalLinkTypes, type LinkReadPage } from '../link-validity.ts';
 import { writeManualTransitions, removeManualTransitions } from '../link-temporal-apply.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { primeRelationSemantics } from '../link-semantics-pack.ts';
@@ -57,9 +62,10 @@ import {
  * tagged 'frontmatter' with no origin_page_id would be a phantom that put_page
  * reconciliation (link_source='frontmatter' AND origin_page_id=written_page)
  * never cleans (see src/schema.sql). `manual` is intentionally absent — it IS
- * the user-facing provenance and the default for omitted link_source.
+ * the user-facing provenance and the default for omitted link_source. The list
+ * lives in links-fence.ts, whose rows cannot carry these provenances either.
  */
-export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wikilink-resolved', 'mcp-remote-mention'];
+export { MANAGED_LINK_SOURCES };
 
 /** add_link valid_from / valid_until: calendar dates on a dated relation type. Null when neither is given. */
 function validateLinkDates(ctx: OperationContext, p: Record<string, unknown>, linkType: string): { validFrom?: string; validUntil?: string } | null {
@@ -86,10 +92,11 @@ function validateLinkDates(ctx: OperationContext, p: Record<string, unknown>, li
 
 const add_link: Operation = {
   name: 'add_link',
-  idempotent: false,
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   description: 'Create a typed link (edge) from one page to another in the same source. Use when recording a relationship (works_at, invested_in, mentions); remote page writes already link [[wikilinks]] to existing pages as mentions (receipt auto_links), so add only typed links or ones the text lacks. Needs write scope; an explicit link_type must be declared by the active schema pack. On page_not_found: resolve both slugs with resolve_slugs.',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
     from: { type: 'string', required: true, description: "Slug of the page the link originates from (the edge renders on this page), e.g. 'people/alice-example'. These are page slugs — there is no `source`/`target` pair." },
     to: { type: 'string', required: true, description: "Slug of the page the link points to, e.g. 'companies/acme-example'." },
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at). When the active schema pack declares a link vocabulary, an explicit link_type must be one of its declared verbs (undeclared verbs are rejected, also under dry_run). Omitted = untyped edge.' },
@@ -142,20 +149,21 @@ const add_link: Operation = {
     // #4109: per-endpoint source-boundary diagnostics before the mutation.
     await requireWritablePage(ctx, p.from as string, 'add_link', 'from');
     await requireWritablePage(ctx, p.to as string, 'add_link', 'to');
+    // G5: on a managed brain the edge is a row of the from page's links fence, written through the page-mutation door.
+    if (await managedPersistenceEnabled(ctx.engine)) {
+      await submitPageMutation(ctx, { operation: 'add_link', params: { ...(p.request_id !== undefined ? { request_id: p.request_id } : {}),
+        slug: p.from, to: p.to, link_type: linkType, link_source: linkSource, context: (p.context as string) || '',
+        ...(dates?.validFrom ? { valid_from: dates.validFrom } : {}), ...(dates?.validUntil ? { valid_until: dates.validUntil } : {}) } });
+      return { status: 'ok' };
+    }
     try {
-      // #5280: a managed brain takes the coordinated database-only path.
-      const managed = await coordinatedManualLinkWrite(ctx, 'add_link', p.from as string, p.to as string, async (engine, sourceId) => {
-        await engine.addLink(p.from as string, p.to as string, (p.context as string) || '', linkType, linkSource, undefined, undefined, // gbrain-allow-direct-insert: coordinated manual link inside withCoordinatedWrite
-          { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId });
-        if (dates) await writeManualTransitions(engine, { from: p.from as string, to: p.to as string, linkType, sourceId }, dates);
-      });
-      if (!managed && !dates) await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
+      if (!dates) await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
         p.from as string, p.to as string,
         (p.context as string) || '', linkType,
         linkSource, undefined, undefined,
         linkOpts,
       );
-      if (!managed && dates) {
+      if (dates) {
         const sourceId = ctx.sourceId ?? 'default';
         await maintenanceTransaction(ctx.engine, async tx => {
           await tx.addLink(p.from as string, p.to as string, (p.context as string) || '', linkType, linkSource, undefined, undefined, // gbrain-allow-direct-insert: add_link with dated manual evidence, one maintenance transaction
@@ -178,10 +186,11 @@ const add_link: Operation = {
 
 const remove_link: Operation = {
   name: 'remove_link',
-  idempotent: false,
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   description: 'Remove a link between two pages (optionally only one link_type or link_source). Use when a relationship was recorded wrongly. Needs write scope. On page_not_found: resolve both slugs with resolve_slugs.',
   params: {
+    request_id: WRITE_REQUEST_PARAM,
     from: { type: 'string', required: true, description: 'Slug of the page the link originates from (same endpoint order as add_link).' },
     to: { type: 'string', required: true, description: 'Slug of the page the link points to.' },
     link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
@@ -192,6 +201,9 @@ const remove_link: Operation = {
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
+    const writeSource = ctx.sourceId || 'default';
+    if (await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, p.from as string)
+      || await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, p.to as string)) return { status: 'ok', removed: 0 };
     await primeRelationSemantics(ctx.engine);
     const linkOpts = ctx.sourceId
       ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
@@ -212,11 +224,16 @@ const remove_link: Operation = {
     // #4527: report how many edges actually died — an unconditional
     // `{ status: 'ok' }` made a zero-match delete (typo'd slug, wrong
     // link_type, already removed) indistinguishable from a real removal.
-    // #5280: a managed brain takes the coordinated database-only path.
-    const managed = await coordinatedManualLinkWrite(ctx, 'remove_link', p.from as string, p.to as string,
-      (engine, sourceId) => remove(engine, { fromSourceId: sourceId, toSourceId: sourceId }));
-    const removed = managed ? managed.value : await remove(ctx.engine, linkOpts);
-    return { status: 'ok', removed };
+    // G5: a managed brain removes the from page's links fence rows through the page-mutation door, and with them
+    // the matching database-only edges (persistence/manual-links.ts). A missing from page has no edges to remove.
+    if (await managedPersistenceEnabled(ctx.engine)) {
+      if (!await ctx.engine.getPage(p.from as string, { sourceId: ctx.sourceId || 'default' })) return { status: 'ok', removed: 0 };
+      const result = await submitPageMutation(ctx, { operation: 'remove_link', params: { ...(p.request_id !== undefined ? { request_id: p.request_id } : {}),
+        slug: p.from, to: p.to, ...(p.link_type ? { link_type: p.link_type } : {}), ...(p.link_source ? { link_source: p.link_source } : {}) } });
+      return { status: 'ok', removed: Number(result.removed ?? 0),
+        ...(Array.isArray(result.derived_from_text) ? { derived_from_text: result.derived_from_text, message: result.derived_message } : {}) };
+    }
+    return { status: 'ok', removed: await remove(ctx.engine, linkOpts) };
   },
   cliHints: { name: 'unlink', aliases: ['link-rm'], positional: ['from', 'to'] },
 };
@@ -228,7 +245,11 @@ const LINK_SOURCE_ID_PARAM = {
 const LINK_ALL_SOURCES_PARAM = {
   type: 'boolean',
   description: 'Same as source_id __all__.',
+  fullSurfaceOnly: true,
 } as const;
+const LINK_LIMIT_PARAM = { type: 'number', minimum: 1, description: `Rows per call (default ${LINK_READ_DEFAULT_LIMIT}, max ${LINK_READ_MAX_LIMIT}).` } as const;
+const LINK_CURSOR_PARAM = { type: 'string', description: 'next_cursor from the previous call (same filters).' } as const;
+const LINK_ALL_PARAM = { type: 'boolean', description: 'Local CLI only: every row, paging internally.', fullSurfaceOnly: true } as const;
 
 /**
  * #5827: the per-call source scope of a link read (get_links, get_backlinks,
@@ -267,67 +288,83 @@ const linkIdentity = (l: Link) => JSON.stringify([
 ]);
 
 /**
- * get_links / get_backlinks body. A trusted local unqualified read whose scope
- * widened to the federated set runs the scalar read once per federated source
- * (resolved source first, the set's own order) and merges, de-duplicated on
- * link identity: the scalar branch keeps the cross-source far-endpoint view
- * local callers rely on, which the all-endpoints branch would drop for far
- * pages in non-federated sources. Every other caller runs one read.
+ * get_links / get_backlinks body: one page of a page's edges (#6876,
+ * link-paging.ts). A trusted local unqualified read whose scope widened to
+ * the federated set runs the scalar read once per federated source and
+ * merges, de-duplicated on link identity: the scalar branch keeps the
+ * cross-source far-endpoint view local callers rely on, which the
+ * all-endpoints branch would drop for far pages in non-federated sources.
+ * Every other caller runs one read. Each read is a keyset page with link_type,
+ * get_backlinks' referrer type and the temporal policy in SQL; the cap applies after the merge and the
+ * identity union, and hidden former relationships never count toward it.
  */
 async function readLinkEdges(
   ctx: OperationContext,
   p: Record<string, unknown>,
   opName: 'get_links' | 'get_backlinks',
   direction: 'out' | 'in',
-): Promise<Link[]> {
+): Promise<{ links: Link[]; nextCursor?: string }> {
   const slug = p.slug as string;
   const { requested, policy } = await resolveLinkReadScope(ctx, p, opName);
   const temporal = await resolveEdgeTemporal(ctx, p, opName);
+  const listing = parseLinkListing(ctx, opName, p, policy);
   const linkType = typeof p.link_type === 'string' && p.link_type ? p.link_type : undefined;
-  // Rows come back annotated with their relationship status; the policy is
-  // applied below so hidden former relationships can be counted and reported.
+  const fromType = direction === 'in' ? await backlinkTypeFilter(ctx, p, policy) : undefined;
+  // Rows come back annotated with their relationship status; the policy
+  // itself runs in SQL (and a second read counts what it hid).
   const annotate = temporal.disabled ? undefined : { ...temporal, status: 'all' as const, during: undefined };
-  const finish = (links: Link[]): Link[] => {
-    const typed = linkType ? links.filter(l => l.link_type === linkType) : links;
-    const { kept, hidden } = filterTemporalLinks(typed, temporal);
-    reportTemporal(ctx, opName, p, temporal, hidden);
-    return kept;
-  };
+  const filtering = !temporal.disabled && relationshipFilterSql('l', temporal) !== 'TRUE';
   const scopes: PageReadPolicy[] = ctx.remote === false && policy.sourceIds
     ? policy.sourceIds.map((sourceId) => ({ ...policy, sourceIds: undefined, sourceId }))
     : [policy];
-  const perScope: Link[][] = [];
-  for (const sourceOpts of scopes) {
-    const readOpts = annotate ? { ...sourceOpts, temporal: annotate } : sourceOpts;
-    const links = direction === 'out'
-      ? await ctx.engine.getLinks(slug, readOpts)
-      : await ctx.engine.getBacklinks(slug, readOpts);
-    // #4224: flag-gated identity union — merge edges from the page's identity
-    // co-members (entity_identity.union config, default off; pure no-op then).
-    // Member visibility never widens past the caller's grant. The scalar base
-    // scope (when present) pins group resolution to the page actually read.
-    // The engine authorizes the base and every member read before merging;
-    // each union contributor must preserve this policy because no final filter runs.
-    perScope.push(await unionLinksAcrossIdentity(ctx.engine, slug, links, direction, {
-      sourceId: sourceOpts.sourceId,
-      allowedSources: sourceOpts.sourceIds,
-      excludePrivate: sourceOpts.excludePrivate,
-      ...(annotate ? { temporal: annotate } : {}),
-    }));
-  }
-  if (perScope.length === 1) {
-    if (perScope[0].length === 0) await hintScopedLinkMiss(ctx, p, requested, policy, direction);
-    return finish(perScope[0]);
-  }
-  const seen = new Set<string>();
-  const merged = perScope.flat().filter((l) => {
-    const key = linkIdentity(l);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  if (merged.length === 0) await hintScopedLinkMiss(ctx, p, requested, policy, direction);
-  return finish(merged);
+  const read = async (page: LinkReadPage) => {
+    const streams: Link[][] = [];
+    const merged = new Map<string, Link>();
+    for (const sourceOpts of scopes) {
+      const readOpts = { ...sourceOpts, ...(annotate ? { temporal: annotate } : {}), page };
+      const links = direction === 'out'
+        ? await ctx.engine.getLinks(slug, readOpts)
+        : await ctx.engine.getBacklinks(slug, readOpts);
+      streams.push(links);
+      // #4224: flag-gated identity union — merge edges from the page's identity
+      // co-members (entity_identity.union config, default off; pure no-op then).
+      // Member visibility never widens past the caller's grant. The scalar base
+      // scope (when present) pins group resolution to the page actually read.
+      // The engine authorizes the base and every member read before merging;
+      // each union contributor must preserve this policy because no final filter runs.
+      const unioned = await unionLinksAcrossIdentity(ctx.engine, slug, links, direction, {
+        sourceId: sourceOpts.sourceId,
+        allowedSources: sourceOpts.sourceIds,
+        excludePrivate: sourceOpts.excludePrivate,
+        ...(annotate ? { temporal: annotate } : {}),
+        page,
+        onMemberRead: (rows) => streams.push(rows),
+      });
+      for (const l of unioned) if (!merged.has(linkIdentity(l))) merged.set(linkIdentity(l), l);
+    }
+    return { streams, rows: [...merged.values()].sort((a, b) => linkId(a) - linkId(b)) };
+  };
+  const base: LinkReadPage = { ...(linkType ? { linkType } : {}), ...(fromType ? { fromType } : {}), contextChars: LINK_READ_CONTEXT_MAX_CHARS };
+  // A page every row of which a JS filter dropped (the identity union's
+  // member pin, the temporal shape check) is never returned while the
+  // listing continues: a bare empty array cannot carry its cursor.
+  const kept: Link[] = [];
+  let hidden = 0;
+  let afterId = listing.afterId;
+  let nextId: number | undefined;
+  do {
+    const { streams, rows } = await read({ ...base, afterId, limit: listing.limit + 1, ...(filtering ? { relationship: { policy: temporal, keep: 'match' as const } } : {}) });
+    const page = cutLinkPage(streams, rows, listing.limit);
+    if (filtering) hidden += (await read({ ...base, afterId, throughId: page.nextId, relationship: { policy: temporal, keep: 'hidden' } })).rows.length;
+    const shaped = filterTemporalLinks(page.rows, temporal);
+    kept.push(...shaped.kept);
+    hidden += shaped.hidden;
+    nextId = page.nextId;
+    afterId = nextId;
+  } while ((listing.all || kept.length === 0) && nextId !== undefined);
+  reportTemporal(ctx, opName, p, temporal, hidden);
+  if (kept.length === 0 && hidden === 0 && listing.afterId === undefined && !fromType) await hintScopedLinkMiss(ctx, p, requested, policy, direction);
+  return { links: kept, nextCursor: reportLinkPage(ctx, opName, p, listing, { returned: kept.length, nextId }) };
 }
 
 /**
@@ -379,15 +416,21 @@ const get_links: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'List a page\'s outgoing links (typed edges to other pages). Use when exploring what a page points at; rows carry status and dates, live relationships by default (status: "all" for history, during: "2022" for a period). Pass source_id or all_sources to widen. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.',
+  description: `List a page's outgoing links (typed edges to other pages). Use when exploring what a page points at; rows carry status and dates, live relationships by default (status: "all" for history, during: "2022" for a period). Pass source_id or all_sources to widen. Returns up to ${LINK_READ_DEFAULT_LIMIT} rows per call (limit, max ${LINK_READ_MAX_LIMIT}); a cut list's last row carries truncated: true and next_cursor, which you pass as cursor. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.`,
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose outgoing links to list.' },
     link_type: { type: 'string', description: 'Only this type.' },
     ...TEMPORAL_EDGE_PARAMS,
     source_id: LINK_SOURCE_ID_PARAM,
     all_sources: LINK_ALL_SOURCES_PARAM,
+    limit: LINK_LIMIT_PARAM,
+    cursor: LINK_CURSOR_PARAM,
+    all: LINK_ALL_PARAM,
   },
-  handler: async (ctx, p) => readLinkEdges(ctx, p, 'get_links', 'out'),
+  handler: async (ctx, p) => {
+    const { links, nextCursor } = await readLinkEdges(ctx, p, 'get_links', 'out');
+    return finishLinkPage(links, nextCursor);
+  },
   scope: 'read',
   cliHints: { name: 'links', aliases: ['get_links'], positional: ['slug'] },
 };
@@ -397,7 +440,7 @@ const get_backlinks: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'Links to a page; group:"page" pages by referrer, newest first.',
+  description: `Links to a page, ≤${LINK_READ_DEFAULT_LIMIT}/call; group:"page" by referrer, newest first.`,
   params: {
     slug: { type: 'string', description: 'Page slug.', required: true },
     status: STARTER_STATUS_PARAM,
@@ -406,14 +449,15 @@ const get_backlinks: Operation = {
     all_sources: LINK_ALL_SOURCES_PARAM,
     type: { type: 'string', description: 'Referrer type.' },
     group: { type: 'string', enum: ['page'], description: 'Per page.' },
-    limit: { type: 'number', description: 'Max 500.' },
-    cursor: { type: 'string', description: 'Paging.' },
+    limit: { type: 'number', minimum: 1, description: `≤${LINK_READ_MAX_LIMIT}` },
+    cursor: { type: 'string', description: 'Next.' },
+    all: LINK_ALL_PARAM,
   },
   handler: async (ctx, p) => {
-    if (!wantsPagedBacklinks(p)) return readLinkEdges(ctx, p, 'get_backlinks', 'in');
     if (p.group !== undefined) return readBacklinkPage(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy);
-    const links = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
-    return filterBacklinkRows(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
+    const { links, nextCursor } = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
+    const policy = async () => (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy;
+    return finishLinkPage(await withLinkPageStatus(ctx, policy, links), nextCursor);
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
@@ -427,7 +471,7 @@ const list_link_sources: Operation = {
   // v114 (#1941): the read-side counterpart to link-add/link-rm. Since
   // link_source is now an open kebab provenance (no allowlist), this is how an
   // agent discovers which provenances a brain actually carries.
-  description: 'Link provenances in the brain (e.g. markdown, manual) with edge counts.',
+  description: 'Link provenances (e.g. markdown, manual) with their edge counts.',
   params: {},
   handler: async (ctx) => {
     // Route through sourceScopeOpts so the read honors both scalar ctx.sourceId
@@ -439,10 +483,10 @@ const list_link_sources: Operation = {
 };
 
 /**
- * Hard cap on traverse_graph depth from MCP callers. Each recursive CTE iteration
- * grows a `visited` array per path; in `direction=both` the join is `OR`-based and
- * fans out exponentially. Without a cap, a remote MCP caller can pass depth=1e6
- * and burn memory/CPU on the database. 10 hops is well beyond any realistic
+ * Hard cap on traverse_graph depth from MCP callers. The walk is breadth-first
+ * and bounded by TRAVERSE_WALK_ROW_CAP pages, but each hop is one more layer of
+ * work; without a cap a remote MCP caller could pass depth=1e6. 10 hops is well
+ * beyond any realistic
  * relationship query (your OpenClaw's "people who attended meetings with Alice"
  * is 2 hops; the deepest meaningful chain in our test data is 4).
  */
@@ -450,10 +494,9 @@ const TRAVERSE_DEPTH_CAP = 10;
 
 /**
  * Default depth for the remote no-direction call. #4666 made that call
- * bidirectional, and traversePaths' `both` branch is an uncapped
- * path-enumerating recursive CTE (no LIMIT) — on an entity hub with 10^2-10^3
- * edges the legacy depth-5 default is combinatorial, on the per-agent-turn
- * path. Two hops covers the realistic relationship query ("people who
+ * bidirectional; on an entity hub a depth-5 `both` walk reaches most of the
+ * brain and returns the 5,000-row cap of edges on every agent turn. Two hops
+ * covers the realistic relationship query ("people who
  * attended meetings with Alice"); a caller that wants more passes `depth`
  * explicitly (still honored up to TRAVERSE_DEPTH_CAP).
  */
@@ -522,14 +565,15 @@ const traverse_graph: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: `Walk the link graph from a page. Remote callers get bidirectional paths at depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH} by default.`,
+  description: `Walk the link graph from a page. Remote default: both directions, depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH}.`,
   params: {
     slug: { type: 'string', description: 'Start page slug.', required: true },
     depth: { type: 'number', description: `Max depth (cap ${TRAVERSE_DEPTH_CAP}).` },
-    link_type: { type: 'string', description: 'Follow only this link type.' },
+    link_type: { type: 'string', description: 'Only this link type.' },
     direction: { type: 'string', description: 'Remote default both.', enum: ['in', 'out', 'both'] },
     hops: {
       type: 'array',
+      minItems: 1,
       description: '≤3 typed hops, e.g. [{"link_type":"founded","toward":"subject"}]; toward: object|subject.',
       items: { type: 'object', properties: { link_type: { type: 'string' }, toward: { type: 'string' } } },
       fullSurfaceOnly: true,
@@ -578,13 +622,19 @@ const traverse_graph: Operation = {
       return ctx.engine.traverseGraph(slug, depth, scope);
     }
     const { paths, truncated } = await ctx.engine.traversePathsDetailed(slug, { depth, linkType, direction, ...scope });
-    // Row cap hit: the walk's deepest edges were dropped. stderr-only so the
-    // GraphPath[] wire shape stays unchanged (additive contract).
+    // Cap hit: the walk stopped at TRAVERSE_WALK_ROW_CAP visited pages or the
+    // output at TRAVERSE_PATH_ROW_CAP edge rows, dropping the deepest edges.
+    // The stderr note stays; a per-call notice (GBRA-200 stamps it) tells MCP callers, so the GraphPath[] wire shape stays unchanged.
     if (truncated) {
       ctx.logger.warn(
-        `[gbrain] traverse_graph output truncated at ${TRAVERSE_PATH_ROW_CAP} edge rows (shallowest first). ` +
+        `[gbrain] traverse_graph output truncated (walk cap ${TRAVERSE_WALK_ROW_CAP} pages, ${TRAVERSE_PATH_ROW_CAP} edge rows; shallowest first). ` +
         `Lower depth or narrow with link_type/direction for a complete walk.`,
       );
+      const why = `The walk stopped at its cap (${TRAVERSE_WALK_ROW_CAP} pages, ${TRAVERSE_PATH_ROW_CAP} edge rows; shallowest first), so deeper edges are missing; walk one level shallower or narrow with link_type or direction for a complete walk.`;
+      const fix = depth > 1 ? readFix(why, {
+        mcp: { tool: 'traverse_graph', arguments: { slug, depth: depth - 1, ...(linkType ? { link_type: linkType } : {}), direction } },
+      }) : undefined;
+      ctx.emitNotice?.({ code: 'graph_walk_truncated', kind: 'degraded', why, ...(fix ? { fix } : {}) });
     }
     return paths;
   },
@@ -604,7 +654,7 @@ const wanted_pages: Operation = {
   description: 'Link targets that have no page yet, most-referenced first: each was written as a link but its page does not exist, so no edge exists. Use to find entities worth a page (enrichment) or typo links to fix. The edge appears on its own once the page is created.',
   params: {
     source_id: { type: 'string', description: 'Only targets referenced from this source (must be inside your source grant).' },
-    limit: { type: 'number', description: `Rows per page (default ${WANTED_DEFAULT_LIMIT}, max ${WANTED_MAX_LIMIT}).` },
+    limit: { type: 'number', minimum: 1, description: `Rows per page (default ${WANTED_DEFAULT_LIMIT}, max ${WANTED_MAX_LIMIT}).` },
     offset: { type: 'number', description: 'Skip the first N targets.' },
     count_only: { type: 'boolean', description: 'Return the total with no rows.' },
   },
@@ -622,7 +672,7 @@ const wanted_pages: Operation = {
         limitOk ? { def: wanted_pages.params.offset, example: 0 } : { def: wanted_pages.params.limit, example: WANTED_DEFAULT_LIMIT });
     }
     const { total, rows } = await listWantedPages(ctx.engine, { sourceId: policy.sourceId, sourceIds: policy.sourceIds,
-      excludePrivate: policy.excludePrivate, privateFilter: privatePagesFilterFragment,
+      excludePrivate: policy.excludePrivate, privateFilter: privatePagesFilterForCaller,
       limit: p.count_only === true ? 1 : limit, offset });
     const next = offset + limit < total ? offset + limit : null;
     return {

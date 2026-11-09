@@ -37,8 +37,7 @@ import {
   type ResolutionInput,
   type ResolutionResult,
 } from './registry.ts';
-import { isBundledPackName } from './bundled.ts';
-import { isValidPackName } from './mutate.ts';
+import { isBundledPackName, isValidPackName } from './bundled.ts';
 import { bundledPackPath } from './bundled-assets.ts';
 
 /**

@@ -14,6 +14,8 @@ import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, claimNextWrite, getWriteRequest, getWriteRequestById, receiptFor } from '../src/core/persistence/journal.ts';
 import { PersistenceConsumer } from '../src/core/persistence/consumer.ts';
 import { waitFor } from './helpers/wait-for.ts';
+import { legacyForget } from './helpers/legacy-forget.ts';
+import { cancelWriteRequest } from '../src/core/persistence/control.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
@@ -68,6 +70,7 @@ describe('journaled memory publication, both engines', () => {
         visibility: 'world', fence: true, valid_from: new Date().toISOString(), valid_until: null };
       const row = await admitWrite(engine, { principal: authority.principal, operation: 'remember', sourceId,
         sourceIncarnation: snapshot.sourceIncarnation, slug, pageId: snapshot.page.id, callerIntent: intent, intent, authority, requestId: randomUUID() });
+      let entered = false;
       let aborted = false;
       const release = Promise.withResolvers<void>();
       const provider = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async () => {
@@ -76,13 +79,26 @@ describe('journaled memory publication, both engines', () => {
       } });
       configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: { OPENAI_API_KEY: 'sk-test' } });
       __setEmbedTransportForTests(async options => {
+        entered = true;
         try { return await (await fetch(provider.url, { signal: options.abortSignal })).json() as never; }
         catch (error) { aborted = options.abortSignal!.aborted; throw error; }
       });
-      const consumer = new PersistenceConsumer(engine, context(engine).config, prepareMemoryMutation, { pollMs: 60000, preparationMs: 50 });
+      // The 50 ms budget is wall-clock from the claim, so on a loaded machine it can pass before the preparer reaches the
+      // provider; the provider abort is pinned on a signal aborted once the call is in flight, the budget on the consumer's own signal.
+      const cancel = new AbortController();
+      let preparation: Promise<unknown> | undefined;
+      const consumer = new PersistenceConsumer(engine, context(engine).config,
+        (e, current, config, signal) => preparation = prepareMemoryMutation(e, current, config, signal), { pollMs: 60000, preparationMs: 50 });
       try {
+        const direct = prepareMemoryMutation(engine, row, context(engine).config, cancel.signal);
+        await waitFor(() => entered);
+        cancel.abort({ code: 'preparation_deadline' });
+        await expect(direct).rejects.toEqual({ code: 'preparation_deadline' });
+        expect(aborted).toBe(true);
         consumer.start();
-        await waitFor(() => aborted && consumer.status().active_preparations === 0);
+        await waitFor(() => preparation !== undefined);
+        await expect(preparation).rejects.toEqual({ code: 'preparation_deadline' });
+        await waitFor(() => consumer.status().active_preparations === 0);
         expect((await getWriteRequestById(engine, row.id))?.state).toBe('queued');
         expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND fact=$2', [sourceId, intent.fact])).toHaveLength(0);
       } finally { release.resolve(); provider.stop(true); await consumer.stop(); __setEmbedTransportForTests(null); configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} }); }
@@ -177,6 +193,26 @@ describe('journaled memory publication, both engines', () => {
     }
   }, 120_000);
 
+  test('remember numbers its fence row past a facts row the fence does not hold', async () => {
+    for (const engine of engines) {
+      const slug = 'people/row-floor-example';
+      const fenced = [1, 2].reduce(body => upsertFactRow(body, { claim: `Fenced claim ${body.length}`, kind: 'fact', visibility: 'world',
+        confidence: 1, notability: 'medium' }).body, 'Biography');
+      await setupPage(engine, slug, fenced);
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(
+        `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source, row_num, source_markdown_slug)
+         VALUES ($1, $2, 'Extracted occupant claim', 'fact', 'world', 'extraction fixture', 3, $2)`, [sourceId, slug]), TEST_WRITE_ATTRIBUTION));
+      const receipt = await submitRememberMutation(context(engine), { fact: 'Remembered past the occupant', provenance: 'test conversation',
+        entity: slug, request_id: randomUUID() }, 30_000);
+      expect(receipt).toMatchObject({ status: 'inserted', state: 'committed' });
+      const rows = await engine.executeRaw<{ fact: string; row_num: number }>(
+        'SELECT fact, row_num FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 ORDER BY row_num', [sourceId, slug]);
+      expect(rows.map(r => [r.fact, Number(r.row_num)])).toEqual([['Extracted occupant claim', 3], ['Remembered past the occupant', 4]]);
+      const fence = parseFactsFence((await engine.readPageSnapshot(slug, { sourceId }))!.page.compiled_truth).facts;
+      expect(fence.map(f => f.rowNum)).toEqual([1, 2, 4]);
+    }
+  }, 60_000);
+
   test('a remember prepared against a stale page re-prepares; every committed receipt is readable at acknowledgement', async () => {
     let held = 0;
     let gate = Promise.withResolvers<void>();
@@ -246,6 +282,8 @@ describe('journaled memory publication, both engines', () => {
     try {
       for (const engine of engines) {
         const slug = 'people/supersede-example';
+        // Calibrate the fixed test embedder: an uncalibrated model never supersedes by cosine (supersession-threshold.ts).
+        await engine.setConfig('facts.supersession_thresholds', JSON.stringify({ 'openai:text-embedding-3-small@1536': 0.95 }));
         await setupPage(engine, slug);
         const privateMemory = await submitRememberMutation(context(engine), { fact: 'Confidential unrelated claim',
           provenance: 'test', entity: slug, visibility: 'private' }, 30_000);
@@ -318,7 +356,7 @@ describe('journaled memory publication, both engines', () => {
     }
   });
 
-  test('forget commits offline, withdraws before sealing reads and replays after fact removal', async () => {
+  test('forget waits for an offline owner like every page write, withdraws nothing until it publishes, and replays after fact removal', async () => {
     for (const engine of engines) {
       const slug = 'people/withdraw-example';
       await setupPage(engine, slug);
@@ -328,6 +366,20 @@ describe('journaled memory publication, both engines', () => {
       await engine.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id) VALUES($1::uuid,$2::uuid)', [worktreeId, offlineHost]);
       await engine.executeRaw(`INSERT INTO persistence_source_bindings(source_id,source_incarnation,worktree_id)
         VALUES($1,$2::uuid,$3::uuid)`, [sourceId, before.sourceIncarnation, worktreeId]);
+      // GBRA-190 G4: a withdrawal is a page publication (Git is the parent), so it waits for the source's owner as
+      // remember does; until it publishes nothing is withdrawn.
+      const local = await registerLocalWriter(engine, 'cli');
+      const principal = { kind: 'local_cli' as const, id: local.id };
+      const offline = randomUUID();
+      const pending = await submitForgetMutation(context(engine), 'forget', { id: remembered.id, request_id: offline }, 200).catch((error: unknown) => error);
+      expect(pending).toMatchObject({ code: 'write_pending' });
+      expect((await getWriteRequest(engine, principal, offline))!.worktree_id).toBe(worktreeId);
+      expect(await engine.executeRaw('SELECT 1 FROM fact_withdrawals WHERE source_id=$1', [sourceId])).toEqual([]);
+      expect(await engine.executeRaw('SELECT 1 FROM facts WHERE id=$1 AND expired_at IS NULL', [Number(remembered.id)])).toHaveLength(1);
+      expect((await engine.readPageSnapshot(slug, { sourceId }))!.revision).toBe(before.revision);
+      expect((await cancelWriteRequest(engine, principal, offline))?.state).toBe('cancelled');
+      // The source is database-only again (its synthetic offline owner unbound): the withdrawal publishes at once.
+      await engine.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1', [sourceId]);
       const requestId = randomUUID();
       const params = { id: remembered.id, reason: 'User correction', request_id: requestId };
       const forgotten = await submitForgetMutation(context(engine), 'forget', params);
@@ -339,17 +391,11 @@ describe('journaled memory publication, both engines', () => {
       const chunks = (await engine.getChunks(slug, { sourceId })).map(chunk => chunk.chunk_text).join('\n');
       expect(chunks).toContain('Existing biography');
       expect(chunks).not.toContain('Withdraw this unique memory');
-      const local = await registerLocalWriter(engine, 'cli');
-      const request = (await getWriteRequest(engine, { kind: 'local_cli', id: local.id }, requestId))!;
+      const request = (await getWriteRequest(engine, principal, requestId))!;
       expect(request.worktree_id).toBeNull();
-      expect(await engine.executeRaw('SELECT kind FROM persistence_effects WHERE request_id=$1::uuid', [request.id])).not.toHaveLength(0);
+      expect(await engine.executeRaw("SELECT kind FROM persistence_effects WHERE request_id=$1::uuid AND kind='withdrawal-mirror'", [request.id])).toEqual([]);
       await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM facts WHERE id=$1', [Number(remembered.id)]), TEST_WRITE_ATTRIBUTION));
       expect(await submitForgetMutation(context(engine), 'forget', params)).toEqual(forgotten);
-      // The fixture's offline owner is synthetic. Durable effects otherwise
-      // deliberately retain their worktree identity until reconciliation.
-      await engine.executeRaw('DELETE FROM persistence_effects WHERE worktree_id=$1::uuid', [worktreeId]);
-      await engine.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1', [sourceId]);
-      await engine.executeRaw('DELETE FROM persistence_worktrees WHERE id=$1::uuid', [worktreeId]);
     }
   });
 
@@ -368,7 +414,9 @@ describe('journaled memory publication, both engines', () => {
         slug, pageId: snapshot.page.id, callerIntent: p, intent: p, authority, requestId: randomUUID() });
       const row = (await claimNextWrite(engine, randomUUID()))!;
       const prepared = await prepareMemoryMutation(engine, row, context(engine).config);
-      await submitForgetMutation(context(engine), 'forget', { id: String(old.id), request_id: randomUUID() });
+      // A current forget queues behind the claimed remember on its root; a gbrain before G4 sharing the brain still commits
+      // its withdrawal database-first, at any moment. The publication must refuse the withdrawn claim either way.
+      await legacyForget(context(engine), Number(old.id));
       const result = await publishMutation(engine, row, prepared);
       expect(result.state).not.toBe('committed');
       const live = await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND fact=$2 AND expired_at IS NULL', [sourceId, p.fact]);

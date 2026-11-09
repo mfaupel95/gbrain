@@ -18,6 +18,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { listCorePages, loadCoreBlock } from '../src/core/core-memory.ts';
 import { runCore } from '../src/commands/core.ts';
+import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { coreMemoryCheck } from '../src/commands/doctor/checks/core-memory.ts';
 
 let engine: PGLiteEngine;
@@ -73,7 +74,7 @@ async function cli(args: string[]): Promise<{ out: string; err: string }> {
   console.log = (...a: unknown[]) => { out.push(a.join(' ')); };
   console.error = (...a: unknown[]) => { err.push(a.join(' ')); };
   try { await withVerifiedLocalRegistration(engine, cliRegistration, () => runCore(engine, args)); }
-  finally { console.log = log; console.error = error; }
+  finally { console.log = log; console.error = error; _resetCliExitVerdictForTests(); process.exitCode = 0; }
   return { out: out.join('\n'), err: err.join('\n') };
 }
 
@@ -165,12 +166,12 @@ describe('remember items[]', () => {
     expect(after).toBe(n);
   });
 
-  test('a non-UUID request_id refuses with invalid_params and writes no fact (#6280)', async () => {
+  test('an unusable request_id refuses with invalid_params and writes no fact (#6280)', async () => {
     const [{ n }] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM facts`);
-    const r = await call('remember', { request_id: 'not-a-uuid', provenance: 'user said', items: [{ fact: 'Drinks oolong' }] }, true);
+    const r = await call('remember', { request_id: 'not a uuid', provenance: 'user said', items: [{ fact: 'Drinks oolong' }] }, true);
     expect(r.isError).toBe(true);
     expect(r.text).toContain('invalid_params');
-    expect(r.text).toContain('request_id must be a UUID');
+    expect(r.text).toContain('request_id must be 1 to 128 printable ASCII characters');
     const [{ n: after }] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM facts`);
     expect(after).toBe(n);
   });

@@ -8,8 +8,8 @@ import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { assertNoOverlappingPath } from '../sources-ops.ts';
 import { checkApprovedSchemaForEngine } from '../schema-pack/engine-resolution.ts';
-import { getWorktreeBinding, managedPersistenceEnabled } from '../persistence/ownership.ts';
-import { registerLocalWriter, localHostId, currentVerifiedLocalWriter } from '../persistence/identity.ts';
+import { getWorktreeBinding, managedPersistenceEnabled, readPersistenceBrain } from '../persistence/ownership.ts';
+import { registerLocalWriter, currentVerifiedLocalWriter, hostIdFor } from '../persistence/identity.ts';
 import { isWriteRequestId } from '../persistence/types.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { topologyTransaction } from '../persistence/topology-transaction.ts';
@@ -104,7 +104,7 @@ export function assertCompanyBrainCaller(input: CompanyBrainDestination): void {
 export async function ingestionFence(engine: BrainEngine, sourceId: string): Promise<SourceIngestionFence> {
   if (!await managedPersistenceEnabled(engine)) return { mode: 'unmanaged' };
   const binding = await getWorktreeBinding(engine, sourceId);
-  if (!binding?.owner_host_id || binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
+  if (!binding?.owner_host_id || binding.owner_host_id !== hostIdFor(engine) || binding.state !== 'active' || !binding.local_path) {
     throw opError('owner_unavailable', 'The managed source must run on its active registered local owner.',
       `Source ${sourceId} is managed and this host is not its active owner. Check the owner, then run the command on that host or wait until its owner is active again.`,
       { fix: ownerStatusFix(sourceId) });
@@ -177,8 +177,8 @@ export async function checkCompanyBrainDestination(engine: BrainEngine, input: C
   assertCompanyBrainCaller(input);
   await assertIngestionStorage(engine);
   if (!input.plan.ready || !input.plan.revision || !input.plan.schema) throw planNotReady('source_not_ready', 'The inspected source is not ready to connect.', input.path);
-  const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean }>('SELECT brain_id,enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain) throw brainUninitialized('Initialize the selected brain before connecting a source.', input.brainId);
+  // #6482: `assertIngestionStorage` has already proven the table exists; a malformed singleton is `storage_error`, never "unmanaged".
+  const brain = await readPersistenceBrain(engine);
   if (newSource && (await engine.executeRaw('SELECT id FROM sources WHERE id=$1', [input.sourceId])).length) {
     throw sourceTaken('Connect requires a new source. Resume the existing source through sync.', input);
   }

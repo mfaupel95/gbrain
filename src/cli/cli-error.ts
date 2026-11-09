@@ -8,9 +8,9 @@
  * idle and the patched `process.exit` drains anything queued, so callers may
  * exit right after.
  */
-import { cliRenderContext, renderCliError, renderNotice, type AgentEnvelope, type Notice } from '../core/agent-output.ts';
+import { cliRenderContext, renderCliError, renderNotice, type Action, type AgentEnvelope, type Notice } from '../core/agent-output.ts';
 import { renderCliNotices } from '../core/agent-markers.ts';
-import { jsonGuardActive, jsonRequested, noteRenderedErrorCode, writeStdoutFinal } from '../core/cli-force-exit.ts';
+import { jsonGuardActive, jsonRequested, noteRenderedErrorCode, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { opError, type OpErrorOpts, type OperationError } from '../core/ops/contract.ts';
 import type { RegistryCode } from '../core/error-registry.ts';
 import {
@@ -23,6 +23,7 @@ import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { suggestNearest } from '../core/levenshtein.ts';
 import { isConsentRefusal, printConsentRefusal } from '../core/consent.ts';
 import { exclusiveFix, liveServeOwner } from '../core/exclusive-fix.ts';
+import { RemoteMcpError } from '../core/remote-mcp-error.ts';
 
 export interface CliErrorWriteOpts {
   /** Raw argv (defaults to process.argv.slice(2)); decides `--json`. */
@@ -37,6 +38,10 @@ export interface CliErrorWriteOpts {
    * (line-reading consumers of the old shape keep working).
    */
   legacy?: Record<string, unknown>;
+  /** Fields the document carries after the envelope's own (a refused dry run's `convergence` receipt). */
+  extra?: Record<string, unknown>;
+  /** Where the document goes instead of fd 1 (a command's own JSON document writer). */
+  emit?: (doc: string) => void;
 }
 
 /** The command word of an argv (first token that is not a flag), for E11 records. */
@@ -55,8 +60,9 @@ export function writeCliError(e: unknown, command: string, opts: CliErrorWriteOp
     noteRenderedErrorCode(env.code);
     // An NDJSON stream ends a failure with one `{status:"error", …envelope}` line (D2).
     const legacy = opts.legacy ?? (jsonGuardActive() === 'ndjson' ? { status: 'error' } : undefined);
-    const doc = legacy ? `${JSON.stringify({ ...legacy, ...withoutUndefined(env), ...legacy })}\n` : r.stdout;
-    void writeStdoutFinal(doc).catch(() => { /* fd 1 gone */ });
+    const doc = legacy || opts.extra ? `${JSON.stringify({ ...legacy, ...withoutUndefined(env), ...legacy, ...opts.extra })}\n` : r.stdout;
+    if (opts.emit) opts.emit(doc);
+    else void writeStdoutFinal(doc).catch(() => { /* fd 1 gone */ });
     // stderr stays the human channel under --json (same TTY order as renderCliError).
     stderr = [`Error [${env.code}]: ${env.message}`, `Fix: ${env.fix?.command ?? env.suggestion}`,
       ...(env.why ? [`Why: ${env.why}`] : [])].join('\n') + '\n';
@@ -144,12 +150,21 @@ export function unknownFlagError(command: string, flag: string, message: string,
  * The fatal seam (main() rejected). Same renderer, plus the two pre-v1
  * behaviours agents and skills depend on: the `pglite_busy` JSON keys
  * (`next_action`) and the `GBRAIN_DB_ACCESS` marker line skills/db-repair
- * literal-matches, with the classifier's remediation.
+ * literal-matches, with the classifier's remediation. A thin client's remote
+ * MCP failure is never a database access error: Bun 1.4.3's fetch says
+ * `ECONNREFUSED: Unable to connect…` where 1.4.2 said `Unable to connect…`,
+ * which the database classifier would otherwise read as a refused Postgres
+ * connection and send the user to `gbrain db-repair` (#6586).
  */
 export function writeFatalCliError(e: unknown, opts: { argv?: readonly string[]; dbUrl?: string | null; brainId?: string } = {}): number {
   const argv = opts.argv ?? process.argv.slice(2);
   const command = cliCommandOf(argv);
-  const busy = e as { code?: unknown; reason?: unknown; message?: unknown } | null;
+  const busy = e as { code?: unknown; reason?: unknown; message?: unknown; fix?: Action } | null;
+  if (busy?.code === 'pglite_busy' && busy.reason === 'legacy_owner_unverified' && busy.fix) {
+    const next = 'Waiting does not free this lock. Ask the user (fix.user_message); if they agree, run the read-only preview in fix and follow it.';
+    const err = opError('pglite_busy', String(busy.message), next, { reason: busy.reason, fix: busy.fix, retryable: false });
+    return writeCliError(err, command, { argv, legacy: { error: 'pglite_busy', retryable: false, reason: busy.reason } });
+  }
   if (busy?.code === 'pglite_busy') {
     const next = 'Wait for the current command or server to close, then retry. Do not remove a live lock.';
     // A7: a live serve owns the brain (usually an agent session's stdio serve), so
@@ -166,7 +181,7 @@ export function writeFatalCliError(e: unknown, opts: { argv?: readonly string[];
     });
     return writeCliError(err, command, { argv, legacy: { error: 'pglite_busy', retryable: true, reason: busy.reason, next_action: next } });
   }
-  if (!jsonRequested(argv)) {
+  if (!jsonRequested(argv) && !(e instanceof RemoteMcpError)) {
     try {
       const d = classifyPgAccessError(e, { url: opts.dbUrl ?? null, brainId: opts.brainId });
       if (d.reason !== 'unknown') {
@@ -179,4 +194,19 @@ export function writeFatalCliError(e: unknown, opts: { argv?: readonly string[];
     } catch { /* classifier failure: the generic renderer below still reports it */ }
   }
   return writeCliError(e, command, { argv });
+}
+
+/**
+ * #4488 / GST-1387: an op that reports failure in-band (`{status: 'error'}`, e.g. put_page over unparseable frontmatter
+ * or a remember batch with a failed item) is echoed to stderr and exits 1 on every CLI path, never read as success.
+ * No-op statuses ('skipped', 'unchanged', …) stay exit 0: a no-op is not a failure. An extraction-review batch with a
+ * failed decision reports 'partial' and exits 1 too.
+ */
+export function reportInBandFailure(result: unknown, command: string): void {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return;
+  const status = (result as { status?: unknown }).status;
+  if (status !== 'error' && !(status === 'partial' && command === 'extraction-review')) return;
+  const detail = (result as { error?: unknown }).error;
+  console.error(`gbrain ${command}: operation reported status '${status}'` + (typeof detail === 'string' && detail ? ` — ${detail}` : '') + '.');
+  setCliExitVerdict(1);
 }

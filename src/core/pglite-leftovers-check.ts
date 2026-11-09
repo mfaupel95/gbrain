@@ -282,7 +282,8 @@ export function assessPgliteLeftovers(
       `${anyIncomplete ? 'at least ' : ''}${humanBytes(total, anyIncomplete)} of reclaimable disk. ` +
       `It also inflates any backup that archives the gbrain home. Your live data is in the postgres ` +
       `engine; once you have verified that (a recent restore or backup of it), the dir is safe to ` +
-      `delete by hand — gbrain never deletes it for you.`,
+      `delete by hand — gbrain never deletes it for you. Preview: du -sh ${leftovers[0]!.path}; then, after the user agrees: ` +
+      `${leftovers.map((l) => `rm -rf ${l.path}`).join('; ')}.`,
     leftovers,
   };
 }

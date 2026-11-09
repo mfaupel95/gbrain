@@ -134,15 +134,47 @@ function parseToml(text: string): Record<string, unknown> {
  * appending to a broken file could only deepen the damage.
  */
 export function detectForeignCodexServer(configText: string, name: string): boolean {
-  const lines = configText.replace(/\r\n/g, '\n').split('\n');
-  const { remainder } = stripBlock(lines);
-  const parsed = parseToml(remainder.join('\n'));
-  const servers = parsed.mcp_servers;
-  if (typeof servers !== 'object' || servers === null) return false;
-  return (servers as Record<string, unknown>)[name] !== undefined;
+  const server = outsideServer(configText, name);
+  return server !== undefined && !isToolsOnly(server);
 }
 
-function renderBlock(block: CodexHttpServerBlock): string[] {
+/** `mcp_servers.<name>` as defined outside our managed block, or undefined. */
+function outsideServer(configText: string, name: string): unknown {
+  const { remainder } = stripBlock(configText.replace(/\r\n/g, '\n').split('\n'));
+  const servers = parseToml(remainder.join('\n')).mcp_servers;
+  return isTable(servers) ? servers[name] : undefined;
+}
+
+/**
+ * Codex's per-tool settings for a server (`[mcp_servers.<name>.tools.<tool>]`,
+ * e.g. `approval_mode = "approve"` from "always allow", #6799): tool name to
+ * scalar settings. Null for any other shape, which stays a foreign edit.
+ */
+export type CodexToolPolicy = Record<string, Record<string, string | number | boolean>>;
+
+const isTable = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+export function codexToolPolicy(value: unknown): CodexToolPolicy | null {
+  if (!isTable(value)) return null;
+  for (const settings of Object.values(value)) {
+    if (!isTable(settings) || Object.values(settings).some(v => !['string', 'number', 'boolean'].includes(typeof v))) return null;
+  }
+  return value as CodexToolPolicy;
+}
+
+/** A server table holding nothing but a valid tool policy: Codex's approvals, not a server definition. */
+function isToolsOnly(server: unknown): boolean {
+  return isTable(server) && Object.keys(server).join(',') === 'tools' && codexToolPolicy(server.tools) !== null;
+}
+
+/** Tools whose Codex settings sit outside our managed block (removing the block would orphan them). */
+export function codexToolsOutsideBlock(configText: string, name: string): string[] {
+  const server = outsideServer(configText, name);
+  return isToolsOnly(server) ? Object.keys((server as { tools: CodexToolPolicy }).tools) : [];
+}
+
+function renderBlock(block: CodexHttpServerBlock, tools: CodexToolPolicy = {}): string[] {
   // http_headers inline table, NOT `bearer_token`: codex-cli >=0.149 rejects
   // bearer_token for streamable_http at config load (#4574); this shape loads
   // on 0.147.x and 0.149.x.
@@ -151,18 +183,24 @@ function renderBlock(block: CodexHttpServerBlock): string[] {
     `[mcp_servers.${block.name}]`,
     `url = ${tomlString(block.url)}`,
     `http_headers = { Authorization = ${tomlString(`Bearer ${block.bearerToken}`)} }`,
+    ...Object.entries(tools).flatMap(([tool, settings]) => [
+      `[mcp_servers.${block.name}.tools.${tomlKey(tool)}]`,
+      ...Object.entries(settings).map(([k, v]) => `${tomlKey(k)} = ${typeof v === 'string' ? tomlString(v) : String(v)}`),
+    ]),
     CODEX_TOML_BLOCK_END,
   ];
 }
 
 /** Post-render assertion shared by the writer and the snippet renderer: our
- * table's keys are EXACTLY [http_headers, url], and the http_headers inline
+ * table's keys are EXACTLY [http_headers, url] (plus a `tools` table of
+ * Codex's own per-tool settings, #6799), and the http_headers inline
  * table carries EXACTLY the Authorization header we wrote. Returns an error
  * string (caller prefixes its own context) or null when valid. */
 function validateOurKeys(ours: unknown): string | null {
   const ourKeys = typeof ours === 'object' && ours !== null ? Object.keys(ours as object).sort() : [];
-  if (ourKeys.join(',') !== 'http_headers,url') {
-    return `keys are [${ourKeys.join(', ')}], expected exactly [http_headers, url]`;
+  const withTools = ourKeys.join(',') === 'http_headers,tools,url' && codexToolPolicy((ours as Record<string, unknown>).tools) !== null;
+  if (ourKeys.join(',') !== 'http_headers,url' && !withTools) {
+    return `keys are [${ourKeys.join(', ')}], expected exactly [http_headers, url] (plus Codex tool settings)`;
   }
   const headers = (ours as Record<string, unknown>).http_headers;
   const headerKeys = typeof headers === 'object' && headers !== null ? Object.keys(headers as object) : [];
@@ -231,9 +269,15 @@ export function writeCodexHttpServerBlock(
   const lines = rawText.replace(/\r\n/g, '\n').split('\n');
 
   const { remainder, hadBlock } = stripBlock(lines);
+  // #6799: Codex's tool approvals written inside our block are carried into the new one.
+  const span = findBlock(lines);
+  const priorServers = span.begin === -1 ? undefined : parseToml(lines.slice(span.begin, span.end + 1).join('\n')).mcp_servers;
+  const prior = isTable(priorServers) ? priorServers[block.name] : undefined;
+  const carried: CodexToolPolicy = (isTable(prior) && codexToolPolicy(prior.tools)) || {};
 
   // Foreign ownership guard — a duplicate table definition is a hard TOML
-  // parse error that would brick codex entirely.
+  // parse error that would brick codex entirely. A table holding only Codex's
+  // tool settings is not a server definition (#6799).
   const remainderText = remainder.join('\n');
   let parsedRemainder: Record<string, unknown>;
   try {
@@ -245,7 +289,7 @@ export function writeCodexHttpServerBlock(
     );
   }
   const servers = parsedRemainder.mcp_servers;
-  if (typeof servers === 'object' && servers !== null && (servers as Record<string, unknown>)[block.name] !== undefined) {
+  if (isTable(servers) && servers[block.name] !== undefined && !isToolsOnly(servers[block.name])) {
     throw new Error(
       `[mcp_servers.${block.name}] is already defined in ${configPath} outside the gbrain-managed block — ` +
         `refusing to double-define it (that is a hard TOML parse error). ` +
@@ -258,13 +302,15 @@ export function writeCodexHttpServerBlock(
   const trimmed = [...remainder];
   while (trimmed.length > 0 && trimmed[trimmed.length - 1].trim() === '') trimmed.pop();
   const body = trimmed.length > 0 ? [...trimmed, ''] : [];
-  const nextLines = [...body, ...renderBlock(block), ''];
+  const nextLines = [...body, ...renderBlock(block, carried), ''];
   const nextText = nextLines.join('\n');
 
   // Post-render validation: parse + assert OUR table's keys are exactly ours.
   const rendered = parseToml(nextText);
   const renderedServers = rendered.mcp_servers as Record<string, unknown> | undefined;
-  const problem = validateOurKeys(renderedServers?.[block.name]);
+  const ours = renderedServers?.[block.name] as Record<string, unknown> | undefined;
+  const lost = Object.keys(carried).find(tool => canonicalJson((ours?.tools as CodexToolPolicy | undefined)?.[tool]) !== canonicalJson(carried[tool]));
+  const problem = validateOurKeys(ours) ?? (lost === undefined ? null : `Codex settings for tool ${lost} did not round-trip`);
   if (problem !== null) {
     throw new Error(
       `post-render validation failed: [mcp_servers.${block.name}] ${problem} — original file left untouched.`,
@@ -322,4 +368,112 @@ export function removeCodexHttpServerBlock(
   chmodSync(backupPath, 0o600);
   atomicWriteToml(configPath, nextText, crlf);
   return { configPath, removed: true, backupPath, notes };
+}
+
+// ── Hash-owned single tables (`gbrain setup codex`) ─────────────────────────
+//
+// Setup owns individual tables (`[mcp_servers.<name>]`, each
+// `[hooks.state."<key>"]`) by the fingerprint of their parsed value, not by
+// markers: codex itself may rewrite config.toml and drop comments. A table is
+// appended at EOF and removed by its header line through the next header;
+// both edits are verified by parsing: everything else in the file must parse
+// to exactly what it parsed to before, or the file is left as it was.
+
+export type CodexTomlValue = string | string[] | Record<string, string>;
+
+const tomlKey = (k: string): string => (/^[A-Za-z0-9_-]+$/.test(k) ? k : tomlString(k));
+
+export function codexTomlHeader(path: string[]): string {
+  return `[${path.map(tomlKey).join('.')}]`;
+}
+
+function renderTomlValue(v: CodexTomlValue): string {
+  if (typeof v === 'string') return tomlString(v);
+  if (Array.isArray(v)) return `[${v.map(tomlString).join(', ')}]`;
+  return `{ ${Object.entries(v).map(([k, val]) => `${tomlKey(k)} = ${tomlString(val)}`).join(', ')} }`;
+}
+
+/** The parsed value at `path`, or undefined. Throws when the file does not parse. */
+export function readCodexTomlTable(configPath: string, path: string[]): unknown {
+  if (!existsSync(configPath)) return undefined;
+  let node: unknown = parseToml(readFileSync(configPath, 'utf8'));
+  for (const seg of path) node = node && typeof node === 'object' && !Array.isArray(node) ? (node as Record<string, unknown>)[seg] : undefined;
+  return node;
+}
+
+const canonicalJson = (v: unknown): string => JSON.stringify(v, (_k, val) =>
+  val && typeof val === 'object' && !Array.isArray(val) ? Object.fromEntries(Object.keys(val).sort().map((k) => [k, (val as Record<string, unknown>)[k]])) : val);
+
+/** Delete `path` from a parsed document, then drop the ancestors that deletion emptied. */
+function withoutPath(doc: Record<string, unknown>, path: string[]): Record<string, unknown> {
+  const copy = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+  const chain: Array<Record<string, unknown>> = [copy];
+  for (const seg of path.slice(0, -1)) {
+    const next = chain[chain.length - 1]![seg];
+    if (!next || typeof next !== 'object' || Array.isArray(next)) return copy;
+    chain.push(next as Record<string, unknown>);
+  }
+  delete chain[chain.length - 1]![path[path.length - 1]!];
+  for (let i = chain.length - 1; i > 0; i--) {
+    if (Object.keys(chain[i]!).length > 0) break;
+    delete chain[i - 1]![path[i - 1]!];
+  }
+  return copy;
+}
+
+/**
+ * Append `[path]` with `value` at EOF (after an optional comment line). Refuses
+ * when the table already exists anywhere in the file (a duplicate table is a
+ * hard parse error that bricks codex) or when the result would not parse to
+ * the old document plus exactly this table.
+ */
+export function appendCodexTomlTable(configPath: string, path: string[], value: Record<string, CodexTomlValue>, comment?: string): void {
+  const raw = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+  const crlf = raw.includes('\r\n');
+  const text = raw.replace(/\r\n/g, '\n');
+  const before = parseToml(text);
+  if (readCodexTomlTable(configPath, path) !== undefined) throw new Error(`${configPath} already defines ${codexTomlHeader(path)}; setup never defines a table twice.`);
+  const block = [...(comment ? [`# ${comment}`] : []), codexTomlHeader(path), ...Object.entries(value).map(([k, v]) => `${tomlKey(k)} = ${renderTomlValue(v)}`)];
+  const body = text.replace(/\n*$/, '');
+  const next = `${body ? `${body}\n\n` : ''}${block.join('\n')}\n`;
+  const after = parseToml(next);
+  if (canonicalJson(withoutPath(after, path)) !== canonicalJson(before)) throw new Error(`appending ${codexTomlHeader(path)} to ${configPath} would change other settings; the file is left as it was.`);
+  let node: unknown = after;
+  for (const seg of path) node = (node as Record<string, unknown> | undefined)?.[seg];
+  if (canonicalJson(node) !== canonicalJson(value)) throw new Error(`${codexTomlHeader(path)} in ${configPath} did not parse back to what setup wrote; the file is left as it was.`);
+  atomicWriteTextFile(configPath, crlf ? next.replace(/\n/g, '\r\n') : next, { freshMode: 0o600 });
+}
+
+/**
+ * Remove `[path]`: its header line through the line before the next header
+ * (plus a directly preceding `# gbrain setup` comment and one separating blank
+ * line). `unlocatable` when no such header line exists or the edit would change
+ * anything but this table (it was split, re-rendered or extended); the file is
+ * then left as it was. The caller checks the table's fingerprint first.
+ */
+export function removeCodexTomlTable(configPath: string, path: string[], opts: { dryRun?: boolean } = {}): 'removed' | 'absent' | 'unlocatable' {
+  if (!existsSync(configPath)) return 'absent';
+  const raw = readFileSync(configPath, 'utf8');
+  const crlf = raw.includes('\r\n');
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const before = parseToml(lines.join('\n'));
+  if (readCodexTomlTable(configPath, path) === undefined) return 'absent';
+  const header = codexTomlHeader(path);
+  const quoted = `[${path.map((seg) => tomlString(seg)).join('.')}]`;
+  const start = lines.findIndex((l) => l.trim() === header || l.trim() === quoted);
+  if (start < 0) return 'unlocatable';
+  let end = lines.findIndex((l, i) => i > start && /^\s*\[/.test(l));
+  if (end < 0) end = lines.length;
+  while (end > start + 1 && /^\s*(#.*)?$/.test(lines[end - 1]!)) end--;
+  let from = start;
+  if (from > 0 && lines[from - 1]!.startsWith('# gbrain setup')) from--;
+  if (from > 0 && lines[from - 1]!.trim() === '') from--;
+  const kept = [...lines.slice(0, from), ...lines.slice(end)];
+  while (kept.length > 0 && kept[kept.length - 1]!.trim() === '') kept.pop();
+  const next = kept.length > 0 ? `${kept.join('\n')}\n` : '';
+  let after: Record<string, unknown>;
+  try { after = parseToml(next); } catch { return 'unlocatable'; }
+  if (canonicalJson(after) !== canonicalJson(withoutPath(before, path))) return 'unlocatable';
+  if (!opts.dryRun) atomicWriteTextFile(configPath, crlf ? next.replace(/\n/g, '\r\n') : next, { freshMode: 0o600 });
+  return 'removed';
 }

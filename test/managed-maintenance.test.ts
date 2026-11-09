@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ensureCorpusSpoolDir, sessionCorpusFileName } from '../src/core/context/corpus-segments.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runPhaseConsolidate } from '../src/core/cycle/phases/consolidate.ts';
@@ -16,7 +17,7 @@ import { disposePersistenceConsumer, startPersistenceConsumer } from '../src/cor
 import { claimNextWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { localHostId, revokeLocalWriter } from '../src/core/persistence/identity.ts';
-import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
+import { legacyForget } from './helpers/legacy-forget.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { readJournalLimits } from '../src/core/persistence/limits.ts';
@@ -93,12 +94,15 @@ async function seed(engine: BrainEngine, sourceId: string, slug = 'people/exampl
   await seedFacts(engine, sourceId, slug, visibility);
 }
 
+// #6023: untyped facts that differ in a number token no longer cluster, so
+// the seeded claims vary by a plain word instead of a digit.
+const WORDS = ['alpha', 'beta', 'gamma'] as const;
 async function seedFacts(engine: BrainEngine, sourceId: string, slug: string, visibility = 'world') {
   const vector = `[${[1, ...Array(1535).fill(0)].join(',')}]`;
   for (let i = 0; i < 3; i++) {
     await engine.executeRaw(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,visibility,confidence,valid_from,embedding,embedding_model,embedded_text_hash)
       VALUES($1,$2,$3,'fact','test',$4,$5,$6::timestamptz,$7::vector,'openai:text-embedding-3-large',md5($3))`,
-    [sourceId, slug, `Example claim ${i}`, visibility, 0.9 - i / 10, `2026-01-0${i + 1}T00:00:00Z`, vector]);
+    [sourceId, slug, `Example claim ${WORDS[i]}`, visibility, 0.9 - i / 10, `2026-01-0${i + 1}T00:00:00Z`, vector]);
   }
 }
 
@@ -134,7 +138,7 @@ test('runCycle consolidates only its explicitly selected source across two eligi
     expect(await engine.executeRaw('SELECT id FROM takes WHERE page_id=$1', [otherBefore.page.id])).toHaveLength(0);
     const selectedAfter = (await engine.readPageSnapshot('people/example', { sourceId }))!;
     expect(selectedAfter.revision).not.toBe(selectedBefore.revision);
-    expect(selectedAfter.page.compiled_truth).toContain('Example claim 0');
+    expect(selectedAfter.page.compiled_truth).toContain('Example claim alpha');
     expect(parseMarkdown(readFileSync(join(root, 'people/example.md'), 'utf8')))
       .toEqual(parseMarkdown(serializePageToMarkdown(selectedAfter.page, selectedAfter.tags)));
     expect((await engine.readPageSnapshot('people/example', { sourceId: otherSourceId }))!.revision).toBe(otherBefore.revision);
@@ -183,7 +187,7 @@ test('managed consolidation publishes take, facts, canonical page, and file toge
     expect(result.details.facts_consolidated).toBe(3);
     expect(result.details.takes_written).toBe(1);
     const page = (await engine.readPageSnapshot('people/example', { sourceId }))!;
-    expect(page.page.compiled_truth).toContain('Example claim 0');
+    expect(page.page.compiled_truth).toContain('Example claim alpha');
     expect(parseMarkdown(readFileSync(join(root, 'people/example.md'), 'utf8'))).toEqual(parseMarkdown(serializePageToMarkdown(page.page, page.tags)));
     const facts = await engine.executeRaw<{ consolidated_into: number }>('SELECT consolidated_into FROM facts WHERE source_id=$1', [sourceId]);
     expect(facts.every(f => f.consolidated_into === facts[0].consolidated_into && f.consolidated_into > 0)).toBe(true);
@@ -239,7 +243,7 @@ for (const retirement of ['inactive', 'resolved'] as const) {
       const ctx = { engine, sourceId, remote: false as const, config: { engine: engine.kind, embedding_disabled: true },
         dryRun: false, logger: { info() {}, warn() {}, error() {} } };
       const added = await submitPageMutation(ctx, { operation: 'takes_add', params: { slug: 'people/example',
-        claim: 'Example claim 0', kind: 'fact', holder: 'self', weight: 0.9, request_id: randomUUID() } });
+        claim: 'Example claim alpha', kind: 'fact', holder: 'self', weight: 0.9, request_id: randomUUID() } });
       await submitPageMutation(ctx, { operation: retirement === 'inactive' ? 'takes_supersede' : 'takes_resolve', params: {
         slug: 'people/example', row_num: added.row_num, request_id: randomUUID(),
         ...(retirement === 'inactive' ? { claim: 'Replacement claim' } : { quality: 'correct', evidence: 'Verified fixture evidence' }),
@@ -298,7 +302,7 @@ test('consolidation retains a bounded semantic intent and honors configured admi
     await seed(engine, sourceId);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
     const limits = await readJournalLimits(engine);
-    expect(limits.principalIntentBytes).toBe(32 * 1024 ** 2);
+    expect(limits.principalIntentBytes).toBe(64 * 1024 ** 2);
     expect(limits.brainIntentBytes).toBe(256 * 1024 ** 2);
     const key = 'persistence.limits.principal_intent_bytes';
     const original = await engine.getConfig(key);
@@ -417,8 +421,10 @@ for (const failure of ['commit', 'withdrawal'] as const) {
       const prepared = await prepareMaintenanceMutation(engine, row, { engine: engine.kind, embedding_disabled: true });
       if (failure === 'withdrawal') {
         const [fact] = await engine.executeRaw<{ id: number }>('SELECT id FROM facts WHERE source_id=$1 ORDER BY id LIMIT 1', [sourceId]);
-        await submitForgetMutation({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
-          logger: { info() {}, warn() {}, error() {} } }, 'forget', { id: Number(fact.id), request_id: randomUUID() });
+        // A current forget queues behind the claimed request on its root; a gbrain before G4 sharing the brain still commits
+        // its withdrawal database-first, at any moment (test/helpers/legacy-forget.ts).
+        await legacyForget({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
+          logger: { info() {}, warn() {}, error() {} } }, Number(fact.id));
       }
       const outcome = await publishMutation(engine, row, prepared, localHostId(), { boundary: async name => {
         if (failure === 'commit' && name === 'before_commit') throw new Error('Injected fixture commit failure');
@@ -435,7 +441,7 @@ for (const failure of ['commit', 'withdrawal'] as const) {
 test('managed synthesis drives real children and publishes repaired provenance plus summary without repeated model calls', async () => {
   await fixture(async (engine, sourceId, root) => {
     await seed(engine, sourceId);
-    const transcript = join(root, '2026-09-20-session.txt');
+    const transcript = join(ensureCorpusSpoolDir(root), sessionCorpusFileName('2026-09-20-session', sourceId));
     const quote = 'we charge for durability because reliable memories should survive every tool';
     writeFileSync(transcript, `User: ${quote}.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
     await engine.setConfig('dream.synthesize.enabled', 'true');

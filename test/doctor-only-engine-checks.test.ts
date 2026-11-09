@@ -37,7 +37,7 @@ const postGate = new Set(DOCTOR_CHECK_REGISTRY.slice(gate + 1).flatMap((e) => e.
 
 describe('doctor --only engine need (#6303)', () => {
   test('engine-reading pre-gate checks need the engine', () => {
-    for (const name of ['dream_paid_loop', 'connectors', 'extract_atoms_backlog', 'default_source_local_path', 'volunteer_channels']) {
+    for (const name of ['dream_paid_loop', 'connectors', 'extract_atoms_backlog', 'default_source_local_path', 'volunteer_channels', 'sync_failures', 'managed_sync_backlog']) {
       expect(`${name}:${onlyNeedsEngine(new Set([name]))}`).toBe(`${name}:true`);
     }
     expect(onlyNeedsEngine(new Set(['pglite_data_dir', 'supervisor', 'harness_wiring']))).toBe(false);

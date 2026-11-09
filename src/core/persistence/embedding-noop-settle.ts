@@ -21,6 +21,7 @@
  * `next_attempt_at, id` across kinds, only Git groups and withdrawal mirrors
  * gate other effects, and an embedding effect gates nothing.
  */
+import { trueUpRequests } from './receipt-true-up.ts';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { embeddingWriteTarget } from '../page-state/projections.ts';
@@ -32,11 +33,14 @@ import { faultPoint } from './fault-points.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 
-/** At most this many effects settle in one statement. */
-export const NOOP_SETTLE_BATCH = 200;
+/**
+ * At most this many effects settle in one statement. A pass and its reservation true-up hold the event loop on PGLite,
+ * so the batch bounds how long a request waits behind the drain.
+ */
+export const NOOP_SETTLE_BATCH = 50;
 
 /** Guard failures that leave an effect for the runner, which records them as it does today. */
-const LEFT_FOR_RUNNER = new Set(['owner_unavailable', 'source_changed', 'recovery_required']);
+const LEFT_FOR_RUNNER = new Set(['owner_unavailable', 'source_changed', 'recovery_required', 'owner_marker_missing']);
 
 type Candidate = Pick<PersistenceEffect, 'id' | 'kind' | 'source_id' | 'source_incarnation' | 'worktree_id'>;
 
@@ -61,7 +65,8 @@ export async function settleNoopEmbeddingEffects(engine: BrainEngine, hostId: st
   const [due] = await engine.executeRaw(`SELECT 1 FROM persistence_effects e WHERE e.id>$1::bigint AND e.kind='embedding' AND e.state='queued'
     AND e.attempts=0 AND e.recovery IS NULL ORDER BY e.id LIMIT 1`, [from]);
   if (!due) return { settled: 0, cursor: { key, through: from }, done: true };
-  return engine.transaction(async tx => {
+  const requestIds: string[] = [];
+  const pass = await engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
     const [{ newest }] = await tx.executeRaw<{ newest: string }>('SELECT COALESCE(max(id),0)::text AS newest FROM persistence_effects');
     // The window is the next `limit` unattempted embedding effects by id, read from the primary key and locked;
@@ -108,9 +113,13 @@ export async function settleNoopEmbeddingEffects(engine: BrainEngine, hostId: st
     }
     if (!ids.length) return { settled: 0, cursor, done };
     const settled = await tx.executeRaw(`UPDATE persistence_effects SET state='committed', error_code=NULL, attempts=attempts+1,
-        data=data-'retry_slugs'-'target_failures'-'failing_target', execution_token=NULL, claim_expires_at=NULL, outcome='{}'::jsonb, updated_at=now()
-      WHERE id=ANY($1::text[]::bigint[]) AND state='queued' AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [ids]);
+        data=data-'retry_slugs'-'target_failures'-'failing_target', execution_token=NULL, claim_expires_at=NULL, claim_owner=NULL, outcome='{}'::jsonb, updated_at=now()
+      WHERE id=ANY($1::text[]::bigint[]) AND state='queued' AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id, request_id`, [ids]);
     await faultPoint('effect:embedding:settle', { effectId: ids[0] });
+    for (const row of settled as Array<{ request_id: string }>) requestIds.push(row.request_id);
     return { settled: settled.length, cursor, done };
   });
+  // #6696 (A1): the settled requests give back their unused reservation, outside the settle transaction.
+  await trueUpRequests(engine, requestIds);
+  return pass;
 }

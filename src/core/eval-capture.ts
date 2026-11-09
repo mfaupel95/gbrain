@@ -43,7 +43,7 @@ import type {
 } from './types.ts';
 import type { GBrainConfig } from './config.ts';
 import { scrubPii } from './eval-capture-scrub.ts';
-import { registerBackgroundWorkDrainer } from './background-work.ts';
+import { deferUntilResponse, registerBackgroundWorkDrainer } from './background-work.ts';
 
 // HybridSearchMeta is canonical in src/core/types.ts and exported via the
 // public `gbrain/types` subpath. Surfaced from hybridSearch via the
@@ -64,7 +64,7 @@ export interface CaptureContext {
   latency_ms: number;
   /** OperationContext.remote — true for MCP callers, false for local CLI. */
   remote: boolean;
-  /** The `expand` flag as requested by the caller (query-only; null for search). */
+  /** The raw `expand` param the caller passed (query-only): null when unset (the mode decided) and for search. What ran is `meta.expansion_applied`. */
   expand_enabled: boolean | null;
   /** The `detail` flag as requested (query-only). */
   detail: 'low' | 'medium' | 'high' | null;
@@ -164,9 +164,12 @@ export async function captureEvalCandidate(
   // returned promise is back-compat for any awaiter. The async DB write
   // (logEvalCandidate) is the same lock-pin / disconnect-race class as the other
   // sinks — on PGLite an undrained capture racing db.close() can wedge.
-  const p = doCaptureEvalCandidate(engine, ctx, opts);
-  trackEvalCapture(p);
-  return p;
+  // GBRA-156: inside a request that defers its writes (background-work.ts deferUntilResponse), the insert starts after the response.
+  return new Promise<void>(resolve => deferUntilResponse(() => {
+    const p = doCaptureEvalCandidate(engine, ctx, opts);
+    trackEvalCapture(p);
+    p.then(resolve, () => resolve());
+  }));
 }
 
 async function doCaptureEvalCandidate(

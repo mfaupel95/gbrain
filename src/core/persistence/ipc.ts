@@ -5,9 +5,10 @@ import { isAbsolute } from 'node:path';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
+import type { ProjectionBacklog } from '../page-state/projections.ts';
 import { resolveSocketPathForConfig, socketHasLiveListener } from '../context/resolve-ipc.ts';
-import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt } from './types.ts';
-import { isPersistenceAdminOperation, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminOperation } from './admin-contract.ts';
+import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt, type WriteReceipt } from './types.ts';
+import { isPersistenceAdminExtension, isPersistenceAdminOperation, PERSISTENCE_ADMIN_EXTENSIONS, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminExtension, type PersistenceAdminOperation } from './admin-contract.ts';
 import { claimLocalIpcBinding, isWindowsIpcPipe, prepareLocalIpcPath } from '../context/ipc-path.ts';
 
 export const PERSISTENCE_IPC_VERSION = 1;
@@ -16,14 +17,14 @@ export const PERSISTENCE_IPC_VERSION = 1;
 export const PERSISTENCE_IPC_MAX_BYTES = 32 * 1024 * 1024;
 export const PERSISTENCE_IPC_MAX_CONNECTIONS = 8;
 export const PERSISTENCE_IPC_OPERATIONS = [
-  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page',
+  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page',
   'remember', 'forget', 'extract_facts', 'get_write_request', 'list_write_requests', 'cancel_write_request',
   'get_page', 'fetch', 'get_recent_transcripts',
   'list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack',
   'put_skill', 'delete_skill', 'join_brain', 'sync_brain_skills', 'leave_brain',
   'get_skill_policy', 'set_skill_policy', 'get_skill_retention', 'prune_skill_revisions',
   'retain_skill_revision', 'import_skill_proposal',
-  'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
+  'add_tag', 'remove_tag', 'add_timeline_entry', 'add_link', 'remove_link', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
   'purge_fact', 'list_page_purges', 'unpurge_page',
 ] as const;
 /**
@@ -36,9 +37,9 @@ export const LOCAL_CLI_OWNER_OPERATIONS: ReadonlySet<string> = new Set(['purge_f
 export type PersistenceIpcOperation = typeof PERSISTENCE_IPC_OPERATIONS[number];
 const OPERATIONS = new Set<string>(PERSISTENCE_IPC_OPERATIONS);
 const MUTATIONS = new Set<string>([
-  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'remember', 'forget', 'extract_facts',
+  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page', 'remember', 'forget', 'extract_facts',
   'put_skill', 'delete_skill', 'import_skill_proposal',
-  'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
+  'add_tag', 'remove_tag', 'add_timeline_entry', 'add_link', 'remove_link', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
 ]);
 
 export interface PersistenceIpcRegistration {
@@ -65,8 +66,10 @@ export interface PersistenceIpcCapabilities {
   brain_id: string;
   operations: readonly PersistenceIpcOperation[];
   max_frame_bytes: number;
-  /** Optional for protocol compatibility with owners predating local administration. */
+  /** Optional for protocol compatibility with owners predating local administration. Frozen: new operations go in `administration_extensions`. */
   administration?: readonly PersistenceAdminOperation[];
+  /** #6650: administration added after `administration` froze; older clients ignore the key, a client keeps only the entries it knows. */
+  administration_extensions?: readonly PersistenceAdminExtension[];
   /** #5232: the owner honors `write_wait_ms` on operation requests. */
   write_wait?: true;
 }
@@ -80,12 +83,15 @@ export interface PersistenceIpcAdminRequest {
   registration: PersistenceIpcRegistration;
 }
 
-/** #5401: the resident's queued text-projection backlog. Counts only, never identifiers. */
-export interface PersistenceProjectionStatus {
-  pending: number;
-  failed: number;
-  oldest_age_seconds: number | null;
-}
+/**
+ * #5401: the resident's queued text-projection backlog. Counts only, never
+ * identifiers. #6803: `pending` and `failed` keep their meaning (rows the
+ * resident drains); the class counts are optional, so an older doctor reading
+ * a new reply sees an unchanged `pending` and a new doctor reading an old one
+ * knows the resident predates them.
+ */
+export type PersistenceProjectionStatus = ProjectionBacklog;
+const PROJECTION_CLASS_KEYS = ['sealable', 'sealable_with_visual', 'reimport', 'ocr_required', 'protected', 'archived'] as const;
 
 export interface PersistenceIpcProvider {
   brainId: string;
@@ -225,13 +231,14 @@ export async function startPersistenceIpcServer(
       chunks = [];
       void (async () => {
         let admitted = false;
+        let mutation: { requestId: string; receipt?: WriteReceipt } | undefined;
         try {
           const request: unknown = JSON.parse(payload);
           if (record(request) && exactKeys(request, ['version', 'kind']) && request.version === 1 && request.kind === 'capabilities') {
             socket.end(responseFrame({ version: 1, ok: true, result: {
               version: 1, brain_id: provider.brainId, operations: PERSISTENCE_IPC_OPERATIONS,
               max_frame_bytes: PERSISTENCE_IPC_MAX_BYTES,
-              ...(provider.administer ? { administration: PERSISTENCE_ADMIN_OPERATIONS } : {}),
+              ...(provider.administer ? { administration: PERSISTENCE_ADMIN_OPERATIONS, administration_extensions: PERSISTENCE_ADMIN_EXTENSIONS } : {}),
               write_wait: true,
             } satisfies PersistenceIpcCapabilities }));
             return;
@@ -261,9 +268,17 @@ export async function startPersistenceIpcServer(
           if (request.kind === 'administration' && !provider.administer) throw opError('unavailable', 'This owner does not support local administration.',
             'The running persistence owner was started without local administration (an older release or a non-CLI owner), so nothing ran. Restart the owner on this gbrain release, or stop it and run the administration command from the gbrain CLI on this host.',
             { fix: ownerVersionsFix() });
+          if (request.kind === 'operation' && isPersistenceIpcMutation(request.operation)) mutation = { requestId: request.params.request_id as string };
           const result = request.kind === 'administration' ? await provider.administer!(request) : await provider.dispatch(request);
+          if (mutation && record(result) && isWriteReceipt(result.write_request)) mutation.receipt = result.write_request;
           if (!socket.destroyed) socket.end(responseFrame({ version: 1, ok: true, result }));
         } catch (error) {
+          // #6989: a write whose reply is too large to frame may have committed; the error carries its request ID (and
+          // receipt, when the result held one) so the advice to inspect it is actionable. A read gets none.
+          if (mutation && error instanceof OperationError && error.code === 'response_too_large') {
+            error.requestId = mutation.requestId;
+            if (mutation.receipt) error.writeRequest = publicWriteReceipt(mutation.receipt);
+          }
           if (!socket.destroyed) socket.end(responseFrame({ version: 1, ok: false, error: publicError(error) }));
         } finally {
           if (admitted) active--;
@@ -327,17 +342,60 @@ export class PersistenceIpcTransportError extends Error {
   }
 }
 
+/**
+ * GST-1387: a wire error body's recovery contract (canonical code, detail, retryable, fix) restored onto a rebuilt
+ * OperationError, so a refresh fence stays worktree_refreshing with fix.next wait across the owner hop. Only the fence's
+ * fix (read-only, no consent) is carried: a rendered fix drops `ask_user`, and a receipt's fix is rendered on this side.
+ */
+export function restoreRecoveryContract(error: OperationError, body: Record<string, unknown>): void {
+  if (typeof body.code === 'string' && body.code !== error.code) error.canonical = body.code as OperationError['canonical'];
+  if (typeof body.detail === 'string') error.detail = body.detail;
+  if (typeof body.retryable === 'boolean') error.retryable = body.retryable;
+  if (record(body.fix) && body.code === 'worktree_refreshing') { const { next: _next, command: _command, ...fix } = body.fix; error.fix = fix as unknown as Action; }
+}
+
 function remoteOperationError(value: unknown): OperationError {
   if (!record(value) || typeof value.error !== 'string' || typeof value.message !== 'string') {
     throw new Error('Malformed persistence error response.');
   }
   const error = new OperationError(value.error, value.message, typeof value.suggestion === 'string' ? value.suggestion : undefined,
     typeof value.docs === 'string' ? value.docs : undefined);
-  if (typeof value.detail === 'string') error.detail = value.detail;
   if (typeof value.protocol_version === 'number') error.protocolVersion = value.protocol_version;
+  restoreRecoveryContract(error, value);
   if (isWriteReceipt(value.write_request)) error.writeRequest = publicWriteReceipt(value.write_request);
+  if (isWriteRequestId(value.request_id)) error.requestId = value.request_id;
   if (isWriteErrorCode(value.write_error)) error.writeError = value.write_error;
+  if (typeof value.why === 'string') error.why = value.why;
+  if (typeof value.reason === 'string') error.reason = value.reason;
+  if (value.contract_version === 1) error.contractVersion = 1;
+  const fix = wireAction(value.fix);
+  if (fix) error.fix = fix;
   return error;
+}
+
+/**
+ * #7707, #8130: the owner sends a refusal's `fix` already rendered (`toJSON`), or as the stored Action when it never loaded the renderer.
+ * Back to an Action, so a delegated refusal prints the same structured fix as the direct path; a value of any other shape is dropped.
+ */
+function wireAction(value: unknown): Action | undefined {
+  if (!record(value) || !Array.isArray(value.consent) || typeof value.actor !== 'string' || typeof value.why !== 'string'
+    || typeof value.requires_exclusive !== 'boolean') return undefined;
+  const argv = Array.isArray(value.argv) && value.argv.every(arg => typeof arg === 'string') ? value.argv as string[] : undefined;
+  const mcp = record(value.mcp) && typeof value.mcp.tool === 'string' && record(value.mcp.arguments) ? value.mcp as unknown as Action['mcp'] : undefined;
+  if (!argv && !mcp) return undefined;
+  const then = value.then === undefined ? undefined : wireAction(value.then);
+  return {
+    ...(value.next === 'ask_user' || value.ask_user === true ? { ask_user: true as const } : {}),
+    ...(argv ? { argv } : {}), ...(mcp ? { mcp } : {}),
+    consent: value.consent as Action['consent'], actor: value.actor as Action['actor'], why: value.why, requires_exclusive: value.requires_exclusive,
+    ...(typeof value.user_message === 'string' ? { user_message: value.user_message } : {}),
+    ...(record(value.verify) ? { verify: value.verify as Action['verify'] } : {}),
+    ...(typeof value.docs === 'string' ? { docs: value.docs } : {}),
+    ...(Array.isArray(value.inputs) ? { inputs: value.inputs as Action['inputs'] } : {}),
+    ...(typeof value.plan_hash === 'string' ? { plan_hash: value.plan_hash } : {}),
+    ...(Array.isArray(value.preview_argv) && value.preview_argv.every(arg => typeof arg === 'string') ? { preview_argv: value.preview_argv as string[] } : {}),
+    ...(then ? { then } : {}),
+  };
 }
 
 /** One bounded exchange. No automatic reconnect or replay after any request bytes are sent. */
@@ -378,7 +436,12 @@ async function exchange(socketPath: string, request: unknown, timeoutMs: number,
         const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         if (!record(value) || value.version !== 1 || typeof value.ok !== 'boolean') { lost(); return; }
         if (value.ok) settle(undefined, value.result);
-        else settle(remoteOperationError(value.error));
+        else {
+          const error = remoteOperationError(value.error);
+          // #6989: an owner that predates the server-side ID still answers a mutation's oversized reply without it.
+          if (requestId && error.code === 'response_too_large' && !error.requestId) error.requestId = requestId;
+          settle(error);
+        }
       } catch { lost(); }
     });
   });
@@ -393,7 +456,15 @@ export async function requestPersistenceCapabilities(socketPath: string, timeout
     || value.max_frame_bytes < 1 || value.max_frame_bytes > PERSISTENCE_IPC_MAX_BYTES) {
     throw new PersistenceIpcTransportError(false);
   }
-  return value as unknown as PersistenceIpcCapabilities;
+  // #6650: an extension list is advisory: a malformed one is dropped, an entry this build does not know is ignored.
+  const extensions = Array.isArray(value.administration_extensions) ? value.administration_extensions.filter(isPersistenceAdminExtension) : undefined;
+  const { administration_extensions: _ignored, ...rest } = value;
+  return { ...rest, ...(extensions ? { administration_extensions: extensions } : {}) } as unknown as PersistenceIpcCapabilities;
+}
+
+/** Whether a resident owner's capabilities include an administration operation (a frozen one or an extension). */
+export function ownerAdministers(capability: Pick<PersistenceIpcCapabilities, 'administration' | 'administration_extensions'>, operation: PersistenceAdminOperation): boolean {
+  return isPersistenceAdminExtension(operation) ? capability.administration_extensions?.includes(operation) === true : capability.administration?.includes(operation) === true;
 }
 
 function count(value: unknown): value is number {
@@ -404,7 +475,9 @@ export async function requestPersistenceProjectionStatus(socketPath: string, tim
   const value = await exchange(socketPath, { version: 1, kind: 'projection_status' }, timeoutMs);
   if (!record(value) || !count(value.pending) || !count(value.failed)
     || !(value.oldest_age_seconds === null || count(value.oldest_age_seconds))) throw new PersistenceIpcTransportError(false);
-  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds };
+  const classes = Object.fromEntries(PROJECTION_CLASS_KEYS.flatMap(key => count(value[key]) ? [[key, value[key]]] : []));
+  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds, ...classes,
+    ...(typeof value.as_of === 'string' ? { as_of: value.as_of } : {}) };
 }
 
 export async function requestPersistenceOperation(socketPath: string, request: PersistenceIpcRequest, timeoutMs = 30_000): Promise<unknown> {

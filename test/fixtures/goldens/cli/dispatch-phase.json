@@ -4,6 +4,13 @@
       "readOnlyTimeoutMs !== null"
     ],
     "commands": {
+      "access": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "advisor": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -40,6 +47,25 @@
             "terminates": true,
             "thinClientCheck": true,
             "unconditionalFor": []
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "append": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect-own-engine",
+        "preConnectRules": [
+          {
+            "condition": "command === 'append'",
+            "connectsEngine": true,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "append"
+            ]
           }
         ],
         "thinClient": "none",
@@ -139,6 +165,15 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "beliefs": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "route-then-refuse",
+        "thinClientRoutedSubcommands": [
+          "changes"
+        ]
+      },
       "bench": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -188,6 +223,25 @@
         "hasSwitchCase": true,
         "phase": "post-connect",
         "preConnectRules": [],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "bundled-skill": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'bundled-skill'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "bundled-skill"
+            ]
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -516,6 +570,13 @@
             ]
           }
         ],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "diag": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
@@ -916,6 +977,25 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "git": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'git'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "git"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "google": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1055,6 +1135,7 @@
         "thinClientRoutedSubcommands": [
           "list",
           "get",
+          "wait",
           "stats"
         ]
       },
@@ -1336,6 +1417,13 @@
         "thinClientRoutedSubcommands": [
           "list"
         ]
+      },
+      "questions": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
       },
       "recall": {
         "hasSwitchCase": true,
@@ -1839,7 +1927,16 @@
             "unconditionalFor": []
           },
           {
-            "condition": "command === 'sync' && !syncOperator",
+            "condition": "command === 'sync' && args[0] === 'trigger' && await (await import('../commands/sync-delegate.ts')).maybeTriggerThroughServe(loadConfig(), args.slice(1))",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          },
+          {
+            "condition": "command === 'sync' && !syncOperator && args[0] !== 'trigger'",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1945,11 +2042,11 @@
       },
       "upgrade": {
         "hasSwitchCase": false,
-        "phase": "pre-connect",
+        "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
             "condition": "command === 'upgrade'",
-            "connectsEngine": false,
+            "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
             "terminates": true,
@@ -1967,6 +2064,13 @@
         "phase": "post-connect",
         "preConnectRules": [],
         "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "wakeshift": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
       "watch": {
@@ -1995,6 +2099,20 @@
       }
     },
     "mainRules": [
+      {
+        "commands": [
+          "serve"
+        ],
+        "condition": "command === 'serve'",
+        "connectsEngine": false,
+        "refusesThinClient": false,
+        "routesThinClient": false,
+        "terminates": false,
+        "thinClientCheck": false,
+        "unconditionalFor": [
+          "serve"
+        ]
+      },
       {
         "commands": [
           "--help",
@@ -2136,6 +2254,16 @@
         "terminates": true,
         "thinClientCheck": false,
         "unconditionalFor": []
+      },
+      {
+        "commands": [],
+        "condition": "cliOpts.as === undefined && ['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)",
+        "connectsEngine": false,
+        "refusesThinClient": false,
+        "routesThinClient": false,
+        "terminates": true,
+        "thinClientCheck": false,
+        "unconditionalFor": []
       }
     ],
     "thinClientGuard": {
@@ -2146,6 +2274,9 @@
       ]
     },
     "thinClientRoutes": {
+      "beliefs": [
+        "changes"
+      ],
       "cache": [
         "stats"
       ],

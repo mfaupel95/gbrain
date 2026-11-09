@@ -9,13 +9,15 @@
  * it). Never import from '../operations.ts' here (cycle).
  */
 
-import { MIN_TRUST_PARAM } from '../eligibility/policy.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { resolveScopedFindings } from '../eval-contradictions/scoped-read.ts';
+import type { ProbeReport } from '../eval-contradictions/types.ts';
 import { proactiveEligibility } from '../eligibility/registry.ts';
 import { activationSuppressionNotice, suppressionSummary } from '../eligibility/activation.ts';
 import type { Operation } from './contract.ts';
 import { opError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
-import { sourceScopeOpts, readPolicyOpts } from './context.ts';
+import { federatedSearchScope, sourceScopeOpts, readPolicyOpts } from './context.ts';
 import {
   FIND_EXPERTS_DESCRIPTION,
   FIND_CONTRADICTIONS_DESCRIPTION,
@@ -176,13 +178,17 @@ const find_experts: Operation = {
     const pack = await loadActivePackBestEffort(ctx);
     const types = pack ? expertTypesFromPack(pack.manifest) : [];
     const scope = await readPolicyOpts(ctx);
+    let degraded: unknown[] = [];
     const experts = await findExperts(ctx.engine, {
       topic,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       explain: p.explain === true,
       types: types as never,
       ...scope,
+      onMeta: m => { degraded = m.degraded ?? []; },
     });
+    // GBRA-200: a keyword-only or cut ranking is stamped like search, never read as "nobody knows".
+    if (degraded.length) ctx.emitResponseMeta?.('retrieval', { degraded });
     return experts;
   },
   // hidden: 'whoknows' is in CLI_ONLY (src/cli.ts) — runWhoknows owns the CLI
@@ -203,7 +209,8 @@ const find_contradictions: Operation = {
   scope: 'read',
   // Reads eval_contradictions_runs.report_json for the latest run, then
   // filters in-memory by slug and severity. No new probe is triggered;
-  // the agent surfaces what's already on disk.
+  // the agent surfaces what's already on disk. Scoped readers (remote,
+  // source-scoped or floored) get each side re-read live (D9, scoped-read.ts).
   params: {
     slug: {
       type: 'string',
@@ -218,6 +225,7 @@ const find_contradictions: Operation = {
       type: 'number',
       description: 'Max findings to return. Default 20.',
     },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
     const scope = sourceScopeOpts(ctx);
@@ -225,8 +233,11 @@ const find_contradictions: Operation = {
     // select is not a filter, so the bare command reads the latest run.
     const sourceFiltered = scope.sourceIds !== undefined
       || (scope.sourceId !== undefined && ctx.localSourceImplicit !== true);
-    if (ctx.remote !== false || sourceFiltered) {
-      return { contradictions: [], note: 'Stored contradiction reports are temporarily available only to trusted local callers without a source filter.' };
+    const { floor } = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const scoped = ctx.remote !== false || sourceFiltered || floor !== undefined;
+    const readScope = ctx.remote === false && !sourceFiltered ? {} : federatedSearchScope(ctx);
+    if (scoped && ctx.remote !== false && readScope.sourceId === undefined && readScope.sourceIds === undefined) {
+      return { contradictions: [], note: 'This connection names no readable source, so no stored contradiction findings are returned.' };
     }
 
     const limit = typeof p.limit === 'number' && p.limit > 0 ? Math.min(p.limit, 100) : 20;
@@ -239,23 +250,9 @@ const find_contradictions: Operation = {
       return { contradictions: [], note: 'No probe runs in the last 30 days; run `gbrain eval suspected-contradictions` first.' };
     }
     const latest = rows[0];
-    const report = latest.report_json as Record<string, unknown> | null;
-    const perQuery = (report?.per_query as Array<{
-      contradictions: Array<{
-        kind: string;
-        severity: 'low' | 'medium' | 'high';
-        axis: string;
-        confidence: number;
-        a: { slug: string; chunk_id: number | null; take_id: number | null };
-        b: { slug: string; chunk_id: number | null; take_id: number | null };
-        resolution_kind: string;
-        resolution_command: string;
-      }>;
-    }> | undefined) ?? [];
-    const allFindings = perQuery.flatMap((q) => q.contradictions);
-    // This branch is trusted and unscoped. Apply the requested display
-    // filters before the limit; source-scoped reports are unavailable above.
-    const matching = allFindings.filter((f) => {
+    const report = latest.report_json as Partial<ProbeReport> | null;
+    const allFindings = (report?.per_query ?? []).flatMap((q) => q.contradictions ?? []);
+    const matches = (f: { severity: string; a: { slug: string }; b: { slug: string } }) => {
       if (sevFilter && f.severity !== sevFilter) return false;
       if (slugFilter) {
         const sA = f.a.slug.toLowerCase();
@@ -263,8 +260,21 @@ const find_contradictions: Operation = {
         if (!sA.includes(slugFilter) && !sB.includes(slugFilter)) return false;
       }
       return true;
-    });
-    const kept = matching.slice(0, limit);
+    };
+    if (scoped) {
+      // D9: every side is re-read live under the caller's policy; stored text,
+      // totals and commands never leave for a scoped reader.
+      const visible = (await resolveScopedFindings(ctx.engine, allFindings, await readPolicyOpts(ctx, readScope), floor)).filter(matches);
+      return {
+        run_id: latest.run_id,
+        ran_at: latest.ran_at,
+        contradictions: visible.slice(0, limit),
+        total_visible: visible.length,
+      };
+    }
+    // This branch is trusted, unscoped and unfloored. Apply the requested
+    // display filters before the limit.
+    const kept = allFindings.filter(matches).slice(0, limit);
     return {
       run_id: latest.run_id,
       ran_at: latest.ran_at,

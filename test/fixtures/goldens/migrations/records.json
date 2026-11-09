@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 228,
+    "count": 291,
     "gaps": [
       17,
       18,
@@ -9,47 +9,95 @@
     ],
     "helpers": {
       "ALIAS_TABLES": "cddd37c636af42d862c08ca7754a57dfe9d12576b769fa8f74a5f02c803f67a0",
+      "BELIEF_FACTS_STREAM_INDEX": "9e4491eb9e0b94924a58deea3feff1b315ec0efd25a77a4e6515b362beffbc92",
+      "BOUNDED_TIMELINE_CHECKPOINT": "385c4da3e28732343148795d6e9a86670813a7a7cfa1e52f8a5bb494680a3c0d",
       "CHECKPOINT": "3c6ff909363c4ba1c9d730e748654ab90aa07549ddf4bf36b8f93c5f4ea3680b",
+      "CONTENT_CHUNKS_GENERATION_INDEX": "c434b3a4acdad499cf3b9f170d9f9967b8e3e8218c829db99f3ecba3b53c8b5d",
+      "CONTENT_CHUNKS_OCCURRENCE_GENERATION_INDEX": "b4f73db97ad878ef7256128ddef83fd11e2e08fd215e389d9e921a0daf04853d",
+      "CONTENT_CHUNKS_OCCURRENCE_INDEX": "7b692ba777b30399ab5a3b100eb40b3b9d1b3fb2322dc4dc808ba8a4d667912c",
+      "EXEMPT_RE": "e8b623114f4f77fc3abcfc479abec1442dbf41bc607e046d124b44572d59953c",
+      "FACTS_SUPERSEDED_BY_INDEX": "555c2b267989359a078de0f82cea830584bc0a268be6796bf526c0a9bed45905",
       "FACT_PURGES_ALL_SUBJECTS_INDEX": "99e2eb6c24134b539cb4cfd6e5ff66a724463525d09e9ba1fdde3c13f5787b6c",
       "FACT_PURGES_SUBJECT_INDEX": "f4fba07082f2e26da3fa51b0b689f3fe78a3d09afd20c1924dbc2fbe6b1560f1",
       "FACT_RELINK_TABLE_SQL": "1fdde4b99d0077365274096f294be64a992961c7b4544af794224de238b03630",
       "FACT_UNLINKED_INDEX_SQL": "87dcf23c3fa570d93bfb214b6bbb024faa9ff9bff227aa78869a29580be03298",
       "FTS_CJK_BOUNDARY_REGEX": "e8605bc0f2c6f3ecd2b451cbc8a4fe27ae0974d048f0bea655533cf37e0ff88d",
       "FTS_INPUT_FUNCTION_SQL": "d2f44fc1ef338ff7563c07659d938b743fedb20230948792c71068c022ec54c3",
+      "FUNCTION_SEARCH_PATH_HARDENING_SQL": "cad3e8c5c052c7eadcd0cbe88b1fccded412a9272393887789dece500f0403a4",
+      "INGEST_LOG_MARKED_INDEX": "1099f19af7873878974239a9a6f1a627827221eebd75aea01896246e0809e91c",
+      "INGEST_LOG_UNMARKED_INDEX": "c94e6b009f830527d2f1d6af1683bee94189474e8e67aa4c60165ab4abbd8726",
       "ISSUANCE_CLOCK_SLACK_SECONDS": "8f36c80392df6f9b9c754826289b63969d9d41ca8955213291e4413d614dce35",
+      "LEGACY_SEARCH_PATH_SETTINGS": "d100140125c47049aa913a9b4a9513e1b2cd63d4009256b702d7925520b2518d",
+      "LINKS_SUPERSEDES_INDEX": "a1353995111ef65c1347f295081cf8336dd5da955db7e0e330558d34fd21a4c6",
+      "OPEN_LOOPS_COUNTERPARTY_SOURCE_INDEX": "e9b472d9db37733e908ea40512ad3f9520d7a6729ce207b0d279d43d3beb5b2f",
+      "PAGES_FOLDER_RULE_IDS_INDEX": "f0929fed2e69d1045a1e3a6e8b4267e4323d658c6305e5ae1f568fc71195f684",
+      "PAGES_NAME_LOOKUP_INDEXES": "1ca830342164b5606e96cf0090645364f9145d36178d90f166230189fe8d2705",
+      "PAGES_PAGE_READERS_INDEX": "01a92fc19f866e0791bde647e7220a4666561b94888dccaa1643276c384ba057",
       "PAGES_RECONCILE_NAME_INDEXES": "8805e35341b22324b932b1cc05030cc8f2bfc95532bf810ec35330783f29c59a",
+      "PAGES_SEGMENTED_BODY_BYTES_INDEX": "c904a4f68cf190cce6bc68c03219c7b62d05b77eeb557db946a4f58a4f965e57",
+      "PAGES_SOURCE_CREATED_INDEX": "33411b4d6fc2287ee8fa37b1ebf2cc36a076101dbd3f3f6ac492aed06288513a",
+      "PAGES_TITLE_SEARCH_INDEX": "27e8e1a6c9a2069ee6c6af6fa99b9a7e9e9c118c7a933ffa80ba1864bf68baa3",
+      "PAGE_TIMELINE_FTS_MAX_CHARS": "f7d29264f4144976bbe2e1ded0251095b638175f8e1d711c36f1e80d2263e172",
       "PERSISTENCE_COMMITTED_WATERMARK_INDEX": "f472fa0acb542c1caebaaa3bc69fb2da1647e5e201239429fc02ccef0d669533",
       "PERSISTENCE_COMPACTABLE_INDEX": "25ee657878efb41ba9ea3a7624464ddcf66407d861659456c230366e57f230a0",
       "PERSISTENCE_DATABASE_PENDING_INDEX_SQL": "6e0f618be33d037454933ea4dea11438413d45aef35d3bd4f33e89624d6e199e",
       "PERSISTENCE_EFFECT_PARKED_INDEX_SQL": "0107863883415378d7c0dce7a0cbd5311c2c5a59fc0f81917cc8b767fd235cf2",
+      "PERSISTENCE_FOREGROUND_COMMITTED_INDEX": "cb6bb9f8e9bcfd2524a04d05e5da865e92c69442bbcd438d8191d311f76d0663",
+      "PERSISTENCE_OPEN_INDEX": "7760f2e16960b587e041b19e2eb0b2688831f4a7ca509968a1acc0ca710fcc9c",
+      "PERSISTENCE_REQUEST_ID_INDEX": "2c5325e86cf395f617d93a39a45593931639cd8b14fd513b6d9e7d125f16c78f",
+      "PERSISTENCE_REQUEST_REPLAY_ID_INDEX": "b9ee7e914c0a8370a9aee053c68d78cdd83a20ffe30c5513d81acf04a3a91761",
+      "PERSISTENCE_REQUEST_SLUG_INTENT_INDEX": "5f2e4a3dde452e610fe7eaae949642c00d7c61a363b1cd344d7f0917db233aa5",
+      "PERSISTENCE_REQUEST_SLUG_SEQUENCE_INDEX": "4759eaf319a6ad8d99aae7648acb6556745ed7cba051175273e2f46927c77d52",
       "PERSISTENCE_SYNC_RUN_INDEXES": "e1b12613c5fd2facb850e6857b0bddcf49b2478ec258fa226fe15e71e55df9c1",
       "PERSISTENCE_SYNC_WATERMARK_INDEX": "93523954a30e8483717f07ec97a3e0cd062b15d8a60cc759281054b06c23bb40",
+      "PINNED_FUNCTION_NAMES": "1360b0f7505577cae08292cdd89e0fb841fc02d460d68eb0185fcd8ae4df92a4",
+      "PLANNER_REPAIR_TABLES": "008725595e099adba279d4292661eb4a59930b777c35db43c340220f7f12e093",
+      "TABLES": "3fc77a0fccb525f9b791098f9eae27b19adaa3f5dadbabcff2a719137cbc3ef8",
       "TOKEN_TTL_MAX_SECONDS": "f4a45bec6ec0bacc859dc57732ceb76cec7eb72f242b5a6c89d47190d0525ab4",
       "TOKEN_TTL_MIN_SECONDS": "441d8ce6bd21f753de90abd3013eaa9992a469ea60c590f1005533618199aa25",
+      "analyzeAfterIndexBuild": "8d627df6b496e1c197a244f8519aeaf3aebcd23e3f7cf514576d453a4270e33a",
+      "analyzeDeferred": "e627ca5e77ce0b79cf5eae7c749a0c9275f04bc186704e3f3a6e05121bb78442",
+      "analyzeYieldingToVacuum": "edba1beff1547ea5c2e9f902efe44ab24e8d7016b2253603dcbba92d4137ca9a",
       "backfillChunkVectors": "1c8cc09a28aa3e906fe2f112b71cd3aa61f750a99984e35a029cff9458272aa1",
       "backfillPageVectors": "a325a5eee3bab49723af311f21b38a1ee4a0eaff1fb3c7e1539aa4dcb287ed66",
-      "buildIndexOnline": "ed5378b90f24f7d662e02865cf73af4248e348002661f8fbfd8ee1087c60a3e5",
+      "buildIndexOnline": "aea86be06da261a76f6fad15def8f417cb5318c7991d2ded3cd86aeed82fb2cc",
+      "buildOriginIndexIfClean": "cc6d16f50a4b5e303b87338700b9cded9784fc9cc9391c795bdd755e32385e6c",
       "checkpointKey": "337ef776b18f428542093e27c4d570249d6a5856e5a17e4499d26a22877af34b",
       "chunkSearchVectorTriggerFnSql": "93ed4e29aa058949621b4198fe1ec317218f4b9ec0db0626ec6dc7001032047d",
       "clampOAuthTokenTtls": "b1e94ea8f5b3c3870a56b0f6d00d0a274c2e9dcad912b828848aec250732645f",
       "dropInvalidConcurrentIndex": "6864d844b7dfb2fbecdd0fb9c73e06248473376feb794b3fe58f036c70d2d44c",
+      "enableRlsSql": "b7901b3d5231fcfacd3260ce0f59d4701d8c0bee902808ff48b1d8affbd444b6",
+      "ensureFactsFtsIndex": "95e723314ac30cea2db48e0e167c554ef1fa06df80cae765faa2a080a3a655c2",
       "getFtsLanguage": "0d790b4c4af1f67a2a1bbd59470beb13f434917b381931baf8404a41c5d903db",
-      "grantFromRow": "2d0603bb0f964d7e45e04aa76bac54cd4f6f63c91a8d9f028b60b4792bc1695e",
+      "grantFromRow": "e31bd308b413c11f2879ac4393fbc0362a1a974f937196f11029481e4dc64f69",
+      "hardenFunctionSearchPaths": "8e91e77e7c8f9bab906904e2f4e28c687723aa878f8965a3fdf48f628e8a34b3",
       "hnswMaxDimsForType": "a187cdcc520f813b7c39da97ce53da58509232ed9f851627ef41abfe1b68bd26",
-      "migrateConnectorCheckpoints": "e0403022a56559556c82a9fa1e90d928f36e1d09c7db570e1d788a87d2dc9521",
+      "isLockTimeoutError": "52a3720e1ffb74ce381cc3269f78130c38a89c807e308283ec3d557bae2b89b1",
+      "lockTableForAnalyze": "b6e4f173cffd877d2cfd85af813aa694a6d2c32907eaea613c6879800d3a7b44",
+      "migrateAutoThinkToPins": "34267fe3b1cc4ab2850ddcf9ba18ce73d959678233a53de238c85231e6b71470",
+      "migrateConnectorCheckpoints": "5c13e69a334bfc5275c7d555c4e7b28e034569f086dd4bd70b4b78fa4770dc7a",
       "migrateLegacyTokens": "6e4abe3670127e7a495b56ecbf9f5789edd3a7362d45704656c2210a85b27f4c",
       "migrationNotice": "9a6607b26a9719ef1833571b137bc8ebfcd1e16d545e89ff8728cf3ccbcbb409",
-      "pageSearchVectorTriggerFnSql": "c31a80562c8053479344d6060115a24854b1f419f6e09945f36b1403305f54e6",
+      "migrationStatementTimeoutMs": "2883be5073d2cd96cc17136e2f7d3223c6bdafebe3ef3c7a6836be320867251d",
+      "originTwinsRepairCommand": "fb3c721e48d9f2a98845ef91231836d4a37eb5929e9a9b62f8dfab5ce395c462",
+      "pageSearchVectorTriggerFnSql": "2e418d7069473de186e9d38a726afa009b71902ce20d704638decf299f14757b",
+      "protectTables": "ca31d41dd1fbc1d0cc4a41855741b55f4ec3d428dc264fb2aaf5cd1592082a14",
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
+      "relationsWithoutRls": "1350afca7865e0a915bfd4c6c2614361705090fca4905f25ac3b38312065c99c",
       "repairLegacyClientGrants": "c1dc6b1d0c4933c041583aa1c4eacaefc0ff0ae2a67f56cfad7534f87a5ab309",
       "repairLegacyTimelineSourceRows": "405d4ae158482c020b029b93aff1ae4ac6854e6948cafaf82dbef473e6e5552e",
+      "resolveSchemaLockTimeoutMs": "944eadd479e8de6c6da7dfb5208eb3b140e84b318db97a644d08ae0054d69138",
+      "runMigrationStatement": "84ba969e61fe8e898dd50cf96e1643d237e521e04cd92b5ef43c5d6be75940c1",
+      "schemaLockBlockedError": "c3e1346bc85d4e7592eaa64e262487c87011e4f4fae4c2bcca89b7d818c9a345",
       "seedConnectorDispatchAttempts": "2395a3995a6bf78776d37e72ce79b0dd15f6c6fa7f81c40612a744cb74ab01a5",
       "slugifyPath": "401dbca23580865d8b168dd8d84db4a6c708c6610d7cb61abafc7d0ee9809063",
       "sqlQueryForEngine": "71fb1ccec1b22cdc1662876dbd8c17ed81e9ab83485c6965cdf5caa4fc4a4ab5",
-      "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67"
+      "tableRows": "906d2413b13d76a06d5910885e47ed5c544be4ff3a2266e83146715721b24270",
+      "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67",
+      "withSchemaLockTimeout": "95605bd3004955e11e936c7a4aa6889319b401098abf9db18ef3e48da2c3fc59"
     },
-    "latest": 233,
+    "latest": 296,
     "records": [
       {
         "handler": {
@@ -2230,8 +2278,8 @@
         "idempotent": true,
         "name": "canonical_page_revisions_and_guards",
         "sql": {
-          "length": 4724,
-          "sha256": "c04f8117c2e6c7b9d3c3328acd27f56aa0c2eeddcc32843bec7caf0fb5f9a29b"
+          "length": 5829,
+          "sha256": "8ec891d0eab202452b0507c7f4755eb324979da350ed30a2b65ecb83c6e1a3ba"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2243,8 +2291,8 @@
         "idempotent": true,
         "name": "durable_concurrent_persistence",
         "sql": {
-          "length": 11520,
-          "sha256": "d04bc325652b2d227e16533a761ea501042ce54c7be9c6a105321f6fbeba4e86"
+          "length": 15743,
+          "sha256": "c6a64dd7451000894ce425095a465e8c403cd45f989e8f5419109a8360d51484"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2269,8 +2317,8 @@
         "idempotent": true,
         "name": "verified_text_projection_activation",
         "sql": {
-          "length": 2545,
-          "sha256": "0ce686d328e43d51c806c62161ceafaf6724957fa1652a7b9855b3a4b9c0547f"
+          "length": 7430,
+          "sha256": "0a1e4fc42f20571946543865c49e15503168a124a309aa7f04f3e0ff2025493f"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2282,8 +2330,8 @@
         "idempotent": true,
         "name": "preserve_sanitized_page_search_vectors",
         "sql": {
-          "length": 2109,
-          "sha256": "a03fa150bbe0f7a5414bbc15b644f4bc67ba1bbef1e16081f7b293de6f1968a4"
+          "length": 6994,
+          "sha256": "94518706999daa7b1a65c7ae44f2ebaf63de0365bd13e3c9fb3b3eca443f3824"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2308,8 +2356,8 @@
         "idempotent": true,
         "name": "managed_alias_and_source_checkpoint_guards",
         "sql": {
-          "length": 5632,
-          "sha256": "7cdd67f6734a0f3963b243420d4c0097700d756339e86b36dd8a19a39a20b0b2"
+          "length": 9036,
+          "sha256": "bbc1864bccd1b4a56e3370845644f81c705b70ea8ff12730b8c91a42b6a5ef19"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2430,8 +2478,8 @@
         "idempotent": true,
         "name": "shared_brain_skills_and_membership",
         "sql": {
-          "length": 15917,
-          "sha256": "6d54ba001944603fd35abe6d6f355f106322a4e0dda206cfd93622fc1493e4aa"
+          "length": 16728,
+          "sha256": "66a2779e40295f260ed27b49a93143537503de1702469dc6654756e69496b1ad"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2467,8 +2515,8 @@
         "idempotent": true,
         "name": "fact_embedding_identity",
         "sql": {
-          "length": 5777,
-          "sha256": "9b2ba4919832da41e48e8688bb31c24ea2d27197b9143cde1077b7701621ea40"
+          "length": 9181,
+          "sha256": "293f747112998b8549064e2e8542d62fb2787272c5e879ff0bd9a57ff2348dd6"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2661,10 +2709,16 @@
           "form": "arrow",
           "helpers": [
             "PERSISTENCE_SYNC_RUN_INDEXES",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
-            "quietMigrationNotices"
+            "quietMigrationNotices",
+            "tableRows"
           ],
           "sha256": "7e7a8d3d5494a28590a5cc062f05cd090a735bf35aadb8a56c5f3cbb2687c8a1"
         },
@@ -2866,8 +2920,8 @@
         "idempotent": true,
         "name": "take_embedding_identity",
         "sql": {
-          "length": 5777,
-          "sha256": "f859485119a29379245109e95303a7de53584c023633f38d0287804138b00282"
+          "length": 9181,
+          "sha256": "900c5d058b546debd51a01e833ca319151d68115b53e5cedc588bcca52ab7193"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2879,8 +2933,8 @@
         "idempotent": true,
         "name": "f1_write_attribution",
         "sql": {
-          "length": 14623,
-          "sha256": "ad09591c350cddb3d863c3d36c8b6784b41dafc526cf9eb3023504eec7f8e1c6"
+          "length": 19957,
+          "sha256": "9249557c360a69df0b0c594e8901c28ed81337fbbb8f02ec92eaffe9b145b29e"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2892,8 +2946,8 @@
         "idempotent": true,
         "name": "f0_worktree_refreshes",
         "sql": {
-          "length": 935,
-          "sha256": "77ca451abde39586cefffb674e0ac0c36e371165a2d63e9c8b022557e48172ed"
+          "length": 1096,
+          "sha256": "19344005bafce35a597dfde19cb4d8cfc69ef384040c4c457db09a676af2184a"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2937,8 +2991,8 @@
         "idempotent": true,
         "name": "managed_guard_null_source_fallback",
         "sql": {
-          "length": 5134,
-          "sha256": "6d014f2104fe4f938d470329a75320f13a1a0153f21076f315ba6c85e6f84d04"
+          "length": 8496,
+          "sha256": "ec57ed5104233106665ea06b95ad921f989df354c1fa4db972f2d7059b6b98d2"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2950,8 +3004,8 @@
         "idempotent": true,
         "name": "publication_failure_detail",
         "sql": {
-          "length": 5225,
-          "sha256": "8e6bd0354bd0334b1dd3fb443c1a92d3e1397ffbf3162c4eea6dbd03fbf12da3"
+          "length": 8587,
+          "sha256": "230863f55030cc855bec3c949dfda7a38dbccea84724360d45e232e9f8a95332"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3198,8 +3252,8 @@
         "idempotent": true,
         "name": "facts_attributed_to",
         "sql": {
-          "length": 9118,
-          "sha256": "2e772deed199aba5dc05c6b9f88b70c57a6b50dc724d60b0e9eca684c66f63ba"
+          "length": 11048,
+          "sha256": "341cada2826edc528b6944c312b0fa3993c2266a582d31dceb401d2f2b039535"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3250,10 +3304,16 @@
           "form": "arrow",
           "helpers": [
             "PAGES_RECONCILE_NAME_INDEXES",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
-            "quietMigrationNotices"
+            "quietMigrationNotices",
+            "tableRows"
           ],
           "sha256": "307c6ea0c0366c8664ee6bf04782a136d9e07daf3d88606ce168d30a0e20bf81"
         },
@@ -3299,18 +3359,24 @@
           "form": "arrow",
           "helpers": [
             "PERSISTENCE_COMMITTED_WATERMARK_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
-            "quietMigrationNotices"
+            "quietMigrationNotices",
+            "tableRows"
           ],
           "sha256": "2c85f48116c5262f6ddff8e57665135247fc5867480c069d70c835e3c27e837d"
         },
         "idempotent": true,
         "name": "persistence_consumers",
         "sql": {
-          "length": 617,
-          "sha256": "cd4f82da89b693d122d4591ebbbb692178f1d7b497349c2faa44fc165c1114d4"
+          "length": 687,
+          "sha256": "6fb93119db92219ea691ec8ad27a664f8f369628779932ef94709318e33fe542"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3323,10 +3389,16 @@
           "helpers": [
             "PERSISTENCE_COMPACTABLE_INDEX",
             "PERSISTENCE_SYNC_WATERMARK_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
-            "quietMigrationNotices"
+            "quietMigrationNotices",
+            "tableRows"
           ],
           "sha256": "f7130a17b685dfd2443826ec7959856c9195334273870f1233a8fb1547c1e5b2"
         },
@@ -3380,8 +3452,8 @@
         "idempotent": true,
         "name": "trust_tiers",
         "sql": {
-          "length": 21064,
-          "sha256": "e970169acfdd98bfc4b51d361522f0137341b67988d0db3cf4b1c0f7f9433eca"
+          "length": 25270,
+          "sha256": "695f370bdda1d7dcf96ff995aaead432d5bd1045218539ff201ed6216d0d1bea"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3432,8 +3504,8 @@
         "idempotent": true,
         "name": "trust_generation",
         "sql": {
-          "length": 6491,
-          "sha256": "db0d07c1c48437dae2729fe3a6db19d352edba7f7b7b3caf88de09c9a926cb8d"
+          "length": 7382,
+          "sha256": "eaeaef719418d8122b4c3676e46bef42b37987c8ed135e6cdd2bbb32c36f1848"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3446,10 +3518,16 @@
           "helpers": [
             "FACT_PURGES_ALL_SUBJECTS_INDEX",
             "FACT_PURGES_SUBJECT_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
-            "quietMigrationNotices"
+            "quietMigrationNotices",
+            "tableRows"
           ],
           "sha256": "13e51e81b20b251087af7c0e7b59f1dac434dbde7eedebc0f8312b346932f3f6"
         },
@@ -3505,6 +3583,1249 @@
         "transaction": "absent",
         "verify": "absent",
         "version": 233
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "persistence_git_durability",
+        "sql": {
+          "length": 131,
+          "sha256": "7d1ffa9ac4f3f4a8ea7213dd1b49e23d485f193665eac9fdf14077c6680c7291"
+        },
+        "sqlFor": {
+          "pglite": "absent",
+          "postgres": {
+            "length": 205,
+            "sha256": "254cf68f1c5924bf19bbe7ed7951d8e83d9704a2f55611721ca5f08d6e5ff394"
+          }
+        },
+        "transaction": "absent",
+        "verify": {
+          "form": "arrow",
+          "helpers": [],
+          "sha256": "22a7e9ac067d3d7821610d62f4f60f1343fd127a8715c0e9ec4c47dd475bdac8"
+        },
+        "version": 234
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "migrateAutoThinkToPins"
+          ],
+          "sha256": "6538d483dacf5b76e4eb837603082e0c8611c613f6c534007fa2f2b197e1e1ed"
+        },
+        "idempotent": true,
+        "name": "pinned_questions",
+        "sql": {
+          "length": 2746,
+          "sha256": "07ff5ebf8abd16f5edf1bb76318ef541e7a74a3c275a78dac04acb103858e93b"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 235
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "OPEN_LOOPS_COUNTERPARTY_SOURCE_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "a9803cb770c09bf6fd1bb6a71cffb9059312aa46aeb42283a4108547942ba778"
+        },
+        "idempotent": true,
+        "name": "open_loops_counterparty_source",
+        "sql": {
+          "length": 76,
+          "sha256": "1976b6a28a5078fa1879722e27fdd7778d9524810212c1e4953a6b9cf0b78d70"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 236
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "ensureFactsFtsIndex",
+            "getFtsLanguage",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "a12195bd1365d15b7ace35de35648a71abb4cf2774893823b97941d91c956b2e"
+        },
+        "idempotent": true,
+        "name": "facts_question_recall_indexes",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 237
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "persistence_client_request_id",
+        "sql": {
+          "length": 88,
+          "sha256": "59694a9b9ad91af2199acb78cf50bbc2ac5c502bc76aadce59c4c011f4bed6c6"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 238
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "extract_rollup_halt_reasons",
+        "sql": {
+          "length": 117,
+          "sha256": "75898ef6f707541c890079219b85e0ea1e85cf35cc87a2952917086f24a719a1"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 239
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_NAME_LOOKUP_INDEXES",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "476ec7dc4afa4da607d46eb7edbbd3c3bb68de4115722582eb14eab300e73e79"
+        },
+        "idempotent": true,
+        "name": "pages_name_lookup_indexes",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 240
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PERSISTENCE_REQUEST_SLUG_INTENT_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "5239bc4332339df6f5d39e58b0785e7e508d013d842338082406055fca2560b0"
+        },
+        "idempotent": true,
+        "name": "persistence_request_slug_intent_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 241
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "extract_atoms_partial_input",
+        "sql": {
+          "length": 211,
+          "sha256": "fca4778c549c2441c058f76d9b4dd756dbe4568c8d478d9485dca342b3d45bb7"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 242
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "persistence_consumer_process_start",
+        "sql": {
+          "length": 163,
+          "sha256": "10a330a9e1287db4f47bf4f2a70456fa3fa62dbdca8dde2ff2b8f876333e6e6d"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 243
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "chunk_projected_spans",
+        "sql": {
+          "length": 171,
+          "sha256": "abc04e738f487873c5c7f676ca01643d0f2554204dda36799a093fc7bc02d988"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 244
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "BOUNDED_TIMELINE_CHECKPOINT",
+            "PAGE_TIMELINE_FTS_MAX_CHARS",
+            "backfillPageVectors",
+            "checkpointKey",
+            "getFtsLanguage",
+            "migrationNotice",
+            "pageSearchVectorTriggerFnSql",
+            "quietMigrationNotices"
+          ],
+          "sha256": "fd60ac122a6cc9ccc3986dad825d76b1322eaf2760689c6523198165aa4a4d22"
+        },
+        "idempotent": true,
+        "name": "page_search_vector_bounded_timeline",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 245
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "page_embedding_budget",
+        "sql": {
+          "length": 785,
+          "sha256": "ec11068c49b813afcfb5c4497f5423f8bf71eb5f24c0ae196326bb2175f66680"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 246
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "page_extraction_state",
+        "sql": {
+          "length": 644,
+          "sha256": "f2189cbc318857938dc6d8081c53e93e5ec6372a9402f34029ee9cbf7c376934"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 247
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "CONTENT_CHUNKS_OCCURRENCE_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "f534fe8c1c2a21a072644ff97155d6298e87245cf293fbf25b94c0713f6f4a66"
+        },
+        "idempotent": true,
+        "name": "segmented_page_storage",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": {
+          "pglite": {
+            "length": 8855,
+            "sha256": "4f838080e20c7d145652c5d3a068b8e984436d0b565caf530c9300c068f1df2f"
+          },
+          "postgres": {
+            "length": 9064,
+            "sha256": "49813d44e4db7783e301f7358c6ef6cd2c1bea8c660e18ba9c94346c15d2aa65"
+          }
+        },
+        "transaction": false,
+        "verify": "absent",
+        "version": 248
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "BELIEF_FACTS_STREAM_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "48c7bc5cb1a62090ed3b9f4e3426a3314453ee34e1fbaea990e7a87c929fb923"
+        },
+        "idempotent": true,
+        "name": "belief_ledger",
+        "sql": {
+          "length": 4645,
+          "sha256": "8a5992e82eebda6cc28a91dd588d2b0e9d58fd2d5207ddb1b83e771e50519048"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 249
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PERSISTENCE_REQUEST_ID_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "58a55290a23bae9e57c04871a1d470402ef4846361802e4d9fa53f827e34815b"
+        },
+        "idempotent": true,
+        "name": "persistence_request_id_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 250
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "take_horizons",
+        "sql": {
+          "length": 414,
+          "sha256": "43fb123a615e4eb3a77b021b2e8766e85093bfb80e8ef4f1dbc86dcc01658137"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 251
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "CONTENT_CHUNKS_GENERATION_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "604e3a9c174d9044d7bc0bcbda4be6676aa71838578a04b35ae75428664c4067"
+        },
+        "idempotent": true,
+        "name": "segmented_chunk_gc_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 252
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "page_view_digests",
+        "sql": {
+          "length": 541,
+          "sha256": "3e55a55d18791008b209f7c47bef94f470f507b67ba104e78478f8376aded9ce"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 253
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "INGEST_LOG_UNMARKED_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "b866693f397acc867b33c646f818d985a4b44cac584b0a7d2848113686edf51c"
+        },
+        "idempotent": true,
+        "name": "segment_reader_marks",
+        "sql": {
+          "length": 509,
+          "sha256": "04b3dadaac36924326a2137aed4b774bd38c045085813eec8a63e53cfdb63d8e"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 254
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "page_body_staging_texts",
+        "sql": {
+          "length": 424,
+          "sha256": "8ab1b335cd497dba1d2a9840a846f704d39bb27924a6baac455d3801ac112788"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 255
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "CONTENT_CHUNKS_OCCURRENCE_GENERATION_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "8745c346ffcacab52acb30d4c1fb6b78d5af2c48a69d0d71a23713b782e92800"
+        },
+        "idempotent": true,
+        "name": "chunk_retirement_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 256
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "buildOriginIndexIfClean",
+            "migrationNotice",
+            "originTwinsRepairCommand",
+            "quietMigrationNotices"
+          ],
+          "sha256": "9a476af6261b0466bcee14b083411ddd376cacf124d8bcbc2648077e62a8944e"
+        },
+        "idempotent": true,
+        "name": "pages_live_origin_key",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 257
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "pages_links_extract_failure",
+        "sql": {
+          "length": 79,
+          "sha256": "076f0d516a37d225deec04c581a0176a4551351e08cc052acd5d79c89ca8dd4d"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 258
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "INGEST_LOG_MARKED_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "0d85538d5d8481866342b45c8872e889d1f0c8dcffe114ab833c9209effc42dc"
+        },
+        "idempotent": true,
+        "name": "ingest_log_marked_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 259
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_SEGMENTED_BODY_BYTES_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "35f2cceeba8abac07df01b2da479d76e6594ccc62b62a760a3cc7f3c846a73e9"
+        },
+        "idempotent": true,
+        "name": "segmented_page_size_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 260
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "persistence_request_transient_retries",
+        "sql": {
+          "length": 208,
+          "sha256": "3ab9a442fb2e2c6999cbca77df5bf5acf77aed37cf3c3de8547becbd7addeff0"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 261
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "commit_notifier",
+        "sql": {
+          "length": 1716,
+          "sha256": "92b10ec00767e181fc76c3e945a9085e37c16f06ba6235512ae6b55c409ba695"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 262
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "try_jsonb_function",
+        "sql": {
+          "length": 241,
+          "sha256": "ca16373eb5df962e15b59ed33ebffd4469d09ee873039600929e1b9145638272"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 263
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "set_based_fact_insert_guards",
+        "sql": {
+          "length": 8575,
+          "sha256": "7a76b08224ef82c7034f93c983b82effc7e5bb54a4b734182541967bb478caec"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 264
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "derived_generations",
+        "sql": {
+          "length": 2832,
+          "sha256": "8f07eb75b6de03f1be543c4236cb47d50bb85bbd5e8d9e47c9f776e0cb514872"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 265
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "derived_generation_activations",
+        "sql": {
+          "length": 1151,
+          "sha256": "a33706dbe93948e527af3f692ece4aed3ab7d41f6789ddb552e75fcf39e6055c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 266
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_TITLE_SEARCH_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "08f633af1c107eb453085b9027b8cad8d2ba1595147c44acf4296aa4e5410b3d"
+        },
+        "idempotent": true,
+        "name": "pages_title_search_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 267
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "effect_claim_owner",
+        "sql": {
+          "length": 83,
+          "sha256": "1342d23315a82e4b650358cc8ddd08a1197a2da8ddd3be107a2c96976a032a7f"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 268
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "LINKS_SUPERSEDES_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "e7d77bcf13643b56d3b80e2d5cea59a1e35f94e47ede80dbb9bad76dd04cf4fc"
+        },
+        "idempotent": true,
+        "name": "links_supersedes_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 269
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_SOURCE_CREATED_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "61bbcf074ff9a40f227b7836eb1b4fefb5cc3ec22c4845c556c9e1f4e3e92b3b"
+        },
+        "idempotent": true,
+        "name": "pages_source_created_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 270
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "FACTS_SUPERSEDED_BY_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "da2e5f805da6de37f972aa014bc83ce70e66c6f2d7f0485497efef6ae16f656b"
+        },
+        "idempotent": true,
+        "name": "facts_superseded_by_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 271
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "git_canonical_declared",
+        "sql": {
+          "length": 11056,
+          "sha256": "c6270a97f0b7ede1b5342363c96aaeae598b6e28df80bbddebf7d577bead600e"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 272
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "migrationStatementTimeoutMs",
+            "runMigrationStatement",
+            "withSchemaLockTimeout"
+          ],
+          "sha256": "c0b02932c7327d8a0e02f2211a6e4f12ff860ae8aabece9c841ff537a1961d7a"
+        },
+        "idempotent": true,
+        "name": "segment_derivations",
+        "sql": {
+          "length": 6527,
+          "sha256": "6817b97b501c8fadfb66177fa317ecd4e1a05ef879cc0c411df134f99019e491"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 273
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "pages_withheld_source_path",
+        "sql": {
+          "length": 77,
+          "sha256": "42dd9471b93c51d33f563e1da50966237e919dd84440787a3021822b6f59a379"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 274
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "EXEMPT_RE",
+            "TABLES",
+            "enableRlsSql",
+            "isLockTimeoutError",
+            "migrationStatementTimeoutMs",
+            "protectTables",
+            "relationsWithoutRls",
+            "resolveSchemaLockTimeoutMs",
+            "schemaLockBlockedError"
+          ],
+          "sha256": "f43f901e13f5306d5dc2736eb4a03691e75eb2608858aca24bf38672e47a5dc1"
+        },
+        "idempotent": true,
+        "name": "rls_backfill_unguarded_tables",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 275
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PERSISTENCE_FOREGROUND_COMMITTED_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "6216cb939d9e686a3386b406051d172d78e86f55edb629f7672b9602926d0484"
+        },
+        "idempotent": true,
+        "name": "persistence_foreground_committed_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 276
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "FUNCTION_SEARCH_PATH_HARDENING_SQL",
+            "LEGACY_SEARCH_PATH_SETTINGS",
+            "PINNED_FUNCTION_NAMES",
+            "hardenFunctionSearchPaths",
+            "isLockTimeoutError",
+            "migrationStatementTimeoutMs",
+            "resolveSchemaLockTimeoutMs",
+            "schemaLockBlockedError"
+          ],
+          "sha256": "15a27669929ea32760cb218168dc0cc1500d248b640c7a0185f9ee6792c22e8c"
+        },
+        "idempotent": true,
+        "name": "function_search_path_pg_temp",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 277
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "writer_fence_fail_closed",
+        "sql": {
+          "length": 14639,
+          "sha256": "4efd23df250964920edb1155733da970760e7a16d01f14fa4ff2f440f7eff79d"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 278
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "outcome_markers_skip_purge_guard",
+        "sql": {
+          "length": 2560,
+          "sha256": "95449fe0798457014873642724ad5da8fc97db0bb9cbb94d3b8c22c01b303a3b"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 279
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "principal_private_pages",
+        "sql": {
+          "length": 301,
+          "sha256": "c6fa4543ca075ca6b40c8bd8cba619b266d4ecf388f6d50cd349f4819dd312e4"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 280
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "getFtsLanguage",
+            "pageSearchVectorTriggerFnSql"
+          ],
+          "sha256": "0c2020653af736793a16dd8466337977343e7821aa9349a8cec68ffa2209fedf"
+        },
+        "idempotent": true,
+        "name": "derived_state_maintainers_fail_closed",
+        "sql": {
+          "length": 14676,
+          "sha256": "3a858d548042dc116ab8184e729e6697675270bd64c95bec3f639e18e2037483"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 281
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "member_read_access",
+        "sql": {
+          "length": 6267,
+          "sha256": "101166818b4179ee7c13602d76f4ff02bd0b6c4a1872678ff2da427327b88224"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 282
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "folder_access_rules",
+        "sql": {
+          "length": 10034,
+          "sha256": "8994df295d61b39e1de8954100e42b85347c25abf9ed1152b6ad005e0596718c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 283
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_FOLDER_RULE_IDS_INDEX",
+            "PAGES_PAGE_READERS_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "23a4395ab195e12db78bf63b05213617ae553bbb5af02c23393b1c8ed205af71"
+        },
+        "idempotent": true,
+        "name": "access_page_indexes",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 284
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "slug_rename_history",
+        "sql": {
+          "length": 4735,
+          "sha256": "968c36b28c95a4eb7b1324771770968b39d38c67d70188ff97e1f1ca16ea5a1c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 285
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "qm_actor_links",
+        "sql": {
+          "length": 1073,
+          "sha256": "ce07be19659fb418a83d6bffe655e9cf112e523daeb40d3eca69781a4321ad81"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 286
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "multi_page_recovery_record",
+        "sql": {
+          "length": 2883,
+          "sha256": "6f30345b6cba2bdf0f1441c1f53509479d4726f96fdf2f24836efadee17008b6"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 287
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "decide_proposals_claim_pair_index",
+        "sql": {
+          "length": 450,
+          "sha256": "bf5ffae249862b1e7c1e5ea12f9238425d32b7394891c2540dddf0939437ee13"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 288
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "page_change_reasons",
+        "sql": {
+          "length": 798,
+          "sha256": "de2c9cb2f617e8d250b9e2b7cc786ed74f1fece1232b56e8073ded60e24bd5a3"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 289
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "wake_subscriptions",
+        "sql": {
+          "length": 1533,
+          "sha256": "91e0ec08e0714f7536fd2b0cb36cefb28a4d513a8e1825e4a8e19c9fcf7222f4"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 290
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PERSISTENCE_REQUEST_REPLAY_ID_INDEX",
+            "PERSISTENCE_REQUEST_SLUG_SEQUENCE_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "8b1e45df596f4bc7afcace9328cb586f6020cce7819fee175cd315982e8b8a25"
+        },
+        "idempotent": true,
+        "name": "persistence_request_replay_indexes",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 291
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PERSISTENCE_OPEN_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "migrationStatementTimeoutMs",
+            "quietMigrationNotices",
+            "runMigrationStatement",
+            "tableRows",
+            "withSchemaLockTimeout"
+          ],
+          "sha256": "3d7a66d6651b2f2309a1c52b0cc76cdc79ce9553bdda2b8096c8aea1a96d934b"
+        },
+        "idempotent": true,
+        "name": "refresh_write_barrier",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": {
+          "pglite": {
+            "length": 2684,
+            "sha256": "042e36e067f6244954b6d5cd895b944ed5a0e3aa3de52b56e1f774f6720e9d7b"
+          },
+          "postgres": {
+            "length": 3056,
+            "sha256": "e1546db362bf52ca97c2e1d0068c1a7cad3ca5d53763352d7322f2160c97f61e"
+          }
+        },
+        "transaction": false,
+        "verify": "absent",
+        "version": 292
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "qm_attest_sources",
+        "sql": {
+          "length": 149,
+          "sha256": "0f0c37619839efe212cdd64cf8df61e8a88633d441b5070d1974d619d1b008b2"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 293
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "refresh_barrier_import_deferral",
+        "sql": {
+          "length": 1530,
+          "sha256": "26c97caa36ce1c4a05bcda4d16aed85a3b3f152064b92cd43d97f3444d28b1cb"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 294
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "refresh_retry_hint_history_index",
+        "sql": {
+          "length": 172,
+          "sha256": "54d86ce498bfefd77a6fd28bc2dd0af898fa785544e3f8005508bd3f7949ab23"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 295
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "ingest_applied_captures",
+        "sql": {
+          "length": 1228,
+          "sha256": "71295828e31d9b61202fc5e8b05d78f25041b7509c65bef1aeed7e046e761e4c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 296
       }
     ],
     "versions": [
@@ -3735,7 +5056,70 @@
       230,
       231,
       232,
-      233
+      233,
+      234,
+      235,
+      236,
+      237,
+      238,
+      239,
+      240,
+      241,
+      242,
+      243,
+      244,
+      245,
+      246,
+      247,
+      248,
+      249,
+      250,
+      251,
+      252,
+      253,
+      254,
+      255,
+      256,
+      257,
+      258,
+      259,
+      260,
+      261,
+      262,
+      263,
+      264,
+      265,
+      266,
+      267,
+      268,
+      269,
+      270,
+      271,
+      272,
+      273,
+      274,
+      275,
+      276,
+      277,
+      278,
+      279,
+      280,
+      281,
+      282,
+      283,
+      284,
+      285,
+      286,
+      287,
+      288,
+      289,
+      290,
+      291,
+      292,
+      293,
+      294,
+      295,
+      296
     ]
   },
   "normalizer": "migrations-record-v1"

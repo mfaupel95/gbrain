@@ -10,7 +10,7 @@
 import { applyExtractAtomsNoPricing, readExtractAtomsNoPricing } from '../../../core/cycle/extract-atoms-cost-gate.ts';
 import { applyFactsReconcileBacklog, readFactsReconcileBacklog } from '../../../core/facts/reconcile-watermark.ts';
 import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { gbrainPath } from '../../../core/config.ts';
 import { multiSourceDriftCheck, multiSourceDriftNotVerified } from '../schema-pack-checks.ts';
 import { computeConversationFormatCoverageCheck } from './conversation-coverage.ts';
@@ -26,7 +26,10 @@ import {
   computeConversationParserProbeHealthCheck,
 } from './search-eval.ts';
 import type { Check } from '../../doctor.ts';
+import { withSkippedSegmented } from '../check-fix.ts';
 import type { DoctorContext, DoctorEntry } from '../context.ts';
+import { scanDeadline } from '../budget.ts';
+import { currentStatementDeadline } from '../../../core/statement-deadline.ts';
 
 async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   const { engine, orphanRatioSourceId } = ctx;
@@ -38,7 +41,9 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   // no live page backs. Fires append per-arm `reason` lines to
   // ~/.gbrain/audit/stub-guard-YYYY-Www.jsonl (pre-#4108 lines lack one and
   // count as unprefixed). The v0.36 sunset criterion covers 'unprefixed'
-  // ONLY; the fallback_resolution arm never sunsets.
+  // ONLY; the fallback_resolution arm never sunsets. 'db_only_page' (#6398)
+  // records facts routed DB-only for a page with no file; it is counted on
+  // its own and never feeds the resolver WARN threshold or the sunset count.
   //
   // WARN at >10 fires/24h — at that rate the resolver is probably missing
   // a case (typo prefix, alias, non-Latin script). Operators should grep
@@ -46,9 +51,11 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   // resolver branch or document them as legitimate bare-slug ingestion.
   try {
     const { readRecentStubGuardEvents } = await import('../../../core/facts/stub-guard-audit.ts');
-    const events = readRecentStubGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    const all = readRecentStubGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    const dbOnlyCount = all.filter((e) => e.reason === 'db_only_page').length;
+    const events = all.filter((e) => e.reason !== 'db_only_page');
     const fallbackCount = events.filter((e) => e.reason === 'fallback_resolution').length;
-    const reasonSplit = `unprefixed=${events.length - fallbackCount}, fallback_resolution=${fallbackCount}`;
+    const reasonSplit = `unprefixed=${events.length - fallbackCount}, fallback_resolution=${fallbackCount}, db_only_page=${dbOnlyCount}`;
     if (events.length > 10) {
       // Surface the top 3 slugs that hit it so operators have somewhere to start.
       const slugCounts = new Map<string, number>();
@@ -60,16 +67,16 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
         name: 'stub_guard_24h',
         status: 'warn',
         message:
-          `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; top: ${topSlugs}). ` +
+          `Stub guard fired ${all.length}x in last 24h (${reasonSplit}; top: ${topSlugs}). ` +
           `If this stays elevated, the prefix-expansion in resolveEntitySlug is ` +
           `missing a case. Check ~/.gbrain/audit/stub-guard-*.jsonl for the slugs ` +
           `that hit it.`,
       });
-    } else if (events.length > 0) {
+    } else if (all.length > 0) {
       checks.push({
         name: 'stub_guard_24h',
         status: 'ok',
-        message: `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; below WARN threshold of 10).`,
+        message: `Stub guard fired ${all.length}x in last 24h (${reasonSplit}; ${events.length} resolver hits, below WARN threshold of 10).`,
       });
     }
     // Zero hits is the goal — emit no check at all so the doctor output stays clean.
@@ -119,6 +126,8 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
 export const stubGuardEntry: DoctorEntry = {
   name: 'stub_guard_24h',
   emits: ['stub_guard_24h', 'sync_failures', 'managed_sync_backlog', 'slug_fallback_audit'],
+  engineChecks: ['sync_failures', 'managed_sync_backlog'],
+  tier: 'quick',
   run: runStubGuard,
 };
 
@@ -186,7 +195,8 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       probeEnabled = resolveProbeEnabled(dbVal, (cfg as any)?.autopilot?.nightly_quality_probe?.enabled);
     } catch { /* config unavailable → treat as disabled */ }
     const events = readRecentQualityProbeEvents(7);
-    const check = computeNightlyQualityProbeHealthCheck(probeEnabled, events);
+    const { PROBE_QA_DIMENSIONS } = await import('../../../core/cycle/nightly-probe-adapters.ts');
+    const check = computeNightlyQualityProbeHealthCheck(probeEnabled, events, PROBE_QA_DIMENSIONS);
     checks.push(check);
   } catch {
     // Best-effort; audit-log read failure shouldn't stop doctor.
@@ -204,10 +214,12 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       applyExtractAtomsNoPricing(check, await readExtractAtomsNoPricing(engine).catch(() => []));
       // #5151: unmanaged brains reconcile fences in the cycle, so fence pages
       // behind their facts watermark are facts not indexed yet.
+      let skippedSegmented = 0;
       if (!await managedPersistenceEnabled(engine).catch(() => true)) {
         const backlog = await readFactsReconcileBacklog(engine).catch(() => null);
-        if (backlog) applyFactsReconcileBacklog(check, backlog);
+        if (backlog) { applyFactsReconcileBacklog(check, backlog); skippedSegmented = backlog.skipped_segmented ?? 0; }
       }
+      Object.assign(check, withSkippedSegmented(check, skippedSegmented));
       checks.push(check);
     } catch {
       // Best-effort; rollup-table missing on pre-v106 brains is normal
@@ -368,8 +380,45 @@ export const extractionBacklogsEntry: DoctorEntry = {
   run: runExtractionBacklogs,
 };
 
+/**
+ * #8979: a local probe's stdout, or null when it fails or outlives its bound (5 s, clipped to the entry deadline less
+ * the report reserve; `entryDeadlineAt` is read when the entry starts). It runs asynchronously and is killed with
+ * SIGKILL at its bound (on POSIX its whole process group, so a wrapper's children die too), so a probe that hangs
+ * never blocks the event loop or outlives the entry's deadline. A probe
+ * the entry deadline cut short marks the entry's scope expired, so its checks report unknown instead of absent.
+ */
+async function localProbe(entryDeadlineAt: number | undefined, file: string, args: string[]): Promise<string | null> {
+  const scope = currentStatementDeadline();
+  const ownEnd = Date.now() + 5_000;
+  const end = scanDeadline({ entryDeadlineAt }, 5_000);
+  const cutShort = () => { if (scope && end < ownEnd) scope.expired = true; return null; };
+  const timeout = end - Date.now();
+  if (timeout <= 0) return cutShort();
+  const { spawn } = await import('../../../core/spawn.ts');
+  const posix = process.platform !== 'win32';
+  return new Promise((resolve) => {
+    // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- file and args are constants from the three call sites (npm root -g, which -a gbrain, crontab -l); the shell is Windows-only, where npm resolves to npm.cmd, as with the execFile it replaced; trusted local CLI only
+    const child = spawn(file, args, { shell: !posix, detached: posix, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    let done = false;
+    const finish = (value: string | null) => { if (done) return; done = true; clearTimeout(timer); resolve(value); };
+    const timer = setTimeout(() => {
+      if (done) return;
+      try { if (posix && child.pid) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { child.kill('SIGKILL'); }
+      child.stdout?.destroy();
+      child.unref();
+      finish(cutShort());
+    }, timeout);
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => { out += chunk; });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code === 0 ? out : null));
+  });
+}
+
 async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
+  const { entryDeadlineAt } = ctx;
 
   // 3e. home_dir_in_worktree (v0.35.8.0; peeled to doctor/checks/home-worktree.ts).
   // Walks up from `gbrainPath()` toward $HOME looking for a VALIDATED `.git`
@@ -391,30 +440,35 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
   // unrelated that can shadow the real binary on PATH. Classify every
   // `gbrain` that `which -a` finds (pure helpers in
   // src/core/npm-squat-check.ts) and warn when an unrelated install wins on
-  // PATH or the entry is broken. Skips silently when gbrain isn't on PATH
-  // at all (e.g. running via `bun src/cli.ts`).
+  // PATH or the entry is broken. The `gbrain` packages under `npm root -g`
+  // and Bun's global dir are classified too, so an unrelated global install
+  // whose bin is not on PATH still warns when no real gbrain is. Skips
+  // silently when neither finds anything (e.g. running via `bun src/cli.ts`).
   try {
-    const { execSync } = await import('node:child_process');
-    let candidates: string[] = [];
-    try {
-      candidates = execSync('which -a gbrain', {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
-        .split('\n')
-        .map((s) => s.trim())
-        .filter(Boolean);
-    } catch {
-      // `which` exits non-zero when gbrain isn't on PATH (or is missing
-      // entirely on this platform) — nothing to check.
-    }
+    const { homedir } = await import('node:os');
+    const bunGlobalRoot = join(process.env.BUN_INSTALL || join(homedir(), '.bun'), 'install', 'global');
+    const globalPackages = [join(bunGlobalRoot, 'node_modules', 'gbrain')];
+    // No npm (or it failed): only Bun's global dir is checked.
+    const npmRoot = (await localProbe(entryDeadlineAt, 'npm', ['root', '-g']))?.trim() || undefined;
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- npmRoot is the local operator's own `npm root -g` output, joined only to look for an installed gbrain package; trusted local CLI only
+    if (npmRoot) globalPackages.push(join(npmRoot, 'gbrain'));
+    // `which` exits non-zero when gbrain isn't on PATH (or is missing
+    // entirely on this platform) — nothing to check.
+    const candidates = ((await localProbe(entryDeadlineAt, 'which', ['-a', 'gbrain'])) ?? '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
     const { assessGbrainBinaries } = await import('../../../core/npm-squat-check.ts');
-    const assessment = assessGbrainBinaries(candidates);
+    const { fileURLToPath } = await import('node:url');
+    const assessment = assessGbrainBinaries(candidates, {
+      globalPackages, bunGlobalRoot, npmRoot, selfDir: dirname(fileURLToPath(import.meta.url)),
+    });
     if (assessment.status !== 'skip') {
       checks.push({
         name: 'npm_squat',
         status: assessment.status,
         message: assessment.message,
+        ...(assessment.fix ? { fix: assessment.fix } : {}),
       });
     }
   } catch {
@@ -453,10 +507,21 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     );
     if (leftovers.status !== 'skip') {
       const copy = leftovers.retained?.[0];
+      const store = leftovers.leftovers[0];
       checks.push({
         name: 'pglite_leftovers',
         status: leftovers.status,
         message: leftovers.message,
+        // #7145: the legacy copier's old store gets the same consent-gated delete as a graduation copy, after a size preview.
+        ...(!copy && store ? {
+          details: { leftovers: leftovers.leftovers, preview: ['du', '-sh', store.path] },
+          fix: {
+            argv: ['rm', '-rf', store.path], consent: ['destructive'], actor: 'agent', requires_exclusive: false,
+            verify: { argv: ['gbrain', 'doctor', '--only', 'pglite_leftovers', '--json'] }, docs: 'docs/guides/move-to-postgres.md#after-the-move',
+            why: `${store.path} is the PGLite store the engine migration left behind; the brain reads Postgres (config.json engine), so nothing uses it. Preview its size with du -sh ${store.path}; deleting it frees that disk and cannot be undone.`,
+            user_message: `Your brain moved to Postgres, but the old local PGLite copy is still at ${store.path}. Once you have a recent Postgres backup, should I delete it? It cannot be undone.`,
+          },
+        } : {}),
         ...(copy ? {
           details: { retained: leftovers.retained },
           fix: {
@@ -472,6 +537,15 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     // Best-effort filesystem-hygiene check; never block doctor (a missing/
     // unparseable config.json lands here and skips, same fail-open posture).
   }
+  // GBRA-108: cron lines (and scripts they run) that call gbrain without GBRAIN_HOME (doctor/checks/cron-gbrain-home.ts).
+  // No environment gate: a container can run cron too; without a crontab the check emits nothing.
+  try {
+    const { cronGbrainHomeCheck } = await import('./cron-gbrain-home.ts');
+    const cron = cronGbrainHomeCheck(await localProbe(entryDeadlineAt, 'crontab', ['-l']), process.env.GBRAIN_HOME || undefined);
+    if (cron) checks.push(cron);
+  } catch {
+    // Best-effort: an unreadable crontab never blocks doctor.
+  }
   // Engine graduation state (filesystem only; src/commands/doctor/checks/engine-graduation.ts).
   try {
     const { graduationStateCheck } = await import('./engine-graduation.ts');
@@ -485,7 +559,7 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
 
 export const homeDirInWorktreeEntry: DoctorEntry = {
   name: 'home_dir_in_worktree',
-  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'graduation_interrupted'],
+  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'cron_gbrain_home', 'graduation_interrupted'],
   run: runHomeDirInWorktree,
 };
 
@@ -497,7 +571,9 @@ async function runDefaultSourcePath(ctx: DoctorContext): Promise<Check[]> {
   // default.local_path is the DESIGNED fallback topology (pages nest under
   // sync.repo_path), so this only warns when that fallback demonstrably
   // fails: file-backed default pages with no resolvable root, or a
-  // sync.repo_path the #2018 leak guard silently skips. Logic lives in
+  // sync.repo_path the #2018 leak guard silently skips. #7630: it also warns
+  // on any relative stored path (default local_path, sync.repo_path, or another
+  // source's local_path). Logic lives in
   // doctor/checks/default-source-path.ts (module-dir rule).
   if (engine !== null) try {
     const { defaultSourceLocalPathCheck } = await import('./default-source-path.ts');

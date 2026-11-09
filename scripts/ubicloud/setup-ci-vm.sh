@@ -24,20 +24,22 @@
 # the packages are already installed, so apt is skipped and the image pulls
 # only confirm the baked images are current.
 #
-# Knobs: SLOTS (default nproc), BUN_VERSION (default 1.4.2), GITLEAKS=0|1,
+# Knobs: SLOTS (default nproc), BUN_VERSION (default 1.4.4), GITLEAKS=0|1,
 # CHECKOUT (default .), CHECKOUT_MARKER (default: none, checkout present),
+# PG_IMAGE (default pgvector/pgvector:pg16; ci-ubicloud.ts --pg-image, e.g.
+# pgvector/pgvector:pg15 for the #7112 compatibility audit),
 # PREPARE_IMAGE=1 (install packages and pull images only, then reset
 # cloud-init so the stopped VM can be captured as a machine image).
 set -euo pipefail
 
 SLOTS="${SLOTS:-$(nproc)}"
-BUN_VERSION="${BUN_VERSION:-1.4.2}"
+BUN_VERSION="${BUN_VERSION:-1.4.4}"
 GITLEAKS="${GITLEAKS:-0}"
 CHECKOUT="${CHECKOUT:-.}"
 CHECKOUT_MARKER="${CHECKOUT_MARKER:-}"
 GITLEAKS_VERSION=8.30.1
 APT_PACKAGES=(git ca-certificates python3 procps postgresql-client jq nodejs gcc libc6-dev)
-PG_IMAGE=pgvector/pgvector:pg16
+PG_IMAGE="${PG_IMAGE:-pgvector/pgvector:pg16}"
 PGBOUNCER_IMAGE=edoburu/pgbouncer:latest
 # Throwaway password of the loopback-only test servers (docker-compose.ci.yml uses the same).
 PG_PASSWORD=postgres
@@ -99,7 +101,7 @@ fi
   install_system
   sudo docker network create gbrain-ci >/dev/null 2>&1 || true
   for i in $(seq 1 "$SLOTS"); do
-    sudo docker run -d --name "pg-$i" --network gbrain-ci \
+    sudo docker run -d --name "pg-$i" --network gbrain-ci --shm-size=1g \
       -p "127.0.0.1:$((15432 + i)):5432" \
       -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=gbrain_test \
       "$PG_IMAGE" -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
@@ -175,6 +177,13 @@ for i in $(seq 1 "$SLOTS"); do
     || { echo "[setup-ci-vm] postgres slot $i never became ready" >&2; sudo docker logs "pg-$i" | tail -20 >&2; exit 1; }
 done
 step "$SLOTS postgres + pgbouncer slots ready"
+
+# The pg-arms lane's database: empty like the unit-postgres-arms job's service
+# database, and apart from the E2E schema bootstrapped below.
+for i in $(seq 1 "$SLOTS"); do
+  PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$((15432 + i))" -U postgres -d gbrain_test -qc 'CREATE DATABASE gbrain_arms_test' \
+    || { echo "[setup-ci-vm] could not create gbrain_arms_test on slot $i" >&2; exit 1; }
+done
 
 # Initialize every slot's schema up front, exactly like e2e.yml's "Bootstrap
 # isolated E2E schema" step, so no file depends on whichever file happens to

@@ -1,5 +1,5 @@
 import { submitPageMutation } from '../persistence/page-mutations.ts';
-import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
  * Timeline operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `timelineOperations` below
@@ -13,6 +13,8 @@ import { opTransport } from './op-fix.ts';
 import { readPolicyOpts } from './context.ts';
 import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
 import { stampRowTrust } from '../eligibility/stamp.ts';
+import { quoteTimelineRows } from './timeline-quote.ts';
+import { unquoteTranscriptText } from '../search/transcript-quote.ts';
 import {
   enforceSubagentSlugFence,
   enforceClientSlugFence,
@@ -20,18 +22,20 @@ import {
 
 // --- Timeline ---
 
+
 const add_timeline_entry: Operation = {
   name: 'add_timeline_entry',
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'Append a dated entry to a page timeline. Replaying the same entry changes nothing. A page\'s Timeline section needs no call.',
+  description: 'Append a dated entry to a page timeline. Replays change nothing; the Timeline section needs no call. To change or remove one, edit its bullet via edit_page with expected_revision.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     slug: { type: 'string', description: 'Page slug.', required: true },
     date: { type: 'string', required: true, description: 'YYYY-MM-DD.' },
     summary: { type: 'string', required: true, description: 'One line.' },
-    detail: { type: 'string', description: 'Longer text.' },
-    source: { type: 'string', description: 'Provenance slug or URL.' },
+    detail: { type: 'string', description: 'Details.' },
+    source: { type: 'string', description: 'Source slug or URL.' },
   },
   mutating: true,
   scope: 'write',
@@ -61,7 +65,9 @@ const add_timeline_entry: Operation = {
     if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
       throw badDate(`Invalid calendar date "${date}"`);
     }
-    return submitPageMutation(ctx, { operation: 'add_timeline_entry', params: p });
+    // #8377: an entry an agent copied out of a quoted read (get_timeline, chronicle) is stored without the fence, so its replay key matches; #8384: its source too.
+    const unquote = (v: unknown) => typeof v === 'string' && ctx.remote !== false ? unquoteTranscriptText(v, String(p.slug).toLowerCase()) : v;
+    return submitPageMutation(ctx, { operation: 'add_timeline_entry', params: { ...p, summary: unquote(p.summary), ...(p.detail !== undefined ? { detail: unquote(p.detail) } : {}), ...(p.source !== undefined ? { source: unquote(p.source) } : {}) } });
   },
   cliHints: { name: 'timeline-add', positional: ['slug', 'date', 'summary'] },
 };
@@ -71,7 +77,7 @@ const get_timeline: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'Get timeline entries for a page, optionally filtered by date window',
+  description: 'Get timeline entries for a page, optionally filtered by date window. To change or remove an entry, edit its bullet in the page\'s Timeline section with edit_page (expected_revision from get_page include_content:true): the row follows the page.',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose timeline entries to return.' },
     after: { type: 'string', description: 'Return entries on or after this date (YYYY-MM-DD)' },
@@ -99,7 +105,7 @@ const get_timeline: Operation = {
       ...(limit !== undefined ? { limit } : {}),
       eligibility,
     });
-    return stampRowTrust(ctx.engine, 'timeline_entries', entries, e => (e as { id: number }).id);
+    return quoteTimelineRows(ctx, p.slug as string, await stampRowTrust(ctx.engine, 'timeline_entries', entries, e => (e as { id: number }).id));
   },
   scope: 'read',
   cliHints: { name: 'timeline', positional: ['slug'] },

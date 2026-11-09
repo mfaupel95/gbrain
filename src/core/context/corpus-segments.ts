@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { WindowTurn } from './entity-salience.ts';
+import type { CorpusFileStat, CorpusProgress } from './corpus-windows.ts';
 import { toCorpusText, type ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { mapOpenclawLine } from '../transcripts/openclaw.ts';
 import { stripPastedContent, stripPastedContentFromCorpus } from '../transcripts/pasted-content.ts';
@@ -131,6 +132,13 @@ export const SEAT_SIDECAR_SUFFIX = '.seat.json';
 
 export function seatFileName(sessionId: string): string {
   return `${safeIdComponent(sessionId)}${SEAT_SIDECAR_SUFFIX}`;
+}
+
+/** #8064 per-session speaker sidecar (context/session-speaker.ts owns its content): present only for agent-launched sessions. */
+export const SPEAKER_SIDECAR_SUFFIX = '.speaker.json';
+
+export function speakerFileName(sessionId: string): string {
+  return `${safeIdComponent(sessionId)}${SPEAKER_SIDECAR_SUFFIX}`;
 }
 
 /** #6268: the per-session source record in the spool (context/corpus-source.ts owns its content and lock). */
@@ -614,8 +622,158 @@ export const CORPUS_UNINGESTED_RETENTION_FACTOR = 3;
 /** Completion sidecar suffix (sweep.ts CORPUS_INGESTED_SUFFIX; duplicated to stay engine-free). */
 const INGESTED_SUFFIX = '.ingested';
 
+/**
+ * #6786: `.ingested` skip reasons that record a state of the extracting
+ * process (no servable extraction model), not anything about the file. A
+ * sidecar carrying one is not a completion: selection, the HTTP drain, the
+ * doctor backlog and retention GC all treat the file as pending, and the
+ * sweep extracts it once a model serves (pre-#6786 builds wrote these).
+ */
+export const CORPUS_NON_TERMINAL_SKIPS: readonly string[] = ['chat_unavailable'];
+
+/**
+ * #6786: what `<full>.ingested` says. `absent` (no sidecar), `unavailable`
+ * (a non-terminal skip), or `final` (a completion; an unreadable or
+ * non-JSON sidecar counts as one, as every build before #6786 did). Never throws.
+ */
+export function corpusSidecarState(full: string): 'absent' | 'unavailable' | 'final' {
+  let text: string;
+  try {
+    text = readFileSync(full + INGESTED_SUFFIX, 'utf8');
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'final';
+  }
+  try {
+    const skipped = (JSON.parse(text) as { skipped?: unknown } | null)?.skipped;
+    return typeof skipped === 'string' && CORPUS_NON_TERMINAL_SKIPS.includes(skipped) ? 'unavailable' : 'final';
+  } catch {
+    return 'final';
+  }
+}
+
+function isFileStat(v: unknown): v is CorpusFileStat {
+  const s = v as CorpusFileStat;
+  return !!s && typeof s === 'object' && Number.isFinite(s.size) && Number.isFinite(s.mtime_ms) && Number.isFinite(s.ino);
+}
+
+/** #5887 `.progress` parse (context/corpus-windows.ts); null when unparseable (replayed safely). */
+export function parseCorpusProgress(text: string): CorpusProgress | null {
+  let p: CorpusProgress;
+  try { p = JSON.parse(text) as CorpusProgress; } catch { return null; }
+  if (!p || typeof p !== 'object' || p.version !== 1 || !Number.isSafeInteger(p.generation)) return null;
+  if (!Array.isArray(p.turns) || !p.turns.every((t) => t && typeof t.sha256 === 'string')) return null;
+  if (p.continuation !== null && !(p.continuation && typeof p.continuation.turn_sha256 === 'string'
+    && Number.isSafeInteger(p.continuation.stripped_offset))) return null;
+  if (p.finished !== null && !isFileStat(p.finished)) return null;
+  if (!p.totals || !Array.isArray(p.entity_slugs)) return null;
+  if (p.source != null && !(typeof p.source.id === 'string' && typeof p.source.incarnation === 'string')) return null;
+  return p;
+}
+
+/**
+ * How a corpus file stands (#6786: the one classifier for sweep selection,
+ * the under-claim re-check and retention GC):
+ *   'pending'        — no `.ingested` sidecar;
+ *   'unavailable'    — the sidecar records a non-terminal skip: pending;
+ *   'done'           — its `.progress` finished this exact file (stat match);
+ *   'changed'        — rewritten since; re-enter (turn hashes decide resume);
+ *   'legacy'         — finished before `.progress` existed and not rewritten
+ *                      since (the sidecar is newer than the file): adopt;
+ *   'legacy_changed' — finished before `.progress` existed, rewritten after.
+ * Writeback turn files are immutable single turns: a final sidecar is 'done'.
+ * Only 'done' and 'legacy' are finished. Stat and progress read errors throw.
+ */
+export type CorpusFileCompletion = 'pending' | 'unavailable' | 'done' | 'changed' | 'legacy' | 'legacy_changed';
+
+export function corpusFileCompletion(full: string, name: string): CorpusFileCompletion {
+  const sidecar = corpusSidecarState(full);
+  if (sidecar !== 'final') return sidecar === 'absent' ? 'pending' : 'unavailable';
+  if (parseWbFileName(name)) return 'done';
+  const st = statSync(full);
+  let progress: CorpusProgress | null = null;
+  try {
+    progress = parseCorpusProgress(readFileSync(full + CORPUS_PROGRESS_SUFFIX, 'utf8'));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    return statSync(full + INGESTED_SUFFIX).mtimeMs >= st.mtimeMs ? 'legacy' : 'legacy_changed';
+  }
+  if (!progress) return statSync(full + INGESTED_SUFFIX).mtimeMs >= st.mtimeMs ? 'legacy' : 'legacy_changed';
+  const f = progress.finished;
+  return f && f.size === st.size && f.mtime_ms === st.mtimeMs && f.ino === st.ino ? 'done' : 'changed';
+}
+
+export function corpusFileFinished(state: CorpusFileCompletion): boolean {
+  return state === 'done' || state === 'legacy';
+}
+
+/** Whether a corpus file still waits for extraction, by `corpusFileCompletion`; a file that is gone does not. */
+export function corpusFileAwaitsExtraction(full: string, name: string): boolean {
+  try {
+    return !corpusFileFinished(corpusFileCompletion(full, name));
+  } catch {
+    return existsSync(full);
+  }
+}
+
+/**
+ * #6785: per-file record of the one corpus window (or writeback turn) whose
+ * extraction keeps failing after the model call. Written under the file's
+ * `.in-progress` claim by context/corpus-windows.ts; removed when that
+ * window commits, or by `gbrain sweep --retry-failed --apply`.
+ */
+export const CORPUS_FAILURE_SUFFIX = '.failures.json';
+/** Failed attempts after which a window is not retried until an operator retry or one extraction-config change. */
+export const CORPUS_WINDOW_FAILURE_CAP = 5;
+
+export interface CorpusFailureRecord {
+  version: 1;
+  /** The failing window's start (`<turn sha256>@<offset>`), or `turn` for a writeback turn file. */
+  key: string;
+  source_incarnation: string | null;
+  count: number;
+  first_at: number;
+  last_at: number;
+  /** Error code or class of the last failure; never its message. */
+  last_code: string;
+  /** extraction-config fingerprint (model, provider, key presence) at the last failure. */
+  fingerprint: string | null;
+  /** True once a fingerprint change re-armed a capped window; a second change does not. */
+  rearmed: boolean;
+}
+
+/** The failure record, or null when absent or unparseable. Never throws. */
+export function readCorpusFailure(full: string): CorpusFailureRecord | null {
+  try {
+    const r = JSON.parse(readFileSync(full + CORPUS_FAILURE_SUFFIX, 'utf8')) as CorpusFailureRecord;
+    if (!r || r.version !== 1 || typeof r.key !== 'string' || !Number.isSafeInteger(r.count) || r.count < 1
+      || !Number.isFinite(r.last_at) || !Number.isFinite(r.first_at) || typeof r.last_code !== 'string'
+      || !(r.source_incarnation === null || typeof r.source_incarnation === 'string')
+      || !(r.fingerprint === null || typeof r.fingerprint === 'string') || typeof r.rearmed !== 'boolean') return null;
+    return r;
+  } catch {
+    return null;
+  }
+}
+
+/** Every corpus `.txt` in `dir` with a failure record. Missing dir = empty; never throws. */
+export function listCorpusFailures(dir: string): Array<{ name: string; full: string; record: CorpusFailureRecord }> {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const present = new Set(names);
+  const out: Array<{ name: string; full: string; record: CorpusFailureRecord }> = [];
+  for (const name of names.filter((n) => n.endsWith('.txt') && present.has(n + CORPUS_FAILURE_SUFFIX)).sort()) {
+    const record = readCorpusFailure(join(dir, name));
+    if (record) out.push({ name, full: join(dir, name), record });
+  }
+  return out;
+}
+
 export interface CorpusBacklog {
-  /** `.txt` files with no `.ingested` sidecar. */
+  /** `.txt` files not finished by `corpusFileCompletion` (no final sidecar, or windows left). */
   pending: number;
   /** mtime of the oldest pending file, or null with none pending. */
   oldestPendingMtimeMs: number | null;
@@ -634,7 +792,8 @@ export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()
   }
   const present = new Set(names);
   for (const name of names) {
-    if (!name.endsWith('.txt') || present.has(name + INGESTED_SUFFIX)) continue;
+    if (!name.endsWith('.txt')) continue;
+    if (present.has(name + INGESTED_SUFFIX) && !corpusFileAwaitsExtraction(join(dir, name), name)) continue;
     let mtimeMs: number;
     try {
       mtimeMs = statSync(join(dir, name)).mtimeMs;
@@ -649,21 +808,23 @@ export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()
 }
 
 /**
- * Retention GC for corpus turn files: an extracted file (`.ingested`
- * sidecar present) goes at `retentionMs`; one nothing has extracted stays
- * until `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
+ * Retention GC for corpus turn files: a finished file (corpusFileCompletion
+ * 'done' or 'legacy') goes at `retentionMs`; one nothing has finished
+ * extracting (no sidecar, a non-terminal skip such as `chat_unavailable`
+ * #6786, windows still pending, or rewritten since) stays until
+ * `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
  * Best-effort per file; never throws.
  */
 export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.now()): void {
   try {
-    const names = readdirSync(dir);
-    const present = new Set(names);
-    for (const name of names) {
+    for (const name of readdirSync(dir)) {
       if (!name.endsWith('.txt')) continue;
-      const ageLimit = present.has(name + INGESTED_SUFFIX) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
       const p = join(dir, name);
       try {
-        if (statSync(p).mtimeMs < now - ageLimit) rmSync(p, { force: true });
+        const age = now - statSync(p).mtimeMs;
+        if (age <= retentionMs) continue;
+        const ageLimit = corpusFileFinished(corpusFileCompletion(p, name)) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
+        if (age > ageLimit) rmSync(p, { force: true });
       } catch {
         /* per-file best effort */
       }
@@ -679,20 +840,27 @@ export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.n
  * gone (previously they lived forever), and a session's seat sidecar once no
  * `.txt` of that session remains (after a grace window, so a sidecar written
  * just ahead of its corpus file survives). Best-effort per file; never throws.
+ * #6611: a session is live while a `.txt` of it exists in ANY of
+ * `liveSessionDirs` (the hook passes the spool and the legacy top level: the
+ * source record is always frozen into the spool, a legacy session's `.txt`
+ * lives in the top level).
  */
 export function gcCorpusArtifacts(
   dir: string,
   maxAgeMs: number,
   sidecarSuffixes: string[],
+  liveSessionDirs: string[] = [dir],
 ): void {
   try {
     const cutoff = Date.now() - maxAgeMs;
     const names = readdirSync(dir);
-    const liveSessions = new Set(names.filter((n) => n.endsWith('.txt')).map(corpusFileSessionId));
+    const liveSessions = new Set(liveSessionDirs.flatMap((d) => {
+      try { return d === dir ? names : readdirSync(d); } catch { return []; }
+    }).filter((n) => n.endsWith('.txt')).map(corpusFileSessionId));
     for (const name of names) {
       const p = join(dir, name);
       try {
-        const perSession = [SEAT_SIDECAR_SUFFIX, SESSION_SOURCE_SUFFIX].find((suffix) => name.endsWith(suffix));
+        const perSession = [SEAT_SIDECAR_SUFFIX, SPEAKER_SIDECAR_SUFFIX, SESSION_SOURCE_SUFFIX].find((suffix) => name.endsWith(suffix));
         if (perSession) {
           if (!liveSessions.has(name.slice(0, -perSession.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
             rmSync(p, { force: true });

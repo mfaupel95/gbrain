@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChunkInput } from '../src/core/types.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded } from '../src/core/embedding-invalidation.ts';
+import { hasSignatureDrift, invalidateStaleSignatureEmbeddingsGuarded } from '../src/core/embedding-invalidation.ts';
 import { sealPageTextProjection } from '../src/core/page-state/projections.ts';
 import { stampIfPageProvenanceComplete } from '../src/core/embed-stale.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
@@ -191,5 +191,111 @@ describe('embedding_signature stale semantics', () => {
       `SELECT embedding_signature FROM pages WHERE slug = 'p' AND source_id = 'default'`,
     );
     expect(rows[0]?.embedding_signature).toBe('openai:m:1536');
+  });
+});
+
+describe('windowed stale-signature invalidation (#7148)', () => {
+  const model = 'ollama:example-model:latest';
+
+  /** A mixed corpus: drifted, current-under-an-old-stamp, matching, grandfathered, embed_skip, other-source and archived-source pages. */
+  async function seedCorpus(): Promise<string> {
+    const signature = model + ':' + colDim;
+    await engine.executeRaw("INSERT INTO sources (id, name, config) VALUES ('other', 'other', '{}'::jsonb), ('shelf', 'shelf', '{}'::jsonb) ON CONFLICT (id) DO NOTHING");
+    const page = async (slug: string, stamp: string | null, chunkModel: string, sourceId = 'default') => {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: '# ' + slug }, { sourceId });
+      await installFixtureChunks(engine, slug, Array.from({ length: 3 }, (_, i) => ({
+        chunk_index: i, chunk_text: slug + ' chunk ' + i, chunk_source: 'compiled_truth' as const,
+        embedding: new Float32Array(colDim).fill(0.1), model: chunkModel,
+      })), { sourceId });
+      await engine.executeRaw('UPDATE pages SET embedding_signature = $1 WHERE slug = $2 AND source_id = $3', [stamp, slug, sourceId]);
+    };
+    for (let i = 0; i < 7; i++) await page('drift-' + i, 'old:model:1', 'old:model');
+    await page('current-old-stamp', 'old:model:1', model);
+    await page('matching', signature, model);
+    await page('legacy-old', null, 'old:model');
+    await page('legacy-current', null, model);
+    await page('skipped', 'old:model:1', 'old:model');
+    await engine.executeRaw("UPDATE pages SET frontmatter = frontmatter || '{\"embed_skip\": true}'::jsonb WHERE slug = 'skipped'");
+    await page('elsewhere', 'old:model:1', 'old:model', 'other');
+    await page('shelved', 'old:model:1', 'old:model', 'shelf');
+    await engine.executeRaw("UPDATE sources SET archived = true WHERE id = 'shelf'");
+    for (let i = 7; i < 10; i++) await page('drift-' + i, 'old:model:1', 'old:model');
+    return signature;
+  }
+
+  async function snapshot(): Promise<string[]> {
+    const rows = await engine.executeRaw<{ row: string }>(
+      "SELECT p.source_id || '/' || p.slug || ' ' || COALESCE(p.embedding_signature, '-') || ' ' || string_agg(CASE WHEN cc.embedding IS NULL THEN '0' ELSE '1' END, '' ORDER BY cc.chunk_index) AS row FROM pages p JOIN content_chunks cc ON cc.page_id = p.id GROUP BY p.id ORDER BY p.source_id, p.slug");
+    return rows.map(r => r.row);
+  }
+
+  for (const includeNullSignature of [false, true]) {
+    for (const sourceId of [undefined, 'default']) {
+      test('every page window gives the one-statement result (null=' + includeNullSignature + ', source=' + (sourceId ?? 'all') + ')', async () => {
+        const results: Array<{ invalidated: number; rows: string[] }> = [];
+        for (const pageBatch of [undefined, 1, 2, 5]) {
+          await resetPgliteState(engine);
+          const signature = await seedCorpus();
+          const invalidated = await invalidateStaleSignatureEmbeddingsGuarded(engine, { signature, includeNullSignature, ...(sourceId && { sourceId }), ...(pageBatch && { pageBatch }) });
+          results.push({ invalidated, rows: await snapshot() });
+        }
+        const expected = (includeNullSignature ? 33 : 30) + (sourceId ? 0 : 3);
+        expect(results[0]!.invalidated).toBe(expected);
+        for (const r of results.slice(1)) expect(r).toEqual(results[0]!);
+        const rows = results[0]!.rows;
+        expect(rows).toContain('default/current-old-stamp ' + model + ':' + colDim + ' 111');
+        expect(rows).toContain('default/drift-3 old:model:1 000');
+        expect(rows).toContain('default/skipped old:model:1 111');
+        expect(rows).toContain('shelf/shelved old:model:1 111');
+        expect(rows).toContain('default/legacy-current ' + (includeNullSignature ? model + ':' + colDim : '-') + ' 111');
+        expect(rows).toContain('default/legacy-old - ' + (includeNullSignature ? '000' : '111'));
+        expect(rows).toContain('other/elsewhere old:model:1 ' + (sourceId ? '111' : '000'));
+      });
+    }
+  }
+
+  test('rejects a page window below one', async () => {
+    await expect(invalidateStaleSignatureEmbeddingsGuarded(engine, { signature: 'm:1', pageBatch: 0 })).rejects.toThrow(/page batch/);
+  });
+
+  test('hasSignatureDrift answers what the two-count pre-checks answered', async () => {
+    const signature = model + ':' + colDim;
+    const cases: Array<[string, (s: string) => Promise<void>]> = [
+      ['empty', async () => {}],
+      ['drifted', async s => { await seedEmbedded(s, 'x', 'old:model:1'); }],
+      ['matching', async s => { await seedEmbedded(s, 'x', signature); }],
+      ['legacy', async s => { await seedEmbedded(s, 'x', null); }],
+      ['unembedded-drifted', async s => {
+        await seedEmbedded(s, 'x', 'old:model:1');
+        await engine.executeRaw('UPDATE content_chunks SET embedding = NULL');
+      }],
+      ['skipped', async s => {
+        await seedEmbedded(s, 'x', 'old:model:1');
+        await engine.executeRaw("UPDATE pages SET frontmatter = frontmatter || '{\"embed_skip\": true}'::jsonb");
+      }],
+      ['deleted', async s => {
+        await seedEmbedded(s, 'x', 'old:model:1');
+        await engine.softDeletePage(s, { sourceId: 'default' });
+      }],
+    ];
+    const seen: Record<string, boolean[]> = {};
+    for (const [name, seed] of cases) {
+      await resetPgliteState(engine);
+      await seed('case-' + name);
+      const wide = await engine.countStaleChunks({ signature });
+      const wideNull = await engine.countStaleChunks({ signature, includeNullSignature: true });
+      const nullOnly = await engine.countStaleChunks();
+      const answers = [
+        await hasSignatureDrift(engine, { signature }),
+        await hasSignatureDrift(engine, { signature, includeNullSignature: true }),
+        await hasSignatureDrift(engine, { signature, nullSignatureOnly: true }),
+        await hasSignatureDrift(engine, { signature, sourceId: 'default' }),
+        await hasSignatureDrift(engine, { signature, sourceId: 'other' }),
+      ];
+      expect(answers).toEqual([wide - nullOnly > 0, wideNull - nullOnly > 0, wideNull - wide > 0, wide - nullOnly > 0, false]);
+      seen[name] = answers;
+    }
+    expect(seen.drifted).toEqual([true, true, false, true, false]);
+    expect(seen.legacy).toEqual([false, true, true, false, false]);
   });
 });

@@ -13,6 +13,8 @@ This tutorial picks up where the [personal brain tutorial](personal-brain.md) le
 **Time:** about 90 more minutes on top of the personal-brain install.
 **Cost:** under $100 a month sustained for a 25-person company.
 
+> **Want a team brain without operating one?** [gbrain.io](https://gbrain.io/?ref=company-brain) is hosted GBrain built for exactly this: one brain the whole team prompts together, accounts connected once with a permission level for each AI, and pricing per workspace rather than per person. Keep reading to deploy and run it yourself.
+
 If you haven't done the personal-brain install yet, [start there first](personal-brain.md). Come back when you've got the agent responding to you on Telegram. This tutorial assumes that's already working.
 
 I'm Garry Tan. I built GBrain to run my own AI agents at Y Combinator. It runs as a company brain too: parallel sync across team sources, per-user OAuth scoping, leak-free isolation across every read path. This is the recipe I'd run if I were standing it up for a 10-50 person company today.
@@ -105,11 +107,71 @@ You can also keep the existing personal-brain repo as one of the sources. Just p
 
 ### Two scoping models (pick the one that matches your shape)
 
-There are two ways to scope teammates' access. They suit different deployment shapes.
+There are three ways to scope teammates' access. They suit different deployment shapes.
 
 **Model A: separate sources with OAuth scoping (recommended for true multi-user with different AI clients).** What this tutorial walks you through. Each teammate gets their own OAuth client, which carries `--source` + `--federated-read` flags. The brain refuses cross-source reads at the SQL layer; isolation is database-enforced. Each teammate can run their own MCP-aware client (Claude Code, Cursor, their own OpenClaw, etc.) and the scoping holds.
 
-**Model B: one source, directory-based per-person scoping (simpler for one-agent-serves-everyone setups).** The shape I actually run in production: a single source called `default`, with a `partners/<slug>/` convention inside it (e.g. `partners/alice-example/`, `partners/bob-example/`). Each partner gets their own subdirectory holding their personal pages: `partners/alice-example/USER.md`, `partners/alice-example/concepts/`, `partners/alice-example/sources/`, etc. This is the right model when ONE agent (yours) serves everyone over Telegram or a single shared interface. It's simpler ops, no per-user OAuth. **Write scoping within the shared source can be server-enforced:** register each per-person client with `--bound-slug-prefixes partners/alice-example/` and every slug-mutating write outside that prefix is rejected with `permission_denied`. Without the binding, the scoping is convention-only (the agent polices itself). Read scoping stays source-granular in both models — within a shared source, everyone entitled to the source can read every folder.
+**Model B: one source, directory-based per-person scoping (simpler for one-agent-serves-everyone setups).** The shape I actually run in production: a single source called `default`, with a `partners/<slug>/` convention inside it (e.g. `partners/alice-example/`, `partners/bob-example/`). Each partner gets their own subdirectory holding their personal pages: `partners/alice-example/USER.md`, `partners/alice-example/concepts/`, `partners/alice-example/sources/`, etc. This is the right model when ONE agent (yours) serves everyone over Telegram or a single shared interface. It's simpler ops, no per-user OAuth. **Write scoping within the shared source can be server-enforced:** register each per-person client with `--bound-slug-prefixes partners/alice-example/` and every slug-mutating write outside that prefix is rejected with `permission_denied`. Without the binding, the scoping is convention-only (the agent polices itself). Read scoping stays source-granular in both models — within a shared source, everyone entitled to the source can read every folder (Model C below narrows that per page or per folder).
+
+**Model C: one source, per-member reads.** Teammates share one source, and a page that names its readers in frontmatter is read only by them. Bind each teammate's token or OAuth client to a member, then put `readable_by` on the pages that need it:
+
+```yaml
+---
+title: Renewal notes
+readable_by: [alice-example, group:team-a]
+---
+```
+
+```bash
+gbrain access member add alice-example --groups team-a
+gbrain access member add bob-example
+gbrain auth rescope --token alice-laptop --member alice-example
+gbrain access check --token alice-laptop          # what this credential can read, axis by axis
+gbrain access who-can-read notes/renewal-notes    # the members and groups a page admits
+```
+
+A credential bound with `--member` whose write source is `default` (a token with no `--sources` or `--sources default`, or an OAuth client left at its registration default) writes where every credential without a source grant reads, so a page it creates is written with `readable_by: [member:<id>]` and only that member reads it; it keeps those readers when the member rewrites it without the field, and the member shares it by naming readers (`readable_by: [alice-example, group:team-a]`). An edit to an existing page that names no readers leaves it shared, `remember` facts go on the member's own page as before, and `POST /ingest` refuses such a credential. Pages derived from such a page (extracted atoms, chronicle events, `derived_from` pages, and a synthesized concept that uses it) follow the rule for pages with readers and are readable by no remote caller, the writer included. A page that teammates should read, such as a shared `people/` or `companies/` entity page or a page in a folder a rule already scopes to a group, names its readers when it is created; otherwise the first member to create a slug keeps it, and every other remote credential writing that slug (another member, an unbound token, a shared agent) gets `page_not_found`. The operator widens such a page from the brain host by adding `readable_by` to it. A member-bound `put_page` over a page deleted within the last 72 hours is a create, so it is kept to the member too. A credential whose write source is another source (`--sources private-alice-example,default`, first id the write source) keeps writing exactly what it sends. Earlier releases wrote these pages with no readers, so other members and unbound tokens read them; run `gbrain access who-can-read <slug>` on pages your members wrote and add `readable_by` on the host where needed.
+
+A remote caller whose credential is bound to a listed member (directly or through a group) reads the page on every read path; every other remote caller, including an unbound token, an unbound stdio server, a bot with `--private-pages granted-sources` and an operator escape hatch (`GBRAIN_REMOTE_PRIVATE_PAGES=1`, `search.remote_private_pages=visible`), gets the same `not_found` as for a page that does not exist. `readable_by` only narrows: a `visibility: private` page stays private to a listed member unless the member's credential also has `--private-pages granted-sources`. What every designation means for each kind of caller is in [access designations](../guides/access-designations.md). A malformed `readable_by` reads as nobody. A page derived from a restricted page (an extracted atom, a synthesized concept, a chronicle event) is readable by no remote caller. The local CLI is unchanged; `--as <member>` previews one member's view. Pages that already carried `readable_by` before you upgraded read as nobody until `gbrain repair access` (preview, then `--apply`) derives their readers. This works the same on a repo-less brain: members, groups and bindings live in the database.
+
+**Folder rules: keep a whole folder to some members.** Instead of tagging every page, give a prefix its readers. On a repo-less brain (the default install) the rules live in the database:
+
+```bash
+gbrain access rule add --prefix partners/alice-example/ --readers alice-example,group:team-a --source team-a   # preview
+gbrain access rule add --prefix partners/alice-example/ --readers alice-example,group:team-a --source team-a --yes
+gbrain access rule list --source team-a           # store, revisions, applied rules, anything held or pending
+```
+
+A remote read of a page under a rule needs the caller's member to be on every rule covering it and on the page's own `readable_by`; hatches, grants and `--as` never relax it. Narrowing applies at once. Moving a rule's prefix restricts the new folder at once and keeps the old folder under the old readers until approval. A change that widens (removing a rule or a reader, or releasing a moved rule's old folder) is held until `gbrain access apply --source team-a` previews who would gain access and `gbrain access apply --source team-a --yes --expect <plan_hash>` approves it. If an apply stops halfway, its prefixes read as nobody until `gbrain access resume --source team-a`. `gbrain access rule history` and `rule revert --to <revision>` work over the revision log, and `gbrain export` carries the applied rules so `gbrain import` installs them before any page.
+
+Renaming a page into a ruled folder restricts it at once, and the atoms, concepts, chronicle events and `derived_from` pages made from it follow it, through later renames too. A page that later takes the old slug does not inherit them: they stay under the moved page's rules.
+
+On a git-backed source the same rules live in `.gbrain/access.yml`: `rule add|rm` commit it through `gbrain git commit-push`, a hand edit takes effect when you commit it and run `gbrain sync`, and a widening commit stays held until `gbrain access apply` approves it (recorded in `.gbrain/access.approved`). A source keeps the store it had when its first rule was created; `gbrain access rule migrate --source <id>` (preview, then `--yes`) moves the rules when you attach or remove a repo. A database rebuilt from the repo replays every committed `access.yml` since the last approval, so a removal that was held stays held; the source reads as nobody remotely until that replay finishes, and a shallow clone stays that way until `git fetch --unshallow`. Remote callers cannot write `.gbrain/`.
+
+**Shared agents: one agent, each person's view.** When one agent serves everyone (a Slack or Telegram bot), its harness code names whom each turn serves, and the agent reads only what all of them may read. List the people its credential may act for, then have the harness send the audience on every MCP request:
+
+```bash
+gbrain auth rescope --token team-bot --may-act-for alice-example,bob-example,group:team-a,guest
+gbrain access check --token team-bot --as alice-example,guest   # what that audience reads, and whether may_act_for covers it
+```
+
+```text
+X-Gbrain-On-Behalf-Of: alice-example                  # a DM with Alice (gbrain serve --http)
+X-Gbrain-On-Behalf-Of: alice-example, bob-example, guest   # a channel with a non-member in it
+"_meta": { "on_behalf_of": ["alice-example"] }          # request-level _meta, a sibling of arguments (stdio and HTTP)
+```
+
+A page is returned only when every audience entry may read it (`guest` reads no restricted page, `group:team-a` counts as one entry for a large channel), within the agent's own source grant. The agent's `--private-pages granted-sources` and the operator hatches relax `visibility: private` only when the audience is exactly one member; a channel never sees a private page. The audience is read on every call, so a DM followed by a channel turn gets each its own view. An entry outside `may_act_for` refuses `on_behalf_of_not_permitted` (the operator widens the list with the command it prints), a disabled or unknown member refuses `on_behalf_of_unknown_member`, and an audience inside tool arguments, where conversation text could set it, refuses `on_behalf_of_in_arguments`. Every response carries the applied view in `_meta.access`, and `whoami` returns it as `access.applied` for a model whose harness hides `_meta`. Writes and `submit_agent` jobs keep the audience they were made for and re-check it before they commit or call a tool. A local stdio server takes its list from `gbrain config set mcp.stdio_may_act_for <list>`. `*` permits any member, lets the harness learn which member and group ids exist from the refusals, and `gbrain doctor` warns about it (`access_may_act_for_wildcard`). Each assertion is appended to `~/.gbrain/audit/access-audience-YYYY-Www.jsonl`. Where each person runs their own agent, a credential bound to that person's member stays the simpler setup. Shared agents work the same on a repo-less brain: `may_act_for` and the audience are database and request state.
+
+**A trusted system that names the person (QM).** When a system such as QM already authenticates each person, it names one person per call instead of an audience. Grant its client-credentials client the attest right and link each person's canonical id to their member:
+
+```bash
+gbrain auth register-client qm --grant-types client_credentials --scopes "read write"
+gbrain auth rescope --client <client_id> --attest-actor qm      # default ops: get_write_request,memory_recall,memory_write
+gbrain access member link alice-example --qm U0ALICE            # --dry-run previews; unlink and links manage them
+```
+
+Each request then carries `x-qm-actor: U0ALICE`, and each attested operation runs as `alice-example` (page reads, and page writes such as `put_page` or `add_tag` when listed in `--attest-ops`), never reading `visibility: private` pages, whatever the client's own grant says. A fact the person saves (`remember`) goes on their own page `memory/members/<member>`, which names them as its only reader, so another member, the client's bare calls and an unbound credential never recall it, and no one but that member writes under `memory/members/<member>` remotely; `delta` cursors, write receipts and agent jobs (`submit_agent`, `get_agent_job`) are kept to the person the same way, and `forget` or `forget_fact` withdraws only a fact on the person's own page. QM itself calls `memory_recall` and `memory_write` ([QM guide](../guides/qm.md)). Not attestable yet, because what they read or write is not yet kept to the person: `list_write_conflicts`, `capture`, `extract_facts` and `takes_add|update|resolve|supersede`. Under the header, `tools/list` lists only the attested operations and `resources/read` is refused. An `acting_user` argument must equal the header and is stripped. A client without the right, an operation outside `--attest-ops`, or an id that is not 1-256 visible ASCII characters refuses `actor_not_attested`; an id with no link to an enabled member refuses `actor_unlinked`. Ids compare exactly, unlink and disable take effect on the next call, and queued writes and jobs re-check the link before they commit or call a tool. Links and the right are database state, so this works the same on a repo-less brain.
 
 For most company-brain installs (10+ teammates each with their own AI client), Model A is the right starting point. If you're running the fat-agent-serves-everyone pattern from the personal-brain tutorial, Model B is genuinely simpler. You can also mix: separate sources for the obviously-different ones (customer notes vs internal-only) AND a `partners/<slug>/` convention inside the shared source for per-person workspace.
 
@@ -578,7 +640,7 @@ For a 25-person company at sustained use, expect about $40 a month in embeddings
 
 ### "My teammate can't see anything"
 
-Check `gbrain auth list` on the host and confirm their client has `--source` set to a source that actually exists. Empty or null `--source` means the client falls through to the `default` source, which probably has no content if you set up three named sources.
+Check `gbrain auth list` on the host and confirm their client has `--source` set to a source that actually exists. Empty or null `--source` means the client falls through to the `default` source, which probably has no content if you set up three named sources. Under Model C, run `gbrain access check --token <their token>` to see what the credential reads, axis by axis, and `gbrain access who-can-read <slug>` for a page they expect: a credential bound to no member, or to one missing from the page's `readable_by` or a folder rule covering it, gets `not_found`.
 
 ### "Sync is slow and feels stuck"
 

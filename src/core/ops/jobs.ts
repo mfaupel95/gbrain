@@ -1,9 +1,18 @@
 import { prepareRemoteJob, prepareRemoteAgent, assertRemoteJobControl } from '../minions/submission-authority.ts';
 import type { MinionJob } from '../minions/types.ts';
+import { jobActorSql, NO_JOB_ACTOR, type JobActor } from '../minions/types.ts';
+import { currentCallerAccess } from '../search/private-visibility.ts';
 
 function publicJob(job: MinionJob) {
   const { submission_authority: _authority, ...visible } = job;
   return { ...visible, private_queue_owner_token: job.private_queue_owner_token == null ? null : '[redacted]' };
+}
+
+/** #7241: public jobs with submitted_by, blocked_by, liveness and spend (job-insight.ts), fenced like the row read. */
+async function insightJobs(ctx: OperationContext, jobs: MinionJob[], owner: string | null) {
+  const { describeJobs, withInsight } = await import('../minions/job-insight.ts');
+  const insight = await describeJobs(ctx.engine, jobs, { owner, remote: ctx.remote !== false });
+  return jobs.map(job => withInsight(publicJob(job), insight.get(job.id)));
 }
 
 /** Fields `list_jobs` may project to (F10 token trim): every public job field. */
@@ -15,16 +24,18 @@ const LIST_JOB_FIELDS = [
   'private_queue_owner_token', 'private_queue_lease_until', 'quiet_hours', 'stagger_key', 'result', 'progress', 'error_text',
   'stacktrace', 'created_at', 'started_at', 'finished_at', 'updated_at', 'coalesced',
 ] as const satisfies readonly (keyof MinionJob)[];
+/** #7241 computed fields (job-insight.ts JOB_INSIGHT_FIELDS); list_jobs computes them only when projected. */
+const INSIGHT_JOB_FIELDS = ['submitted_by', 'blocked_by', 'heartbeat_age_ms', 'heartbeat_basis', 'lock_expires_in_ms', 'stalled', 'spend'] as const;
 
 /** Parse list_jobs' `fields` (array or comma string); undefined = every field. */
 function parseJobFields(raw: unknown): readonly string[] | undefined {
   if (raw === undefined || raw === null || raw === '') return undefined;
   const list = (Array.isArray(raw) ? raw : String(raw).split(',')).map(f => String(f).trim()).filter(Boolean);
-  const valid: ReadonlySet<string> = new Set(LIST_JOB_FIELDS);
+  const valid: ReadonlySet<string> = new Set([...LIST_JOB_FIELDS, ...INSIGHT_JOB_FIELDS]);
   const unknown = list.filter(f => !valid.has(f));
   if (unknown.length > 0) {
     throw opError('invalid_params', `list_jobs: unknown field(s) ${unknown.map(f => JSON.stringify(f.slice(0, 40))).join(', ')}.`,
-      `Pass fields from: ${LIST_JOB_FIELDS.join(', ')} (e.g. fields: ["id", "name", "status"]), or omit fields for every field.`);
+      `Pass fields from: ${[...LIST_JOB_FIELDS, ...INSIGHT_JOB_FIELDS].join(', ')} (e.g. fields: ["id", "name", "status"]), or omit fields for every field.`);
   }
   return list.length ? list : undefined;
 }
@@ -43,6 +54,7 @@ import { opError, type OperationError } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, readFix, scopeDeniedError } from './op-fix.ts';
 import { hasScope } from '../scope.ts';
+import { LIST_JOBS_DEFAULT_LIMIT, LIST_JOBS_REMOTE_MAX_LIMIT, pagingLimit, reportJobPage } from './read-paging.ts';
 import { SOURCE_ID_RE } from '../source-id.ts';
 import {
   assertEmbedBackfillQueueAdmission,
@@ -70,7 +82,7 @@ import {
  *     `data->>'__owner_client_id'`. Missing identity → permission_denied
  *     (fail closed, mirroring get_agent_job).
  */
-function agentOwnerFence(ctx: OperationContext, opName: string): string | null {
+export function agentOwnerFence(ctx: OperationContext, opName: string): string | null {
   if (ctx.remote === false) return null;
   const scopes = ctx.auth?.scopes;
   if (scopes && hasScope(scopes, 'admin')) return null;
@@ -96,7 +108,7 @@ function getJobFix(id: unknown, why: string): Action {
 }
 
 /** A1 frozen pair: a missing job keeps `error: invalid_params` and reports `code: not_found`. */
-function jobNotFound(message: string): OperationError {
+export function jobNotFound(message: string): OperationError {
   return opError('not_found', message,
     'No job with that id is visible to this caller (jobs owned by another client read as missing). List jobs to find the right id.',
     { legacy_error: 'invalid_params', fix: listJobsFix('Lists the jobs this caller can see, with their ids and status.') });
@@ -114,10 +126,10 @@ function jobStateError(id: unknown, message: string, need: string): OperationErr
  * design (anti-enumeration): both throw the SAME error the unfenced path
  * throws for a missing id.
  */
-async function assertJobOwned(ctx: OperationContext, id: number, owner: string): Promise<void> {
+export async function assertJobOwned(ctx: OperationContext, id: number, owner: string): Promise<void> {
   const rows = await ctx.engine.executeRaw<{ id: number }>(
-    `SELECT id FROM minion_jobs WHERE id = $1 AND data->>'__owner_client_id' = $2`,
-    [id, owner],
+    `SELECT id FROM minion_jobs WHERE id = $1 AND data->>'__owner_client_id' = $2 AND ${jobActorSql(3)}`,
+    [id, owner, ...callerJobActor()],
   );
   if (rows.length === 0) {
     throw jobNotFound(`Job not found: ${id}`);
@@ -336,6 +348,15 @@ function delegationDenied(ctx: OperationContext, error: Error & { reasons: strin
 //      protected-name guard. Bindings are enforced PER-OP, not per-name.
 //   3. The dispatcher is the subagent handler with the gateway-native loop
 //      (agent.use_gateway_loop is auto-on for submit_agent jobs).
+/**
+ * GST-359 C2: the caller's attested actor, matched against a job's accepted grant (jobActorSql in minions/types.ts). A remote
+ * agent job never coalesces (queue.add coalesces application jobs only), so two people's submissions stay two jobs.
+ */
+function callerJobActor(): JobActor {
+  const actor = currentCallerAccess().actor;
+  return actor ? [actor.system, actor.external_id, actor.member] : NO_JOB_ACTOR;
+}
+
 const submit_agent: Operation = {
   name: 'submit_agent',
   idempotent: false,
@@ -343,11 +364,11 @@ const submit_agent: Operation = {
   description: 'Submit an agent job (agent scope; tools and budget bound to your client). Poll get_agent_job.',
   params: {
     prompt: { type: 'string', description: 'Task prompt.', required: true },
-    model: { type: 'string', description: 'provider:model (default: subagent tier).' },
+    model: { type: 'string', description: 'provider:model (default: subagent tier).', fullSurfaceOnly: true },
     allowed_tools: { type: 'array', description: 'Subset of your bound tools.', items: { type: 'string' } },
-    allowed_slug_prefixes: { type: 'array', description: 'Subset of your write prefixes.', items: { type: 'string' } },
-    max_turns: { type: 'number', description: 'Default 20, max 100.' },
-    queue: { type: 'string', description: 'Default "default".' },
+    allowed_slug_prefixes: { type: 'array', description: 'Subset of your write prefixes.', items: { type: 'string' }, fullSurfaceOnly: true },
+    max_turns: { type: 'number', description: 'Default 20, max 100.', fullSurfaceOnly: true },
+    queue: { type: 'string', description: 'Default "default".', fullSurfaceOnly: true },
   },
   mutating: true,
   scope: 'agent',
@@ -563,8 +584,9 @@ const get_agent_job: Operation = {
          FROM minion_jobs j
         WHERE j.id = $1
           AND j.name = 'subagent'
-          AND j.data->>'__owner_client_id' = $2`,
-      [id, clientId],
+          AND j.data->>'__owner_client_id' = $2
+          AND ${jobActorSql(3, 'j')}`,
+      [id, clientId, ...callerJobActor()],
     );
     if (rows.length === 0) {
       // Uniform envelope: foreign-owned and nonexistent ids are
@@ -618,7 +640,45 @@ const get_job: Operation = {
     if (!job) throw jobNotFound(`Job not found: ${p.id}`);
     // private_queue_owner_token is a capability credential (lease renewal /
     // attach), not job data — never expose it over MCP envelopes.
-    return publicJob(job);
+    return (await insightJobs(ctx, [job], owner))[0];
+  },
+};
+
+/** #7242: the longest a single wait_job call holds the request before it answers `terminal: false`. */
+export const WAIT_JOB_MAX_S = 55;
+
+const wait_job: Operation = {
+  name: 'wait_job',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { exempt: 'admin-scoped job introspection: job params and results are operator data, not retrieved brain text' },
+  description: `Wait until a job is completed, failed, dead or cancelled (at most ${WAIT_JOB_MAX_S} s per call), then return it like get_job plus terminal. terminal: false means it is still running: call again. Agent-scoped tokens (no admin) wait only on jobs they own.`,
+  params: {
+    id: { type: 'number', required: true, description: 'Job ID' },
+    timeout_s: { type: 'number', description: `Seconds to wait (default 30, at most ${WAIT_JOB_MAX_S}).` },
+  },
+  scope: 'admin',
+  agentCallable: true,
+  handler: async (ctx, p) => {
+    const owner = agentOwnerFence(ctx, 'wait_job');
+    if (owner !== null) await assertJobOwned(ctx, p.id as number, owner);
+    const { MinionQueue } = await import('../minions/queue.ts');
+    const { waitForCompletion, TimeoutError, isTerminalJobStatus } = await import('../minions/wait-for-completion.ts');
+    const queue = new MinionQueue(ctx.engine);
+    const first = await queue.getJob(p.id as number);
+    if (!first) throw jobNotFound(`Job not found: ${p.id}`);
+    const requested = typeof p.timeout_s === 'number' && Number.isFinite(p.timeout_s) ? p.timeout_s : 30;
+    const timeoutMs = Math.max(0, Math.min(WAIT_JOB_MAX_S, requested)) * 1000;
+    let job = first;
+    if (!isTerminalJobStatus(job.status) && timeoutMs > 0) {
+      try {
+        job = await waitForCompletion(queue, job.id, { timeoutMs, pollMs: ctx.engine.kind === 'pglite' ? 250 : 1000 });
+      } catch (e) {
+        if (!(e instanceof TimeoutError)) throw e instanceof Error && /disappeared/.test(e.message) ? jobNotFound(`Job not found: ${p.id}`) : e;
+        job = (await queue.getJob(job.id)) ?? job;
+      }
+    }
+    return { ...(await insightJobs(ctx, [job], owner))[0], terminal: isTerminalJobStatus(job.status) };
   },
 };
 
@@ -632,28 +692,53 @@ const list_jobs: Operation = {
     status: { type: 'string', description: 'Filter by status (waiting, active, completed, failed, delayed, dead, cancelled)' },
     queue: { type: 'string', description: 'Filter by queue name' },
     name: { type: 'string', description: 'Filter by job type' },
-    limit: { type: 'number', description: 'Max results (default: 50)' },
+    limit: { type: 'number', description: `Max results (default ${LIST_JOBS_DEFAULT_LIMIT}); MCP callers are capped at ${LIST_JOBS_REMOTE_MAX_LIMIT} per call.` },
+    cursor: { type: 'string', description: 'next_cursor from the last job of the previous page (it carries truncated: true): returns the next older jobs.' },
     fields: { type: 'array', items: { type: 'string' }, description: 'Return only these job fields (e.g. ["id","name","status"]) to save tokens; omit for every field.' },
+    finished_since: { type: 'string', description: 'Terminal-event cursor: an ISO time or the next_cursor of the previous call. Returns {jobs, next_cursor}: jobs that finished after it, oldest first.' },
   },
   scope: 'admin',
   agentCallable: true,
   handler: async (ctx, p) => {
     const fields = parseJobFields(p.fields);
     const owner = agentOwnerFence(ctx, 'list_jobs');
-    const { MinionQueue } = await import('../minions/queue.ts');
-    const queue = new MinionQueue(ctx.engine);
-    const jobs = await queue.getJobs({
-      status: p.status as string | undefined,
-      queue: p.queue as string | undefined,
-      name: p.name as string | undefined,
-      limit: (p.limit as number) || 50,
-      // #4098: SQL-side ownership fence for agent-scoped callers.
-      ...(owner !== null ? { ownerClientId: owner } : {}),
-    } as Parameters<typeof queue.getJobs>[0]);
+    const project = async (jobs: MinionJob[]) => {
+      const visible = !fields || fields.some(f => (INSIGHT_JOB_FIELDS as readonly string[]).includes(f)) ? await insightJobs(ctx, jobs, owner) : jobs.map(publicJob);
+      return fields ? visible.map(j => Object.fromEntries(fields.map(f => [f, (j as Record<string, unknown>)[f]]))) : visible;
+    };
+    if (p.finished_since !== undefined) {
+      const { listFinishedSince, TerminalCursorError } = await import('../minions/terminal-events.ts');
+      try {
+        const page = await listFinishedSince(ctx.engine, String(p.finished_since), {
+          queue: p.queue as string | undefined, name: p.name as string | undefined, limit: (p.limit as number) || 50,
+          ...(owner !== null ? { ownerClientId: owner, ownerActor: callerJobActor() } : {}),
+        });
+        return { jobs: await project(page.jobs), next_cursor: page.next_cursor };
+      } catch (e) {
+        if (e instanceof TerminalCursorError) throw invalidParam(ctx, 'list_jobs', 'finished_since', `list_jobs: ${e.message}`, { example: '2026-10-21T00:00:00Z' });
+        throw e;
+      }
+    }
+    const { listJobPage, JobListCursorError } = await import('../minions/job-list-page.ts');
+    const { limit, clampedFrom } = pagingLimit(ctx, 'list_jobs', p.limit, LIST_JOBS_DEFAULT_LIMIT, LIST_JOBS_REMOTE_MAX_LIMIT);
+    let page: Awaited<ReturnType<typeof listJobPage>>;
+    try {
+      page = await listJobPage(ctx.engine, {
+        status: p.status as string | undefined, queue: p.queue as string | undefined, name: p.name as string | undefined, limit,
+        ...(p.cursor !== undefined && p.cursor !== null ? { cursor: String(p.cursor) } : {}),
+        // #4098: SQL-side ownership fence for agent-scoped callers.
+        ...(owner !== null ? { ownerClientId: owner, ownerActor: callerJobActor() } : {}),
+      });
+    } catch (e) {
+      if (e instanceof JobListCursorError) throw invalidParam(ctx, 'list_jobs', 'cursor', `list_jobs: ${e.message}`, { example: '1792000000000000:42' });
+      throw e;
+    }
     // private_queue_owner_token is a capability credential (lease renewal /
     // attach), not job data — never expose it over MCP envelopes.
-    const visible = jobs.map(publicJob);
-    return fields ? visible.map(j => Object.fromEntries(fields.map(f => [f, (j as Record<string, unknown>)[f]]))) : visible;
+    const jobs = await project(page.jobs);
+    reportJobPage(ctx, p, { limit, clampedFrom, returned: jobs.length, nextCursor: page.next_cursor });
+    if (page.next_cursor === undefined || jobs.length === 0) return jobs;
+    return [...jobs.slice(0, -1), { ...jobs[jobs.length - 1], truncated: true, next_cursor: page.next_cursor }];
   },
 };
 
@@ -676,7 +761,7 @@ const cancel_job: Operation = {
     // #4098: the owner predicate rides the recursive cancel's CTE seed — a
     // fenced caller can cancel only roots it owns (descendants of an owned
     // root cascade as usual). Foreign and missing ids share one envelope.
-    const cancelled = await queue.cancelJob(p.id as number, owner !== null ? { ownerClientId: owner } : undefined);
+    const cancelled = await queue.cancelJob(p.id as number, owner !== null ? { ownerClientId: owner, ownerActor: callerJobActor() } : undefined);
     if (!cancelled) throw jobStateError(p.id, `Cannot cancel job ${p.id} (may already be in terminal status)`, 'Only waiting, active, delayed or paused jobs can be cancelled.');
     // private_queue_owner_token is a capability credential (lease renewal /
     // attach), not job data — never expose it over MCP envelopes.
@@ -879,6 +964,7 @@ const get_job_stats: Operation = {
     'private_queue: true means the queue is a parent-owned dream-inline queue: wedged is ' +
     'NEVER true for it and a worker restart cannot help — recovery runs automatically at ' +
     'worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. ' +
+    'by_queue has one row per queue (every dream-inline-* queue folded into one dream-inline row). ' +
     'Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.',
   params: {
     queue: { type: 'string', required: false, description: "Queue for the wedge signature (default 'default'). The other blocks stay global/windowed." },
@@ -909,7 +995,7 @@ const get_job_stats: Operation = {
 
 // Ops in EXACTLY the canonical `operations` array order.
 export const jobsOperations: Operation[] = [
-  submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
+  submit_job, get_job, wait_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,
   submit_agent, get_agent_job, get_job_stats,
 ];

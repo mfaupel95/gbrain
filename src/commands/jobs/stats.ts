@@ -1,7 +1,8 @@
 /** `gbrain jobs stats` (dispatched by runJobs in src/commands/jobs.ts). */
 import { hasFlag, parseFlag, type JobsCommandContext } from './shared.ts';
 import { formatNice, getEffectiveNiceness } from '../../core/minions/niceness.ts';
-import { deriveWedgeSignal } from '../../core/minions/queue.ts';
+import { DREAM_INLINE_PRIVATE_QUEUE_PREFIX, deriveWedgeSignal } from '../../core/minions/queue.ts';
+import type { QueueFamilyStats } from '../../core/minions/queue-families.ts';
 
 export async function runJobsStats({ args, engine, queue }: JobsCommandContext): Promise<void> {
   try { await queue.ensureSchema(); }
@@ -84,6 +85,7 @@ export async function runJobsStats({ args, engine, queue }: JobsCommandContext):
     console.log('  No jobs in the last 24 hours.');
   }
   console.log(`\n  Queue health: ${stats.queue_health.waiting} waiting, ${stats.queue_health.active} active, ${stats.queue_health.stalled} stalled`);
+  printQueueFamilies(stats.by_queue, sanitizeName);
 
   // DIVERGENT-queue scream: intake structurally exceeds useful drain and a
   // real backlog is sitting there. This is the default-on protection layer
@@ -311,4 +313,12 @@ async function printNoWorker(engineKind: string, queue: string, waiting: number)
     `${engineKind === 'pglite' ? ' (PGLite has no background worker)' : ''}; nothing is stuck, nothing is running them.\n` +
     `     Fix: ${shellQuote(fix.argv ?? [])}   # ${fix.why}`,
   );
+}
+
+/** #7241: one line per queue; the per-run dream-inline-* queues share one line (`--queue <name>` scopes the wedge lines to one). */
+function printQueueFamilies(families: QueueFamilyStats[], sanitizeName: (name: string) => string): void {
+  for (const q of families) {
+    const label = `${q.queue}-` === DREAM_INLINE_PRIVATE_QUEUE_PREFIX ? `${q.queue} (${q.queues} queue${q.queues === 1 ? '' : 's'})` : sanitizeName(q.queue);
+    console.log(`    ${label.padEnd(26)} ${q.waiting_now} waiting, ${q.active_now} active, ${q.total} total, ${q.completed} done, ${q.failed} failed, ${q.dead} dead`);
+  }
 }

@@ -15,7 +15,10 @@ import type { GBrainConfig } from '../../src/core/config.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer } from '../../src/core/persistence/service.ts';
-import { installFaultHook, type FaultPoint } from '../../src/core/persistence/fault-points.ts';
+import { installFaultHook, type FaultDetail, type FaultPoint } from '../../src/core/persistence/fault-points.ts';
+import { bigintToStringReplacer } from '../../src/core/utils.ts';
+import { hardenedGitStream } from '../../src/core/hardened-git.ts';
+import { __setSyncGitStreamForTests } from '../../src/core/persistence/sync-git-stream.ts';
 import { assertSafeE2eDatabaseUrl } from '../../test/helpers/db-guard.ts';
 import postgres from '#postgres';
 import { prepareTopology } from './history-fixture.ts';
@@ -90,7 +93,7 @@ export async function settlePending(world: World, model: ReferenceModel): Promis
   await model.settleLate(pending, observed);
 }
 
-/** Finish a schedule: drain, check drained invariants, prove a fresh write still admits. */
+/** Finish a schedule: drain, check drained invariants, prove a fresh write still admits, and drain that write's effects. */
 export async function finish(world: World, model: ReferenceModel, label: string, drainMs: number = DRAIN_BOUND_MS[world.engine.kind]): Promise<void> {
   const drained = await drain(world.engine, world, drainMs);
   if (!drained) model.violate({ class: 'wedge', detail: `${label}: requests or effects did not drain within ${drainMs / 1000} s` });
@@ -102,6 +105,27 @@ export async function finish(world: World, model: ReferenceModel, label: string,
     { slug: `notes/probe-${randomUUID().slice(0, 8)}`, content: pageBody('notes/probe', 'mk-probe0') });
   const seen = await executeOp(world, probe);
   if (seen.status !== 'committed') model.violate({ class: 'wedge', detail: `${label}: a fresh write after the schedule ended ${seen.status}/${seen.code}` });
+  await awaitClaimPass(world);
+  // The probe's own effects (its git commit among them) reach their seams only if the worker waits for them: a count
+  // role that happened to see the probe's effect:git:mid planned a fault no run was sure to reach (seed 5105).
+  if (!await drain(world.engine, world, drainMs)) model.violate({ class: 'wedge', detail: `${label}: the probe's effects did not drain within ${drainMs / 1000} s` });
+}
+
+/**
+ * #6957: wait for a consumer claim pass after the probe was prepared. The consumer makes one after every write it
+ * finishes, but a worker that returned at once stopped it first, unless timing let the pass in: a CI count role saw
+ * that pass as claim epoch 5 of caller_bound_replay, every replay of the run exited before making it, and its fault
+ * at consumer:claiming#5 went unreached. Waiting makes the last claim epoch part of every counted and run schedule.
+ * Only a worker whose fault hook counts claim passes (`world.claimPasses`) waits.
+ */
+async function awaitClaimPass(world: World): Promise<void> {
+  if (world.claimPasses === undefined) return;
+  const before = world.claimPasses;
+  const deadline = Date.now() + 30_000;
+  while (world.claimPasses === before && Date.now() < deadline) {
+    startPersistenceConsumer(world.engine, world.config).wake();
+    await Bun.sleep(50);
+  }
 }
 
 export async function runSchedule(world: World, schedule: Schedule): Promise<ScheduleResult> {
@@ -158,10 +182,118 @@ async function openRobotEngine(config: RobotConfig, initialize: boolean): Promis
 
 /** Freeze the whole process at a seam until the driver's SIGKILL arrives; nothing after this point runs. */
 function freeze(event: Record<string, unknown>): never {
-  const bytes = Buffer.from(`${JSON.stringify(event)}\n`);
+  const bytes = Buffer.from(`${JSON.stringify(event, bigintToStringReplacer)}\n`);
   for (let offset = 0; offset < bytes.length;) offset += writeSync(1, bytes, offset, bytes.length - offset);
   const blocked = new Int32Array(new SharedArrayBuffer(4));
   for (;;) Atomics.wait(blocked, 0, 0);
+}
+
+/**
+ * Seams one request can reach more than once by design: a preparation runs
+ * again after a revision conflict or a group cut, as often as timing
+ * dictates (7 to 10 preparations for the same 8-op schedule), and a prepared
+ * request whose publication is requeued (`writer_lock_unavailable`) is
+ * prepared again (caller_bound_replay counted 4 or 5 `consumer:prepared`).
+ * Counting every pass made the count run and the run role disagree on nth,
+ * so a fault could go unreached. These seams count each write request row
+ * once (its first pass), keyed on `writeId`: a caller-bound replay's rows
+ * share one `requestId`.
+ */
+const PER_REQUEST_SEAMS: ReadonlySet<FaultPoint> = new Set<FaultPoint>(['consumer:preparing', 'consumer:prepared']);
+/**
+ * #6896: `consumer:claiming` fires before every claim attempt, the consumer's idle ticks and the passes that find
+ * the root busy included, so how many passes a run makes follows wall-clock time, not the schedule (a count role
+ * saw 19, the run made fewer and its fault at #19 went unreached). It counts in claim epochs instead: the number of
+ * distinct write request rows that have reached `consumer:preparing`. The first pass at epoch e or later advances
+ * the count to e + 1, so slot n is the first claim attempt after n - 1 requests were prepared; requests of one root
+ * are claimed one after another, and `finish` waits for a claim pass after its probe, the last request (#6957), so
+ * every slot the count role saw comes again in the run.
+ */
+/**
+ * #7124: a sync pass makes as many rounds as the schedule's races dictate: a direct write still in flight when round 1
+ * reads its level defers that page to a round of its own, so the same schedule makes 2 or 3 rounds per pass (a count role
+ * saw 7 `sync:level_chunk`, a cold run made 6 and its fault at #7 went unreached). These seams count in round slots: in
+ * each pass, the first time a seam is reached in round 1, and the first time in a later round; a `sync:level_chunk`
+ * slot is one chunk ordinal of one Git read (`LEVEL_CHUNK_BYTES` makes the ordinals the same in every run). Every pass
+ * that made a round 1 with work makes a later round, its confirm round at least, so every slot comes again;
+ * `sync:batch_entries` counts in round 1 alone, since a later round has entries only when the race deferred one.
+ */
+const ROUND_SEAMS: ReadonlySet<FaultPoint> = new Set<FaultPoint>(['sync:round_start', 'sync:level_chunk', 'sync:level_result', 'sync:level_take',
+  'sync:level_read', 'sync:confirm_parallel', 'sync:level_narrow', 'sync:batch_entries']);
+/** How far this pass advances the seam's count: 1, 0 for a repeat of the same request at a per-request seam or of a round slot, the epochs passed at the claim seam. */
+export function seamCounter(): (point: FaultPoint, detail: FaultDetail) => number {
+  const seen = new Set<string>(), prepared = new Set<string>();
+  const chunks = new Map<string, number>();
+  let claimSlots = 0, pass = 0, round = 0;
+  return (point, detail) => {
+    if (point === 'sync:round_start') { round = Number(detail.round); if (round === 1) pass++; }
+    if (ROUND_SEAMS.has(point)) {
+      if (point === 'sync:batch_entries' && round > 1) return 0;
+      const read = `${pass}\u0000${round}\u0000${detail.read ?? ''}`;
+      const ordinal = point === 'sync:level_chunk' ? (chunks.get(read) ?? 0) + 1 : 0;
+      if (ordinal) chunks.set(read, ordinal);
+      const key = `${point}\u0000${pass}\u0000${round > 1 ? 'later' : 'first'}\u0000${detail.read ?? ''}\u0000${ordinal}`;
+      if (seen.has(key)) return 0;
+      seen.add(key);
+      return 1;
+    }
+    const request = detail.writeId ?? detail.requestId;
+    if (point === 'consumer:preparing' && request) prepared.add(request);
+    if (point === 'consumer:claiming') {
+      const advanced = Math.max(0, prepared.size + 1 - claimSlots);
+      claimSlots += advanced;
+      return advanced;
+    }
+    if (!PER_REQUEST_SEAMS.has(point) || !request) return 1;
+    const key = `${point}\u0000${request}`;
+    if (seen.has(key)) return 0;
+    seen.add(key);
+    return 1;
+  };
+}
+
+/**
+ * #7124: how many chunks a Git level read arrives in follows the pipe's timing, not the bytes read, so a count role and a
+ * run could see a read in different chunk counts. Robot workers re-cut every level read's stdout at fixed offsets of
+ * this many bytes (the last piece holds the rest): a read's chunk ordinals are then a function of what Git printed, and a
+ * robot tree of a few dozen paths reads in several chunks, so a crash between two chunks of one read is a slot like any.
+ */
+export const LEVEL_CHUNK_BYTES = 512;
+export function fixedChunks(runner: typeof hardenedGitStream = hardenedGitStream): typeof hardenedGitStream {
+  return async (root, args, opts) => {
+    const deliver = opts.onChunk;
+    if (!deliver) return await runner(root, args, opts);
+    let rest = Buffer.alloc(0), chain = Promise.resolve();
+    const emit = (piece: Buffer) => { chain = chain.then(() => deliver(piece)); };
+    const result = await runner(root, args, { ...opts, onChunk: chunk => {
+      rest = Buffer.concat([rest, chunk]);
+      for (; rest.length >= LEVEL_CHUNK_BYTES; rest = rest.subarray(LEVEL_CHUNK_BYTES)) emit(Buffer.from(rest.subarray(0, LEVEL_CHUNK_BYTES)));
+      return chain;
+    } });
+    if (rest.length) emit(Buffer.from(rest));
+    await chain;
+    return result;
+  };
+}
+
+/**
+ * The `run` role's hook: freeze at the nth matching seam. A hook that throws
+ * would unwind into the code under test, which then keeps running as if no
+ * crash were requested (#6584), so the error is reported as a
+ * `fault_hook_error` event and the process freezes anyway; the driver counts
+ * such a run as a gate failure.
+ */
+export function robotFaultHook(fault: NonNullable<RobotConfig['fault']>): (point: FaultPoint, detail: FaultDetail) => void {
+  let seen = 0;
+  const counts = seamCounter();
+  return (point, detail) => {
+    const advanced = counts(point, detail);
+    if (point !== fault.point || (fault.operation && detail.operation !== fault.operation) || !advanced) return;
+    seen += advanced;
+    if (seen < fault.nth) return;
+    try { freeze({ event: 'fault', point, nth: seen, detail }); }
+    catch (error) { freeze({ event: 'fault_hook_error', point, nth: seen, message: error instanceof Error ? error.message : String(error) }); }
+  };
 }
 
 function finalize(config: RobotConfig, model: ReferenceModel, extra: Partial<RobotOutcome>): RobotOutcome {
@@ -169,7 +301,7 @@ function finalize(config: RobotConfig, model: ReferenceModel, extra: Partial<Rob
   for (const v of locks.violations) model.violate({ class: 'lock_order', detail: `${v.rule}: ${v.detail}` });
   const trace = model.violations.length ? [...model.world.observations.values()].map(o =>
     `${o.id} ${o.kind} ${o.actor}@${o.source} ${o.status}${o.code ? `/${o.code}` : ''}${o.values.revision ? ` rev=${o.values.revision}` : ''}`
-    + `${o.receipt ? ` receipt=${o.receipt.state}` : ''}${o.status === 'refused' ? ` ${JSON.stringify(o.raw).slice(0, 300)}` : ''}`) : undefined;
+    + `${o.receipt ? ` receipt=${o.receipt.state}` : ''}${o.status === 'refused' || o.kind === 'sync' || o.kind === 'connector_publish' ? ` ${JSON.stringify(o.raw).slice(0, 300)}` : ''}`) : undefined;
   const deferredOf = (v: Violation) => KNOWN_DEFERRALS.find(k => k.class === v.class && k.match.test(v.detail));
   const deferred = model.violations.filter(v => deferredOf(v)).map(v => ({ ...v, todo: deferredOf(v)!.todo }));
   const violations = model.violations.filter(v => !deferredOf(v));
@@ -266,7 +398,7 @@ async function processFault(config: RobotConfig, world: World, model: ReferenceM
       const stopped = await Promise.race([disposePersistenceConsumer(engine).then(() => true), Bun.sleep(45_000).then(() => false)]);
       if (!stopped) model.violate({ class: 'wedge', detail: 'hung git child: consumer shutdown did not finish within 45 s' });
       else if (Date.now() - started > 30_000) model.violate({ class: 'wedge', detail: `hung git child: consumer shutdown took ${Date.now() - started} ms` });
-    }
+    } else model.violate({ class: 'wedge', detail: 'hung_git: the hung commit never started' });
     shim.release();
     await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE kind='git' AND state='queued'");
   } else if (config.process === 'facts_absorb_kill') {
@@ -327,14 +459,14 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
     }
     world.descriptors = new Map(config.schedule.ops.map(d => [d.id, d]));
     installLockOrderTrace();
+    __setSyncGitStreamForTests(fixedChunks());
     const counts: Record<string, number> = {};
-    if (role === 'count') installFaultHook(point => { counts[point] = (counts[point] ?? 0) + 1; });
-    if (role === 'run' && config.fault) {
-      let seen = 0; const fault = config.fault;
-      installFaultHook((point, detail) => {
-        if (point !== fault.point || (fault.operation && detail.operation !== fault.operation) || ++seen !== fault.nth) return;
-        freeze({ event: 'fault', point, nth: seen, detail });
-      });
+    const counted = seamCounter();
+    const hook = role === 'count' ? (point: FaultPoint, detail: FaultDetail) => { const advanced = counted(point, detail); if (advanced) counts[point] = (counts[point] ?? 0) + advanced; }
+      : role === 'run' && config.fault ? robotFaultHook(config.fault) : undefined;
+    if (hook) {
+      world.claimPasses = 0;
+      installFaultHook((point, detail) => { if (point === 'consumer:claiming') world.claimPasses!++; hook(point, detail); });
     }
     if (role === 'run') {
       let next = 0; let inFlight: string[] = [];
@@ -385,6 +517,7 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
     return finalize(config, model, { crashed: true, fault: config.fault, inFlight: state!.inFlight });
   } finally {
     installFaultHook(undefined);
+    __setSyncGitStreamForTests();
     await disposePersistenceConsumer(engine).catch(() => {});
     await engine.disconnect();
   }

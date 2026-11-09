@@ -3,7 +3,7 @@
  * stubbed orchestrator registry, so a test controls which orchestrator work is
  * pending while the schema-version check runs for real (PGLite or Postgres).
  */
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const REPO = resolve(import.meta.dir, '..', '..');
@@ -12,9 +12,13 @@ const REPO = resolve(import.meta.dir, '..', '..');
  * `reconcile` is an applied re-check that runs on every pass (like the
  * shared-content migration); the others are pending. `migrate_schema` stamps
  * the schema at head; `hide_version` renames the config table so the version
- * cannot be read back; `fail` reports a failed orchestrator.
+ * cannot be read back; `fail` reports a failed orchestrator; `declinable` is
+ * an applied reconcile re-check at version 0.53.0 with the shared-skills
+ * opt-out key (#6466), so `shared_skills.migration.enabled=false` declines it.
+ * `host_work` is that same applied 0.53.0 re-check whose ledger row records
+ * `apply_migrations_pending` (#6796; seeded once per home).
  */
-export type StubMigration = 'reconcile' | 'noop' | 'migrate_schema' | 'hide_version' | 'fail';
+export type StubMigration = 'reconcile' | 'noop' | 'migrate_schema' | 'hide_version' | 'fail' | 'declinable' | 'host_work';
 
 export interface SchemaDriverOpts {
   args: string[];
@@ -37,7 +41,13 @@ export function writeSchemaDriver(home: string, opts: SchemaDriverOpts): string 
   if (opts.migrations.includes('reconcile')) {
     appendFileSync(join(ledgerDir, 'completed.jsonl'), `${JSON.stringify({ version: '0.0.1', status: 'complete' })}\n`);
   }
-  const stubs = opts.migrations.map((kind, i) => ({ kind, version: kind === 'reconcile' ? '0.0.1' : `0.0.${i + 2}` }));
+  if (opts.migrations.includes('declinable')) {
+    appendFileSync(join(ledgerDir, 'completed.jsonl'), `${JSON.stringify({ version: '0.53.0', status: 'complete' })}\n`);
+  }
+  if (opts.migrations.includes('host_work') && !existsSync(join(ledgerDir, 'completed.jsonl'))) {
+    appendFileSync(join(ledgerDir, 'completed.jsonl'), `${JSON.stringify({ version: '0.53.0', status: 'complete', apply_migrations_pending: true })}\n`);
+  }
+  const stubs = opts.migrations.map((kind, i) => ({ kind, version: kind === 'reconcile' ? '0.0.1' : kind === 'declinable' || kind === 'host_work' ? '0.53.0' : `0.0.${i + 2}` }));
   const driver = join(home, `schema-driver-${Math.random().toString(36).slice(2)}.ts`);
   writeFileSync(driver, `import { mock } from 'bun:test';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -61,12 +71,15 @@ const actions = {
   migrate_schema: () => withEngine(engine => engine.setConfig('version', String(realMigrate.LATEST_VERSION))),
   hide_version: () => withEngine(engine => engine.executeRaw('ALTER TABLE config RENAME TO config_hidden_6089')),
   fail: async () => {},
+  declinable: async () => {},
+  host_work: async () => {},
 };
 mock.module(${JSON.stringify(join(REPO, 'src/commands/migrations/index.ts'))}, () => ({
   compareVersions: (a, b) => a.localeCompare(b, undefined, { numeric: true }),
   migrations: ${JSON.stringify(stubs)}.map(({ kind, version }) => ({
     version,
     ...(kind === 'reconcile' ? { reconcile: true } : {}),
+    ...(kind === 'declinable' || kind === 'host_work' ? { reconcile: true, optOut: { key: 'shared_skills.migration.enabled' } } : {}),
     featurePitch: { headline: 'schema exit probe ' + kind },
     orchestrator: async () => {
       appendFileSync(log, 'ran ' + kind + '\\n');

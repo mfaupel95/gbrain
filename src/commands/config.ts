@@ -1,6 +1,7 @@
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, loadConfigWithEngine } from '../core/config.ts';
+import { isLegacyModelKey, reportLegacyModelWrite, unsetModelFilePin } from './config/model-pin-shadow.ts';
 import {
   getEmbeddingColumnRegistry,
   validateColumnKey,
@@ -66,7 +67,8 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
   // #5232: the CLI resolves its write wait before choosing a transport, engine-free.
   'persistence.write_wait_ms',
   // Engine graduation opt-out: the pre-connect migrate router reads it engine-free.
-  'migrate.graduation',
+  'migrate.graduation', 'doctor.default_budget_ms', // #6803: the CLI doctor reads it pre-connect (commands/doctor/default-budget.ts)
+  'minions.terminal_hook', // #7242: a command the worker runs; local file plane only, never the shared DB plane (minions/terminal-hook.ts)
 ]);
 
 /** #5489: every self_upgrade.* reader (cli.ts startup check, autopilot,
@@ -108,7 +110,7 @@ async function unsetFilePlaneKey(key: string): Promise<boolean> {
   const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const cfg = loadConfigFileOnly();
   const dot = key.indexOf('.');
-  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate';
+  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor' | 'minions';
   const leaf = key.slice(dot + 1);
   const branch = cfg?.[top] as Record<string, unknown> | undefined;
   if (!cfg || !branch || !(leaf in branch)) return false;
@@ -378,12 +380,19 @@ const setLineGrammarConfig = async (engine: BrainEngine, key: string, value: str
 
 async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value: string, force = false): Promise<void> {
   if (await setLineGrammarConfig(engine, key, value)) return;
+  if (key === 'sync.admission') return (await import('./config/sync-admission-value.ts')).setSyncAdmissionValue(engine, value);
+  if (key === 'sync.metafile_pages') return (await import('./config/sync-metafile-pages-value.ts')).setMetafilePagesValue(engine, value);
+  if (/^sync\.(max_delete(s|_ratio)|apply_held_deletions)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
+    const err = (await import('../core/sync-reconcile.ts')).deleteSafetyConfigRefusal(key, value);
+    if (err) { console.error(`[config] ${err}`); process.exit(1); }
+  }
   if (key.startsWith('decide.')) {
     const { validateDecideConfigValue } = await import('../core/ai/decide/config.ts');
     const err = validateDecideConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  if (key.startsWith('generations.')) await (await import('./config/generations-values.ts')).refuseGenerationsValue(key, value);
   const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
   if (searchRefusal) {
     const { exitCliError, usageError } = await import('../cli/cli-error.ts');
@@ -396,6 +405,13 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     const err = validateFenceConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
+  if (key === 'dream.claim_conflicts.mode') { const err = (await import('../core/facts/claim-conflicts.ts')).claimConflictsModeRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key.startsWith('recall.')) { const err = (await import('../core/facts/recall-config.ts')).recallConfigValueRefusal(key, value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.slug_conflicts.auto_remove') { const err = (await import('../core/repair/slug-autoheal.ts')).slugAutoRemoveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.origin_twins.auto_resolve') { const err = (await import('../core/repair/origin-twins-heal.ts')).originAutoResolveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.repo_path') { const err = (await import('../core/sync-config-keys.ts')).syncRepoPathRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
     const err = validateMaxClaimConfigValue(key, value);
@@ -404,6 +420,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (key.startsWith('persistence.')) await (await import('./config/preparation-keys.ts')).refuseInvalidPreparationValue(engine, key, value);
   if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
+  if (key === 'search.contextual_retrieval') console.log((await import('./config/contextual-mode-hint.ts')).contextualModeHint());
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);
   if (!key.startsWith('decide.slots.')) return;
   try {
@@ -543,8 +560,9 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
     cfg.backup = { ...(cfg.backup ?? {}), check_enabled: on };
     saveConfig(cfg);
     console.log(`Set ${key} = ${on} (file plane: ~/.gbrain/config.json)`);
-  } else if (key === 'persistence.write_wait_ms') {
-    await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'persistence.write_wait_ms') { await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'minions.terminal_hook') { (await import('../core/minions/terminal-hook.ts')).setTerminalHookConfig(cfg, value, saveConfig);
+  } else if (key === 'doctor.default_budget_ms') { (await import('./doctor/default-budget.ts')).setDoctorDefaultBudget(cfg, value, saveConfig);
   } else if (key === 'migrate.graduation') {
     const on = isConfigTruthy(value);
     cfg.migrate = { ...(cfg.migrate ?? {}), graduation: on };
@@ -675,8 +693,9 @@ Subcommands:
   get <key> [--raw]            Print one value (--raw: no secret redaction)
   set <key> <value>            Write a value. --force accepts an unknown key;
                                --coverage-override (or --yes) passes the embedding
-                               coverage gate; --yes accepts a disclosure prompt
-  unset <key>                  Remove one key
+                               coverage gate; --yes accepts a disclosure prompt;
+                               chat_model/expansion_model warn when outranked (--json)
+  unset <key>                  Remove one key (a model key with --file: its config.json pin)
   unset --pattern <prefix>     Remove every key under a prefix`;
 
 export function printUsage(): void {
@@ -764,6 +783,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       await unsetEmbeddingDisabled(engine);
       return;
     }
+    if (isLegacyModelKey(key) && args.includes('--file')) return unsetModelFilePin(key);
     if (MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY) {
       // Dual-plane delete, mirroring the dual-plane set: file mirror AND the
       // authoritative DB row both go. "Not found" only when neither had it.
@@ -878,6 +898,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   const positionals = args.filter((a) => a !== '--raw');
   const key = positionals[1];
   const value = positionals[2];
+  if ((action === 'get' || action === 'set') && key) (await import('../core/questions/auto-think-migration.ts')).noteAutoThinkReplacement(key);
+  if ((action === 'get' || action === 'set') && key && await (await import('../core/sync-config-keys.ts')).handleSyncKeyConfig(engine, action, key)) return; // #6712 PR 2
 
   if (action === 'get' && (key === EMBEDDING_DISABLED_KEY || key === 'schema_pack')) {
     const effective = key === 'schema_pack' ? await effectiveSchemaPack(engine) : await effectiveEmbeddingDisabled(engine);
@@ -895,6 +917,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // the runtime does — env/file plane wins over DB (loadConfig() already
     // overlays env onto the file) — and report which plane answered on
     // stderr, keeping stdout a bare value for scripts.
+    if (key === 'mcp.publish_wakeshift') return (await import('./wakeshift.ts')).printWakeshiftGate();
     const filePlane = loadConfig() as Record<string, unknown> | null;
     // Dotted keys (push.allow_unverified_remote, hooks.stop_push_debounce_min)
     // are stored NESTED by `set`; resolve the path so `get`/`unset` see them.
@@ -924,6 +947,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       : fileOnly
         ? fileVal
         : (fileVal !== undefined && fileVal !== null ? fileVal : dbVal);
+    if (key === 'memory.agent_writeback' && (val === null || val === undefined)) return (await import('./config-agent-writeback.ts')).printUnsetAgentWriteback(engine);
     if (val !== null && val !== undefined) {
       // #3943: redact by default like `show`/`set` — `get` output lands in
       // agent transcripts and shell history; scripts opt out with the flag.
@@ -964,7 +988,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // sitting in the value slot can't slip through as literal config
     // content.
     const tail = args.slice(2);
-    const unknownFlags = tail.filter(a => a.startsWith('-') && !CONFIG_SET_KNOWN_FLAGS.includes(a));
+    const unknownFlags = tail.filter(a => a.startsWith('-') && !CONFIG_SET_KNOWN_FLAGS.includes(a) && !(a === '--json' && isLegacyModelKey(key)));
     if (unknownFlags.length > 0) {
       for (const flag of unknownFlags) {
         console.error(`[config] unknown flag: ${flag}`);
@@ -988,10 +1012,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // Ambient-writeback keys DUAL-WRITE (OV2-5): file mirror first (the
     // engine-free readers' plane), then the authoritative DB row. A DB
     // failure leaves the planes briefly diverged — reported, not hidden.
-    if (key === EMBEDDING_DISABLED_KEY) {
-      await setEmbeddingDisabled(engine, value);
-      return;
-    }
+    if (key === EMBEDDING_DISABLED_KEY) return setEmbeddingDisabled(engine, value);
     if (key === BRAIN_AUDIENCE_KEY) {
       // Dual-plane like memory.* (WP8): the engine-free harness lane gates
       // its enable-nudge advisory on the file-plane declared audience.
@@ -1023,6 +1044,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       console.log(`Set ${key} = ${audience} (${hostPlane ? 'file + db planes' : 'db plane only — mounted brain'})`);
       return;
     }
+    if (key === 'memory.agent_writeback') return (await import('./config-agent-writeback.ts')).setAgentWritebackFromCli(engine, value);
     if (MEMORY_DUAL_PLANE_KEYS.has(key)) {
       const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
       const cfg = (loadConfigFileOnly() ?? { engine: 'pglite' }) as Parameters<typeof saveConfig>[0];
@@ -1205,8 +1227,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     if (key.startsWith('provider_chat_options.')) await import('../core/config-db-merge.ts').then(m => m.assertProviderChatOptionsSetValue(key, value)).catch((error: Error) => { console.error(`[config] ${error.message}`); process.exit(1); });
     // #5470: every admission parses the journal caps; a malformed value
     // would refuse all managed writes, so reject it here.
-    const { JOURNAL_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
-    if (JOURNAL_CONFIG_KEYS.includes(key)) {
+    const { JOURNAL_CONFIG_KEYS, UPLOAD_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
+    if (JOURNAL_CONFIG_KEYS.includes(key) || UPLOAD_CONFIG_KEYS.includes(key)) {
       try { parseJournalConfigValue(key, value); }
       catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
     }
@@ -1260,6 +1282,13 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const { parseClusterThreshold } = await import('../core/cycle/phases/consolidate.ts');
       try { parseClusterThreshold(value); }
       catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
+    }
+
+    // #5461: think falls back to the default budget on a malformed value (and warns); refuse it here.
+    if (key === 'think.pages_budget_chars' || key === 'think.excerpt_ceiling_chars') {
+      const { pagesBudgetConfigError } = await import('../core/think/pages-budget.ts');
+      const error = pagesBudgetConfigError(key, value);
+      if (error) { console.error(`[config] ${error}`); process.exit(1); }
     }
 
     // Validate sources.default at set time. This key is read by
@@ -1424,10 +1453,9 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     }
 
     await setConfigWithDecideHooks(engine, key, value, forceFlag);
-    // v0.36.x #892: redact sensitive values in confirmation output. API
-    // keys / tokens / passwords are commonly set from terminals with
-    // scrollback; echoing the raw value to stderr leaks the secret.
-    console.log(`Set ${key} = ${redactConfigValue(key, value)}`);
+    // #892: keep credentials out of confirmation output and scrollback. #6795: a model pin says whether it took effect.
+    if (isLegacyModelKey(key)) await reportLegacyModelWrite(engine, key, value, tail.includes('--json'));
+    else console.log(`Set ${key} = ${redactConfigValue(key, value)}`);
     if (key === 'facts.default_visibility') await restampVisibilityPosture(value);
 
     // v0.40.3.0 (D3 + Phase 2B): mode-switch UX. Fires only on
@@ -1436,8 +1464,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // set that already persisted.
     if (key === 'search.mode') {
       try {
-        const { runModeSwitchUx } = await import('../core/search/mode-switch-ux.ts');
-        const { isSearchMode } = await import('../core/search/mode.ts');
+        const [{ runModeSwitchUx }, { isSearchMode }] = await Promise.all([import('../core/search/mode-switch-ux.ts'), import('../core/search/mode.ts')]);
+        if (isSearchMode(value)) await engine.setConfig('search.mode_source', 'operator');
         await runModeSwitchUx({
           oldMode: oldSearchMode && isSearchMode(oldSearchMode) ? oldSearchMode : null,
           newMode: value,
@@ -1494,5 +1522,5 @@ async function refuseSchemaSizingKey(key: 'embedding_model' | 'embedding_dimensi
 async function writebackLanesNote(engine: BrainEngine, key: string): Promise<string> {
   if (key !== 'memory.auto_writeback') return '';
   const { captureLaneSummary, resolveWritebackConfig } = await import('../core/facts/writeback-config.ts');
-  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}`;
+  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}${await (await import('./config-agent-writeback.ts')).agentWritebackNote(engine)}`;
 }

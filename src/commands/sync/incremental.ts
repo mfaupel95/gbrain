@@ -16,21 +16,35 @@ import { legacyHoldFields, openLegacyHolds, type LegacyHolds } from './holds.ts'
 import { runImportsPhase } from './imports.ts';
 import { preflightIncrementalSync } from './preflight.ts';
 import { runRenamesPhase } from './renames.ts';
-import { createSyncRun, abortUnpersistedPin, registerCheckpointCleanup } from './sync-run.ts';
+import { readUpstreamDivergence, type UpstreamResultField } from '../../core/sync-upstream-rewrite.ts';
+import { createSyncRun, abortUnpersistedPin, registerCheckpointCleanup, type SyncPlan } from './sync-run.ts';
+import { scanClassicReasons, withReasonNotices } from './reasons.ts';
 
-export async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+export async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult & UpstreamResultField> {
   // #5988: content refusals are held, not failed; every exit reports the holds.
   const holds = await openLegacyHolds(engine, opts.sourceId);
   const result = await runSyncPhases(engine, opts, holds);
-  return holds ? { ...result, ...(await legacyHoldFields(engine, holds)) } : result;
+  const upstream = opts.sourceId ? await readUpstreamDivergence(engine, opts.sourceId) : null;
+  return { ...result, ...(holds ? await legacyHoldFields(engine, holds) : {}), ...(upstream ? { upstream } : {}) };
 }
 
 async function runSyncPhases(engine: BrainEngine, opts: SyncOpts, holds: LegacyHolds | null): Promise<SyncResult> {
   const pre = await preflightIncrementalSync(engine, opts, holds);
   if ('done' in pre) return pre.done;
-  const { plan } = pre;
-  const { totalChanges, ckpt, pin } = plan;
-  opts = plan.opts;
+  const plan = await withPassReasons(engine, pre.plan);
+  return withReasonNotices(await runPlannedPhases(engine, plan), plan.reasons, plan.opts.sourceId);
+}
+
+/** GBRA-217: the pass's one reason-trailer scan over `last_commit..pin`, when it imports or renames files. */
+async function withPassReasons(engine: BrainEngine, plan: SyncPlan): Promise<SyncPlan> {
+  const { filtered } = plan;
+  const reasons = await scanClassicReasons(engine, { sourceId: plan.opts.sourceId, company: plan.company, anchorPath: plan.anchorPath, gitRoot: plan.gitContextRoot,
+    from: plan.lastCommit, to: plan.pin, imports: filtered.added.length + filtered.modified.length + filtered.renamed.length });
+  return { ...plan, reasons };
+}
+
+async function runPlannedPhases(engine: BrainEngine, plan: SyncPlan): Promise<SyncResult> {
+  const { opts, totalChanges, ckpt, pin } = plan;
 
   const swept = await sweepUnsyncableModified(engine, plan);
 

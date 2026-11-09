@@ -14,7 +14,7 @@ import { relative } from 'path';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { collectSyncableFiles } from '../../import.ts';
-import { resolveSlugForPath, type SyncStrategy } from '../../../core/sync.ts';
+import { readMetafilePagesMode, resolveSlugForPath, type SyncStrategy } from '../../../core/sync.ts';
 import { isImageFilePath } from '../../../core/import-file.ts';
 
 export async function slugCollisionsCheck(engine: BrainEngine): Promise<Check> {
@@ -23,11 +23,12 @@ export async function slugCollisionsCheck(engine: BrainEngine): Promise<Check> {
       `SELECT id, local_path, config FROM sources WHERE archived IS NOT TRUE AND local_path IS NOT NULL ORDER BY id`);
     const groups: Array<{ source: string; slug: string; paths: string[]; indexed?: string }> = [];
     let walked = 0;
+    const metafilePages = await readMetafilePagesMode(engine);
     for (const source of sources) {
       if (!source.local_path || !existsSync(source.local_path)) continue;
       walked++;
       const bySlug = new Map<string, string[]>();
-      for (const file of collectSyncableFiles(source.local_path, { strategy: source.config?.strategy ?? 'markdown' })) {
+      for (const file of collectSyncableFiles(source.local_path, { strategy: source.config?.strategy ?? 'markdown', metafilePages })) {
         const rel = relative(source.local_path, file).replace(/\\/g, '/');
         const slug = isImageFilePath(rel) ? rel.toLowerCase() : resolveSlugForPath(rel);
         bySlug.set(slug, [...(bySlug.get(slug) ?? []), rel]);

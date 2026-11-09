@@ -53,6 +53,7 @@ import {
   type VolunteeredPage,
 } from './volunteer.ts';
 import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
+import { loadContextModule } from './load-warning.ts';
 
 /** Per-turn resolver options shared by every rung of the ladder. */
 export interface ResolveEntitiesOpts {
@@ -272,11 +273,11 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
       const engine = await getPostgresEngine(cfg);
       if (engine) {
         if (pointers.length) {
-          const { logDeliveredReflexPointers } = await import('./retrieval-reflex.ts');
+          const { logDeliveredReflexPointers } = await loadContextModule('src/core/context/retrieval-reflex.ts', () => import('./retrieval-reflex.ts'));
           logDeliveredReflexPointers(engine, pointers);
         }
         if (volunteered.length) {
-          const { volunteerEventRowsFrom, logVolunteerEventsFireAndForget } = await import('./volunteer-events.ts');
+          const { volunteerEventRowsFrom, logVolunteerEventsFireAndForget } = await loadContextModule('src/core/context/volunteer-events.ts', () => import('./volunteer-events.ts'));
           logVolunteerEventsFireAndForget(
             engine,
             volunteerEventRowsFrom(volunteered, { channel: 'openclaw' }),
@@ -331,7 +332,7 @@ async function resolve(
   if (isPostgres(cfg)) {
     const engine = await getPostgresEngine(cfg);
     if (!engine) return null;
-    const { resolveSourceId } = await import('../source-resolver.ts');
+    const { resolveSourceId } = await loadContextModule('src/core/source-resolver.ts', () => import('../source-resolver.ts'));
     const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
     // #5575 (CEO-20): the OpenClaw context engine's direct rung is a proactive surface.
     return resolveEntitiesToPointers(engine, sourceId, candidates, { ...opts, eligibility: await proactiveEligibility({ engine }, 'context_engine') });
@@ -371,7 +372,7 @@ async function getPostgresEngine(cfg: GBrainConfig | null): Promise<BrainEngine 
   if (_pgPending) return _pgPending;
   _pgPending = (async () => {
     try {
-      const { createEngine } = await import('../engine-factory.ts');
+      const { createEngine } = await loadContextModule('src/core/engine-factory.ts', () => import('../engine-factory.ts'));
       const engineConfig = {
         engine: 'postgres' as const,
         database_url: cfg?.database_url,

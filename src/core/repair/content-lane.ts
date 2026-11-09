@@ -39,8 +39,11 @@ import { readFix } from '../ops/op-fix.ts';
 import { shellQuote } from '../agent-output.ts';
 import { fenceHoldStatus, type FenceAutoRepair } from '../fence-repair/hold-fix.ts';
 import type { GitHoldRecord } from '../persistence/sync-holds.ts';
-import type { RepairKind, RepairResult, RepairScope } from './core.ts';
+import { contentRepairLaneCurrent } from '../persistence/sync-fault-class.ts';
+import type { RepairFailedItem, RepairKind, RepairResult, RepairScope } from './core.ts';
 import { repairRunner, type RepairKindSpec } from './registry.ts';
+import { kindErrorResult } from '../remediation/repairs.ts';
+import { ItemRun } from '../item-failure.ts';
 
 /** The lane, in run order: fences first (a merged or closed fence can change what a slug conflict's page looks like), then slug conflicts. */
 export const CONTENT_REPAIR_KINDS: readonly RepairKind[] = ['fences', 'slug-conflicts'];
@@ -81,6 +84,8 @@ export function contentHoldDisposition(record: Pick<GitHoldRecord, 'code' | 'met
     return { action: 'repair', kind };
   }
   const stored = storedContentAction(record.meta);
+  // #6865: a verdict an older lane recorded is rechecked once; the recheck records this lane's version, so it is listed again after that.
+  if (!contentRepairLaneCurrent(record.meta.content_repair)) return { action: 'repair', kind };
   if (stored === 'merge_into') return { action: 'listed', kind, state: 'needs_human', reason: 'merge_recommended' };
   if (stored === 'needs_human') return { action: 'listed', kind, state: 'needs_human', reason: 'content_repair_needs_human' };
   return { action: 'repair', kind };
@@ -107,6 +112,9 @@ export interface ContentLaneOptions {
   sourceFlag?: string;
   /** Replaces the registered kinds (tests pass stub specs). */
   registry?: readonly RepairKindSpec[];
+  /** The caller's cancellation: a kind that throws after it fired is rethrown, never recorded as that kind's error.
+   * A kind bound to its `--expect` hash is rethrown too: the operator approved that set, so a refusal answers the command. */
+  signal?: AbortSignal;
   logger?: OperationContext['logger'];
 }
 
@@ -120,8 +128,10 @@ export interface ContentLaneResult {
   preview_hashes: Partial<Record<RepairKind, string | null>>;
   /** Paid-model spend across the lane: the estimate on a dry run, the actual spend on an apply; the allowance left under `maxLlmUsd` (null: no run cap). */
   cost: { llm_usd: number; llm_allowance_remaining_usd: number | null };
-  /** Every kind that stopped, with its reason (`time_budget` ends the lane; the rest let the next kind run). */
+  /** Every kind that stopped, with its reason (`time_budget` ends the lane; the rest let the next kind run). A kind whose plan or apply threw item-scoped stops with reason `error` and its preview as the fix (GBRA-130); a run-scoped error is thrown. */
   stopped: Array<{ kind: RepairKind } & NonNullable<RepairResult['stopped']>>;
+  /** Every item a kind refused per item and left unchanged (the kinds' `failed[]`, with the kind); the next full scan retries them. */
+  failed: Array<{ kind: RepairKind } & RepairFailedItem>;
   /** The command that applies exactly these plans (dry run), or reruns the lane (apply). */
   apply_command: string;
 }
@@ -153,21 +163,32 @@ export async function runContentLane(engine: BrainEngine, scope: RepairScope, op
   const runner = await repairRunner(engine, { apply: opts.apply, noEmbed: opts.noEmbed, ...(opts.logger ? { logger: opts.logger } : {}), ...(opts.registry ? { registry: opts.registry } : {}) });
   const hashes: ContentLaneResult['preview_hashes'] = {};
   const stopped: ContentLaneResult['stopped'] = [];
+  const failed: ContentLaneResult['failed'] = [];
   const results: RepairResult[] = [];
   let spent = 0;
   const allowance = () => opts.maxLlmUsd === undefined ? undefined : Math.max(0, opts.maxLlmUsd - spent);
+  const kindRun = new ItemRun('repair.content_lane_kinds');
   for (const [index, kind] of kinds.entries()) {
     const expect = opts.expect?.[index];
-    const result = await runner.run(kind, scope, { explicit: true, limit: opts.limit, sourceFlag: opts.sourceFlag, only: opts.only, skip: opts.skip, noLlm: opts.noLlm,
-      maxLlmUsd: allowance(), deadline: opts.deadline, ...(expect ? { expect } : {}) });
+    let result: RepairResult;
+    try {
+      result = await runner.run(kind, scope, { explicit: true, limit: opts.limit, sourceFlag: opts.sourceFlag, only: opts.only, skip: opts.skip, noLlm: opts.noLlm,
+        maxLlmUsd: allowance(), deadline: opts.deadline, ...(expect ? { expect } : {}) });
+      kindRun.succeed();
+    } catch (error) {
+      if (opts.signal?.aborted || expect) throw error;
+      kindRun.fail(kind, error);
+      result = kindErrorResult(kind, scope, { apply: opts.apply, error, source: opts.sourceFlag });
+    }
     hashes[kind] = expect ?? result.preview_hash ?? null;
     spent += result.cost.llm_usd ?? 0;
     results.push(result);
     if (result.stopped) stopped.push({ kind, ...result.stopped });
+    for (const item of result.failed) failed.push({ kind, ...item });
     if (result.stopped?.reason === 'time_budget') break;
   }
   const expect = kinds.map(kind => hashes[kind] ?? null);
-  return { mode: opts.apply ? 'apply' : 'dry_run', scope, kinds, results, preview_hashes: hashes, cost: { llm_usd: spent, llm_allowance_remaining_usd: allowance() ?? null }, stopped,
+  return { mode: opts.apply ? 'apply' : 'dry_run', scope, kinds, results, preview_hashes: hashes, cost: { llm_usd: spent, llm_allowance_remaining_usd: allowance() ?? null }, stopped, failed,
     apply_command: shellQuote(contentLaneArgv({ source: opts.sourceFlag, only: opts.only, skip: opts.skip, noLlm: opts.noLlm, maxLlmUsd: opts.maxLlmUsd, apply: true,
       expect: expect.every((hash): hash is string => hash !== null) ? expect : undefined })) };
 }

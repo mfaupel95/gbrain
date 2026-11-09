@@ -40,7 +40,7 @@ import { prepareEmbeddingProjections } from '../core/embedding-readiness.ts';
 import { assertRetainedEmbeddingRebuildability } from '../core/embedding-migration-retention.ts';
 import { embedStaleFacts } from '../core/embed-facts.ts';
 import { countStaleFactEmbeddings } from '../core/facts/embedding-identity.ts';
-import { authorizeMigrationBudget, assertMigrationLeases, ceilCents, MigrationBudgetRefusal, type MigrationBudgetRefusalDetails, type MigrationWorstCase } from '../core/embedding-migration-budget.ts';
+import { authorizeMigrationBudget, assertMigrationLeases, ceilCents, MigrationBudgetRefusal, withMigrationLeaseTransaction, type MigrationBudgetRefusalDetails, type MigrationLeaseAssert, type MigrationWorstCase } from '../core/embedding-migration-budget.ts';
 import { planMigrationWorstCase, MIGRATION_PROBE_TEXT, RERANKER_PROBE } from '../core/embedding-migration-worst-case.ts';
 import { withAIInvocationGuard } from '../core/ai/invocation-guard.ts';
 
@@ -197,8 +197,9 @@ function renderPlan(ctx: MigrationPlanContext): string {
   if (plan.resuming) {
     lines.push('  Resuming: a prior migration to this target was interrupted; continuing it.');
   }
-  if (concurrentWriters.workers > 0 || concurrentWriters.embedJobs > 0) {
-    lines.push(`  WARNING: ${concurrentWriters.workers} live minion worker(s) and ${concurrentWriters.embedJobs} waiting/running`);
+  if (concurrentWriters.workers !== 0 || concurrentWriters.embedJobs > 0) {
+    const workerCount = concurrentWriters.workers === null ? 'an unknown number of (worker registry unreadable)' : String(concurrentWriters.workers);
+    lines.push(`  WARNING: ${workerCount} live minion worker(s) and ${concurrentWriters.embedJobs} waiting/running`);
     lines.push('          embed job(s) detected. Generic embed/cycle jobs do not take the migration');
     lines.push('          locks — stop the worker (or let the queue drain) first, or their writes');
     lines.push('          will be counted stale by the final census and re-embedded.');
@@ -293,6 +294,14 @@ export async function probeTargetProvider(
     }
     return { ok: true };
   } catch (e) {
+    // #6587: the invocation guard refuses dispatch once the migration lost its lease; that is not a provider
+    // fault, so say so (provider error text stays private).
+    if (e instanceof Error && /lease lost/i.test(e.message)) {
+      return {
+        ok: false,
+        message: `Preflight embed against ${toModel} stopped because the migration lost its lock lease (another process took it, or the heartbeat could not renew it); no migration invalidation performed. Any authorized request debit is retained for safe resume. Inspect migration status before retrying.`,
+      };
+    }
     return {
       ok: false,
       message: `Preflight embed against ${toModel} failed; no migration invalidation performed. Any authorized request debit is retained for safe resume. Check provider configuration and migration status before retrying.`,
@@ -433,8 +442,8 @@ export interface MigrationPlanContext {
   rerankerPlan: RerankerPlan;
   /** Which brain/DB this run is actually pointed at (wrong-brain visibility). */
   identity: { engine: string; target: string };
-  /** Quiesce-lite: live embed writers that are NOT under the migration locks. */
-  concurrentWriters: { workers: number; embedJobs: number };
+  /** Quiesce-lite: live embed writers that are NOT under the migration locks; workers is null when the worker registry is unreadable. */
+  concurrentWriters: { workers: number | null; embedJobs: number };
   /** Non-default search_embedding_column, if configured (read-path caveat). */
   customSearchColumn: string | null;
 }
@@ -543,10 +552,12 @@ export async function planMigrationFlow(
   // Quiesce-lite census (round-1 C2 / round-2 #3): embed writers outside the
   // migration locks. Report, don't block — the completion census is the
   // correctness backstop; this is the operator's "stop the worker first" cue.
-  let concurrentWriters = { workers: 0, embedJobs: 0 };
+  let concurrentWriters: { workers: number | null; embedJobs: number } = { workers: 0, embedJobs: 0 };
   try {
     const { readWorkers } = await import('../core/minions/worker-registry.ts');
-    const workers = readWorkers().length;
+    // An unreadable registry is an unknown worker count (null), and must not also drop the embed-job count below.
+    let workers: number | null = null;
+    try { workers = readWorkers().length; } catch { /* registry unreadable: worker count unknown */ }
     const rows = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM minion_jobs
         WHERE status IN ('waiting', 'running')
@@ -602,10 +613,10 @@ export async function executeMigrationFlow(
   let expectedSources: string | undefined;
   let lost = false;
   let renewing: Promise<void> | undefined;
-  const assertOwned = async (tx?: BrainEngine) => {
+  const assertOwned: MigrationLeaseAssert = async (tx, lease) => {
     if (!tx && renewing) await renewing;
     if (lost) throw new Error('Migration lock lease lost; durable work retained. Inspect --status before resuming.');
-    if (tx) await assertMigrationLeases(tx, heldLocks);
+    if (tx) await assertMigrationLeases(tx, heldLocks, lease);
     else for (const lock of heldLocks) {
       if (!await lock.refresh({ signal: AbortSignal.timeout(30_000) })) { lost = true; controller.abort(); throw new Error('Migration lock lease lost; further mutations refused.'); }
     }
@@ -671,7 +682,8 @@ export async function executeMigrationFlow(
     if (runtimeConfig?.embedding_disabled || disabled !== null && disabled !== 'false') {
       return { status: 'apply_failed', reason: 'Embedding is disabled or its policy is invalid; no provider requests or migration invalidation performed. Review the selected brain embedding configuration before retrying.' };
     }
-    await engine.transaction(async tx => { await assertOwned(tx); await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan); });
+    await withMigrationLeaseTransaction(engine, assertOwned,
+      tx => assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan), { deadlockRetries: 3 });
     const rerankerModel = ctx.rerankerPlan.action.kind === 'switch' ? ctx.rerankerPlan.action.to : undefined;
     let debit: Awaited<ReturnType<typeof authorizeMigrationBudget>>;
     try {
@@ -691,7 +703,7 @@ export async function executeMigrationFlow(
 
     await assertOwned();
     const readiness = await prepareEmbeddingProjections(engine, { repair: true, assertOwned });
-    if (readiness.blocked) return { status: 'apply_failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no migration-wide embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; unsupported media requires its source importer. See docs/guides/embedding-migration.md#recovery.` };
+    if (readiness.blocked) return { status: 'apply_failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no migration-wide embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; image pages are counted by class in gbrain doctor --only text_projection_readiness --json (gbrain projections drain seals the sealable ones). See docs/guides/embedding-migration.md#recovery.` };
 
     const applied = await applyEmbeddingMigration(engine, plan, {
       ignoreEnvOverride: opts.ignoreEnvOverride,
@@ -757,7 +769,9 @@ export async function executeMigrationFlow(
       const [active] = await engine.executeRaw('SELECT id FROM sources WHERE id=$1 AND NOT archived', [sourceId]);
       if (!active) continue;
       await assertOwned();
-      const facts = await embedStaleFacts(engine, { sourceId, yes: true, maxCostUsd: opts.maxCostUsd ?? marker.state?.budget?.max_cost_usd ?? 0, maxFacts: 10_000, signal: controller.signal, assertOwned });
+      const facts = await embedStaleFacts(engine, { sourceId, yes: true,
+        maxCostUsd: opts.maxCostUsd ?? marker.state?.budget?.max_cost_usd ?? 0,
+        migrationDrain: { signal: controller.signal, assertOwned } });
       embeddedFacts += facts.embedded;
       if (facts.failures) break;
     }

@@ -15,8 +15,7 @@
  * rewritten, folded into or guessed; identity keys are never resolved from a
  * duplicate.
  */
-import { load } from 'js-yaml';
-import { FRONTMATTER_SCHEMA } from './data-frontmatter.ts';
+import { FRONTMATTER_SCHEMA, loadBoundedYaml as load } from './data-frontmatter.ts';
 
 /** Bump when a rule widens; older holds are re-screened. */
 export const RECOVERY_VERSION = 1;
@@ -26,7 +25,7 @@ export const RECOVERY_VERSION = 1;
  * `repair/visibility.ts`, connector publication). `test/frontmatter-recovery.test.ts`
  * greps those readers so a new key cannot be missed.
  */
-export const PROTECTED_FRONTMATTER_KEYS: readonly string[] = ['visibility', 'derived_from', 'source_slug', 'synthesized_by', 'concepts', 'captured_via', 'event'];
+export const PROTECTED_FRONTMATTER_KEYS: readonly string[] = ['visibility', 'derived_from', 'source_slug', 'synthesized_by', 'concepts', 'captured_via', 'event', 'pinned_question', 'access', 'confidentiality', 'readable_by'];
 /** Keys that decide which page a file is. A duplicate is never resolved. */
 export const IDENTITY_FRONTMATTER_KEYS: readonly string[] = ['slug', 'type', 'id', 'source_id'];
 

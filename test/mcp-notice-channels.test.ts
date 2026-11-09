@@ -17,6 +17,8 @@ import {
   chatKeyFix, keylessThinkNotice, thinkNotSavedNotice, degradedDedupNotice,
 } from '../src/core/interop-notices.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { importFromContent } from '../src/core/import-file.ts';
+import { serializeMarkdown } from '../src/core/markdown.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
 let engine: PGLiteEngine;
@@ -92,10 +94,34 @@ describe('degraded recall over MCP dispatch (keyless PGLite)', () => {
   async function seedPage() {
     await engine.putPage('notes/alpha', { type: 'note', title: 'Alpha', compiled_truth: 'Alpha body about widgets.', timeline: '', frontmatter: {} }, { sourceId: 'default' });
   }
+  /** A page that is indexed and safety-checked, so a keyless search's only degradation is the configuration-persistent embed_unavailable. */
+  async function importPage() {
+    await importFromContent(engine, 'notes/alpha', serializeMarkdown({}, 'Alpha body about widgets.', '', { type: 'note', title: 'Alpha', tags: [] }), { noEmbed: true, forceRechunk: true });
+  }
+  const noticeBlocks = (res: { content: Array<{ text: string }> }) => res.content.filter(c => c.text.startsWith('[gbrain notice degraded_recall'));
+
+  test('stdio: two keyless searches show one degraded_recall notice; a transient stage on the same search rides every call', async () => {
+    await withEnv(NO_KEYS, async () => {
+      await importPage();
+      const opts = { remote: true, transport: 'stdio' as const, sourceId: 'default', config: keylessUnchosen, noticeLedger: new (await import('../src/core/notice-ledger.ts')).NoticeLedger() };
+      const first = await dispatchToolCall(engine as any, 'search', { query: 'widgets' }, opts);
+      const degraded = (first._meta?.retrieval as { degraded?: Array<{ stage: string; reason?: string }> }).degraded;
+      expect(degraded).toEqual([{ stage: 'embed_unavailable', reason: 'no_provider' }]);
+      expect(JSON.parse(first.content[0].text).length).toBeGreaterThan(0);
+      expect(noticeBlocks(first)).toHaveLength(1);
+      const second = await dispatchToolCall(engine as any, 'search', { query: 'widgets' }, opts);
+      expect(noticeBlocks(second)).toHaveLength(0);
+      // keyword_zero (no match for these terms) is this call's own state: the notice rides each such call.
+      for (let i = 0; i < 2; i++) {
+        const miss = await dispatchToolCall(engine as any, 'search', { query: 'zeppelin' }, opts);
+        expect(noticeBlocks(miss)[0]?.text).toContain('keyword_zero');
+      }
+    });
+  }, 60_000);
 
   test('stdio: content[0] unchanged, a prefixed degraded block + _meta.gbrain_notices, once per session', async () => {
     await withEnv(NO_KEYS, async () => {
-      await seedPage();
+      await importPage();
       const opts = { remote: true, transport: 'stdio' as const, sourceId: 'default', config: keylessUnchosen };
       const first = await dispatchToolCall(engine as any, 'search', { query: 'widgets' }, opts);
       expect(first.isError).toBeUndefined();
@@ -238,6 +264,40 @@ describe('F7 coaching reaches agents', () => {
         expect(takePostUpgradeMcpNotice()).toBeNull();
       });
     } finally {
+      rmSync(home, { recursive: true, force: true });
+      __resetPostUpgradeNoticeForTests();
+    }
+  });
+
+  test('#8621: a partly failed remember batch (an MCP error) leaves the one-shot post-upgrade notice for the next call', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { VERSION } = await import('../src/version.ts');
+    const { takePostUpgradeMcpNotice, __resetPostUpgradeNoticeForTests } = await import('../src/core/post-upgrade-notice.ts');
+    const { operations } = await import('../src/core/operations.ts');
+    const op = operations.find(o => o.name === 'remember')! as { handler: unknown };
+    const original = op.handler;
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-postup-batch-'));
+    try {
+      mkdirSync(join(home, '.gbrain'), { recursive: true });
+      writeFileSync(join(home, '.gbrain', 'upgrade-state.json'), JSON.stringify({ last_upgrade: { from: '0.0.1.0', to: VERSION } }));
+      const { __resetBehaviorNoticeForTests, BEHAVIOR_NOTICE_CODE, takeLocalBehaviorNotice } = await import('../src/core/behavior-change-notice.ts');
+      // A brain older than this release has pending behavior changes, so the stdio behavior notice is due.
+      await engine.executeRaw("UPDATE sources SET created_at = now() - interval '30 days'");
+      await withEnv({ HOME: home, GBRAIN_HOME: home, GBRAIN_NO_ONBOARD_NUDGE: undefined }, async () => {
+        __resetPostUpgradeNoticeForTests();
+        __resetBehaviorNoticeForTests();
+        op.handler = async () => ({ status: 'error', error: 'invalid_params', code: 'invalid_params', message: '1 of 2 item(s) failed.',
+          items: [{ index: 0, request_id: 'r0', status: 'failed', error: { code: 'invalid_params', message: 'refused' } }, { index: 1, request_id: 'r1', status: 'inserted', id: 7 }],
+          saved: 1, failed: 1, partial: true });
+        const res = await dispatchToolCall(engine as any, 'remember', { items: ['alice-example likes tea', 'alice-example likes jazz'], provenance: 'test' }, { remote: true, transport: 'stdio', sourceId: 'default' });
+        expect(res.isError).toBe(true);
+        expect(takePostUpgradeMcpNotice()?.code).toBe('post_upgrade');
+        expect((await takeLocalBehaviorNotice(engine as any, 'stdio', { cfg: null }))?.code).toBe(BEHAVIOR_NOTICE_CODE);
+      });
+    } finally {
+      op.handler = original;
       rmSync(home, { recursive: true, force: true });
       __resetPostUpgradeNoticeForTests();
     }

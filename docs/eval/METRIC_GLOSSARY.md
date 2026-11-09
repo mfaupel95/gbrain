@@ -138,7 +138,7 @@ Every metric `gbrain eval *` and `gbrain search stats` reports has a plain-Engli
 
 **Key:** `cost_per_query_usd`
 
-**Plain English:** Sum of LLM + embedding API charges for one search call. Includes Haiku expansion call (tokenmax mode only) + embedding cost + downstream answer-model cost if measured.
+**Plain English:** Sum of LLM + embedding API charges for one search call. Includes the expansion call when expansion is on (off by default) + embedding cost + downstream answer-model cost if measured.
 
 **Range:** 0..unbounded. Conservative mode is typically <\$0.001 per call; tokenmax with answer-gen can exceed \$0.01.
 
@@ -148,7 +148,7 @@ Every metric `gbrain eval *` and `gbrain search stats` reports has a plain-Engli
 
 **Plain English:** 99th percentile wall-clock time per search call. The latency that 1% of users see — long-tail experience, not the average.
 
-**Range:** 0..unbounded. Warm-cache hits should be <50ms; tokenmax with expansion can exceed 200ms due to the Haiku call.
+**Range:** 0..unbounded. Warm-cache hits should be <50ms; a query with expansion on can exceed 1s due to the expansion call.
 
 ## Result-Sizing Metrics
 

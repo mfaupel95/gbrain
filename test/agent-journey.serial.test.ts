@@ -250,13 +250,15 @@ describe('H1a keyless MCP journey (stdio)', () => {
     expect(text0.startsWith(NOTICE_PREFIX)).toBe(false);
     const result = body(recalled);
     expect(JSON.stringify(result)).toContain(MARKER);
-    expect(result.results.length).toBe(PAGES);
+    // The imported pages, plus memory/unattributed: a fact remembered without an entity is a row of its fence (GBRA-190 G4).
+    expect(result.results.length).toBe(PAGES + 1);
     // The degraded notice is its own prefixed block (the model sees it) and mirrored in _meta.
+    // A recall that passes only `query` also carries the recall_hint (TC7) naming `question`.
     const blocks = noticeBlocks(recalled);
-    expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.split('\n')[0]).toBe('[gbrain notice degraded_recall kind=degraded]');
+    expect(blocks.map(b => b.split('\n')[0])).toEqual(['[gbrain notice degraded_recall kind=degraded]', '[gbrain notice recall_hint kind=info]']);
     expect(blocks[0]).toContain('never as "the brain has nothing on this"');
-    expect(recalled._meta?.gbrain_notices?.map((n: { code: string }) => n.code)).toEqual(['degraded_recall']);
+    expect(recalled._meta?.gbrain_notices?.map((n: { code: string }) => n.code)).toEqual(['degraded_recall', 'recall_hint']);
+    expect(result.facts_order).toBe('newest');
     journeyGolden('recall-degraded.json', recalled, { home });
 
     // Caller mistake: one block, an envelope with a fix the agent runs as given.

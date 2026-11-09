@@ -1,11 +1,13 @@
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
-import { assertPageRevision, type PageSnapshot } from './page-state/types.ts';
+import { assertPageRevision, PageRevisionConflictError, RevisionBackfillPendingError, type PageSnapshot } from './page-state/types.ts';
 import { pipelined } from './page-state/transactions.ts';
+import { PageSourceMissingError } from './page-state/guards.ts';
+import { beliefCoveredSources, unmanagedBeliefPoint } from './belief/projection-point.ts';
 import { executeRawJsonb } from './sql-query.ts';
 import { pageSnapshotKey } from './page-snapshot-batch.ts';
 import { sanitizeForJsonb } from './batch-rows.ts';
 import { replaceWantedLinks, type WantedLinksReplacement } from './wanted-links-store.ts';
-import { applyTemporalEvidence, relationshipKeysForOrigin } from './link-temporal-apply.ts';
+import { applyTemporalEvidence, relationshipKeysForOrigin, type TemporalBody } from './link-temporal-apply.ts';
 import { primeRelationSemantics } from './link-semantics-pack.ts';
 import { effectiveRangesEnabled, LINK_EXTRACTION_GENERATION_KEY, type LineGrammarSettings } from './line-grammar.ts';
 
@@ -38,6 +40,8 @@ export interface DerivedLinkReplacementOptions {
    * so a page is never published from one setting and ranged from another.
    */
   lineGrammar?: LineGrammarSettings;
+  /** The origin body's temporal inputs, read at preparation; a segmented origin's body is never read inside the publication. */
+  temporalBody?: TemporalBody;
 }
 
 export class DerivedLinkRepairRequiredError extends Error {
@@ -64,9 +68,51 @@ export async function replaceDerivedLinksUnlessSettingsChanged(engine: Pick<Brai
   catch (error) { if (error instanceof DerivedLinkSettingsChangedError) return null; throw error; }
 }
 
+/**
+ * #6272: a concurrent writer moved a link endpoint after type resolution, or the origin itself after its snapshot
+ * read. Instance checks only: settings changes, backfill-pending revisions and every other error stay fatal.
+ */
+export function isConcurrentLinkWriteConflict(error: unknown): boolean {
+  return (error instanceof DerivedLinkEndpointChangedError && !(error instanceof DerivedLinkSettingsChangedError))
+    || (error instanceof PageRevisionConflictError && !(error instanceof RevisionBackfillPendingError));
+}
+
+/**
+ * A deferring caller's outcome for one origin: written, left stale by a settings change or a concurrent write, or
+ * (#6808) refused because the origin's source or a link target's source has no sources row (the missing source id).
+ */
+export type DeferredDerivedLinkOutcome = { created: number; removed: number } | 'settings_changed' | 'concurrent_write' | { unknownSource: string };
+
+/** replaceDerivedLinksUnlessSettingsChanged for a run that defers (and counts) pages a concurrent writer moved or whose source is gone. */
+export async function replaceDerivedLinksDeferringConflicts(engine: Pick<BrainEngine, 'replaceDerivedLinks'>,
+  ...args: Parameters<BrainEngine['replaceDerivedLinks']>): Promise<DeferredDerivedLinkOutcome> {
+  try { return await replaceDerivedLinksUnlessSettingsChanged(engine, ...args) ?? 'settings_changed'; }
+  catch (error) {
+    if (error instanceof PageSourceMissingError) return { unknownSource: error.sourceId };
+    if (isConcurrentLinkWriteConflict(error)) return 'concurrent_write';
+    throw error;
+  }
+}
+
+/** #6808: a page a DB link drain deferred because a source it writes through has no sources row. */
+export interface UnknownSourceSkip { slug: string; source_id: string; missing_source: string }
+
+/** The operator line for unknown-source deferrals: unlike the lines above, re-running extraction does not clear them. */
+export function unknownSourceSkipLine(skips: readonly UnknownSourceSkip[]): string {
+  const missing = [...new Set(skips.map(s => s.missing_source))].sort();
+  const sample = skips.slice(0, 5).map(s => `${s.source_id}:${s.slug}`).join(', ');
+  return `Skipped ${skips.length} page(s) because source(s) ${missing.join(', ')} have no sources row (unknown_source; e.g. ${sample}); ` +
+    'their links and watermark were kept and the run is incomplete for them. Re-running extract does not fix this: re-register the source ' +
+    '(`gbrain sources list` shows the registered ones) or remove its pages.';
+}
+
 /** The operator line for pages a settings change left stale mid-run. */
 export const settingsChangedSkipLine = (n: number) =>
   `Skipped ${n} page(s) because the line-grammar settings changed during this run; they stay stale. Run \`gbrain extract --stale\` to finish them.`;
+
+/** The operator line for pages a concurrent write left stale mid-run. */
+export const concurrentWriteSkipLine = (n: number) =>
+  `Skipped ${n} page(s) another writer changed during this run (the page or a link target); their links and watermark were kept, so they stay stale. Run \`gbrain extract --stale\` to finish them.`;
 
 export async function applyAttendanceDelta(tx: Pick<BrainEngine, 'executeRaw' | 'addLinksBatch'>,
   origin: { id: string; slug: string; source_id: string; type: string }, remove: string[], additions: LinkBatchInput[]) {
@@ -122,21 +168,24 @@ const lockedExtractionGeneration = async (tx: BrainEngine) => (await tx.executeR
   'SELECT value FROM config WHERE key = $1 FOR SHARE', [LINK_EXTRACTION_GENERATION_KEY]))[0]?.value ?? null;
 
 export async function replaceDerivedLinks(
-  engine: Pick<BrainEngine, 'transaction'>,
+  engine: Pick<BrainEngine, 'transaction' | 'executeRaw'>,
   origin: DerivedLinkOrigin,
   links: LinkBatchInput[],
   opts: DerivedLinkReplacementOptions = {},
 ): Promise<{ created: number; removed: number }> {
   const { producers, rows } = derivedLinkRows(origin, links, opts);
-  return engine.transaction(async tx => {
+  const beliefs = unmanagedBeliefPoint(origin.sourceId, [origin.slug], 'derived_links');
+  const result = await engine.transaction(async tx => {
     await pipelined(tx, [
       async () => { if (!opts.semanticsPrimed) await primeRelationSemantics(tx); },
       () => tx.lockPageKeys(derivedLinkLockKeys(origin, rows)),
     ]);
     if (opts.lineGrammar && await lockedExtractionGeneration(tx) !== opts.lineGrammar.generation) throw new DerivedLinkSettingsChangedError();
     const snapshot = origin.snapshot !== undefined ? origin.snapshot : await tx.readPageSnapshot(origin.slug, { sourceId: origin.sourceId });
-    return publishDerivedLinks(tx, origin, producers, rows, opts, snapshot);
+    return beliefs.run(tx, () => publishDerivedLinks(tx, origin, producers, rows, opts, snapshot));
   });
+  await beliefs.commit(engine);
+  return result;
 }
 
 export interface DerivedLinkBatchItem { origin: DerivedLinkOrigin; links: LinkBatchInput[]; opts?: DerivedLinkReplacementOptions }
@@ -151,12 +200,13 @@ export interface DerivedLinkBatchItem { origin: DerivedLinkOrigin; links: LinkBa
  * one by one through replaceDerivedLinks.
  */
 export async function replaceDerivedLinksBatch(
-  engine: Pick<BrainEngine, 'transaction'>,
+  engine: Pick<BrainEngine, 'transaction' | 'executeRaw'>,
   items: readonly DerivedLinkBatchItem[],
 ): Promise<Array<{ created: number; removed: number }>> {
   const prepared = items.map(item => ({ origin: item.origin, opts: item.opts ?? {}, ...derivedLinkRows(item.origin, item.links, item.opts ?? {}) }));
   if (!prepared.length) return [];
-  return engine.transaction(async tx => {
+  const beliefs = prepared.map(item => unmanagedBeliefPoint(item.origin.sourceId, [item.origin.slug], 'derived_links'));
+  const results = await engine.transaction(async tx => {
     await pipelined(tx, [
       async () => { if (prepared.some(item => !item.opts.semanticsPrimed)) await primeRelationSemantics(tx); },
       () => tx.lockPageKeys(prepared.flatMap(item => derivedLinkLockKeys(item.origin, item.rows))),
@@ -167,29 +217,34 @@ export async function replaceDerivedLinksBatch(
     }
     const { snapshots } = await tx.readPageSnapshotsBatch(prepared.filter(item => item.origin.snapshot === undefined)
       .map(item => ({ slug: item.origin.slug, sourceId: item.origin.sourceId })), { maxBytes: Number.MAX_SAFE_INTEGER });
+    const covered = await beliefCoveredSources(tx, prepared.map(item => item.origin.sourceId));
     const results: Array<{ created: number; removed: number }> = [];
-    for (const { origin, producers, rows, opts } of prepared) {
+    for (const [i, { origin, producers, rows, opts }] of prepared.entries()) {
       const snapshot = origin.snapshot !== undefined ? origin.snapshot : snapshots.get(pageSnapshotKey(origin.sourceId, origin.slug)) ?? null;
-      results.push(await publishDerivedLinks(tx, origin, producers, rows, opts, snapshot));
+      const publish = () => publishDerivedLinks(tx, origin, producers, rows, opts, snapshot);
+      results.push(await (covered.has(origin.sourceId) ? beliefs[i]!.run(tx, publish) : publish()));
     }
     return results;
   });
+  for (const point of beliefs) await point.commit(engine);
+  return results;
 }
 
 /**
  * Publish through replaceDerivedLinksBatch; when that transaction fails,
- * replay the origins one by one so every outcome is the unbatched one: null
- * for a settings-changed skip, and the first failing origin's error thrown
- * (after `onError`) with the origins before it committed.
+ * replay the origins one by one so every outcome is the unbatched one:
+ * `settings_changed` for a settings-changed skip, `concurrent_write` for an
+ * origin a concurrent writer moved (#6272), `{ unknownSource }` for a missing source (#6808), and any other failing origin's
+ * error thrown (after `onError`) with the origins before it committed.
  */
 export async function replaceDerivedLinksBatchOrReplay(engine: Pick<BrainEngine, 'replaceDerivedLinks' | 'replaceDerivedLinksBatch'>,
-  items: readonly DerivedLinkBatchItem[], onError?: (item: DerivedLinkBatchItem) => void): Promise<Array<{ created: number; removed: number } | null>> {
+  items: readonly DerivedLinkBatchItem[], onError?: (item: DerivedLinkBatchItem) => void): Promise<DeferredDerivedLinkOutcome[]> {
   if (!items.length) return [];
   try { return await engine.replaceDerivedLinksBatch(items); }
   catch {
-    const results: Array<{ created: number; removed: number } | null> = [];
+    const results: DeferredDerivedLinkOutcome[] = [];
     for (const item of items) {
-      try { results.push(await replaceDerivedLinksUnlessSettingsChanged(engine, item.origin, item.links, item.opts)); }
+      try { results.push(await replaceDerivedLinksDeferringConflicts(engine, item.origin, item.links, item.opts)); }
       catch (error) { onError?.(item); throw error; }
     }
     return results;
@@ -234,7 +289,7 @@ async function publishDerivedLinks(tx: BrainEngine, origin: DerivedLinkOrigin, p
     () => opts.lineGrammar ? Promise.resolve(opts.lineGrammar.effectiveRanges) : effectiveRangesEnabled(tx),
   ]) as [unknown, Awaited<ReturnType<typeof relationshipKeysForOrigin>>, unknown[], unknown[], unknown[], Existing[], boolean];
   const withTemporal = async (result: { created: number; removed: number }) => {
-    await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore, { inlineRanges });
+    await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore, { inlineRanges, body: opts.temporalBody });
     return result;
   };
   if (ambiguous.length) throw new DerivedLinkRepairRequiredError();

@@ -8,6 +8,11 @@
  * - unconfirmed standing preferences: facts of kind preference/commitment at
  *   agent_written or lower that the write gate flagged `standing_instruction`;
  * - write-gate holds (`h<id>`);
+ * - contradictions (`dp<id>`): pending decide_proposals whose two facts are
+ *   both still active, from the keyless claim lane (facts/claim-conflicts.ts)
+ *   and the paid conflict sweep alike; each carries supersede (accept), forget
+ *   (the proposed fact), confirm (the proposed fact) and drop (reject) with the
+ *   actor and consent of each;
  * - the owner's active allow rules (`a<id>`) and the kill-switch state.
  *
  * Items are grouped by day and page (many agent edits to one page are one
@@ -20,6 +25,7 @@ import { opError } from '../ops/contract.ts';
 import { currentHoldStore, trustKillSwitchState } from './owner-actions.ts';
 import { getTrustProposal, listTrustProposals, pendingTrustProposalsFor, trustProposalRef, type TrustProposalAction, type TrustProposalRow } from './proposals.ts';
 import { lowerPageState, readPageTrustState } from './page-handlers.ts';
+import { TRUST_MARKER_REPAIR_COMMAND } from './marker-repair.ts';
 import { formatTrustRef, pageRef, parseTrustRef, resolvePageRef } from './refs.ts';
 import { compareTrust, OWNER_TIER_FLOOR, storedTrustTier, trustLabel, USER_SAID_ORIGIN_MARKER, type TrustTier } from './tier.ts';
 import { isUserSaid, trustFields, trustLabelWords } from '../eligibility/labels.ts';
@@ -28,7 +34,7 @@ import { claimPendingSql, TRUST_CLAIM_RESUME_COMMAND } from './claim-state.ts';
 import { listTrustAllowRules, type TrustAllowRule } from './allow-rules.ts';
 import { isQuarantined } from '../quarantine.ts';
 
-export const TRUST_REVIEW_KINDS = ['proposal', 'lowered_page', 'preference', 'hold'] as const;
+export const TRUST_REVIEW_KINDS = ['proposal', 'lowered_page', 'preference', 'hold', 'contradiction'] as const;
 export type TrustReviewKind = typeof TRUST_REVIEW_KINDS[number];
 
 export interface TrustReviewItem {
@@ -46,8 +52,13 @@ export interface TrustReviewItem {
   label: string;
   summary: string;
   /** Complete argv per decision (DX-7). Tier-raising ones are the user's to run on a TTY (DX-3). */
-  commands: Partial<Record<'confirm' | 'drop' | 'release' | 'revert' | 'explain', string[]>>;
+  commands: Partial<Record<TrustReviewCommand, string[]>>;
+  /** Contradiction items: who runs each command, the consent it needs, whether it can be undone and how. */
+  command_meta?: Partial<Record<TrustReviewCommand, TrustReviewCommandMeta>>;
 }
+
+export type TrustReviewCommand = 'confirm' | 'drop' | 'release' | 'revert' | 'repair' | 'explain' | 'supersede' | 'forget';
+export interface TrustReviewCommandMeta { actor: 'agent' | 'user'; consent: 'ask_user' | 'owner_tty'; durable: boolean; undo?: string[]; why: string }
 
 export interface TrustReviewFilter {
   /** `--from <source>` */
@@ -74,7 +85,10 @@ const snippet = (text: unknown, max = 80): string => {
   return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
 };
 const trust = (...args: string[]): string[] => ['gbrain', 'trust', ...args];
-const rowRef = (table: string | null, id: number | null): string => id === null ? '' : `${table === 'facts' ? 'f' : table === 'takes' ? 't' : table === 'pages' ? 'page ' : ''}${id}`;
+const rowRef = (table: string | null, id: number | null): string => id === null ? ''
+  : `${table === 'facts' ? 'f' : table === 'takes' ? 't' : table === 'pages' ? 'page ' : table === 'timeline_entries' ? 'timeline row ' : ''}${id}`;
+/** W1 #6783 §12 (a): what a held lower-tier write would have done (trust/fence-guard.ts). */
+const HELD_VERBS: Record<string, string> = { removed: 'remove', replaced: 'replace', deactivated: 'deactivate', detail_changed: 'rewrite' };
 
 export function parseTrustReviewKind(value: string): string {
   if ((TRUST_REVIEW_KINDS as readonly string[]).includes(value) || PROPOSAL_ACTIONS.includes(value)) return value;
@@ -106,14 +120,22 @@ async function pageOf(engine: BrainEngine, p: TrustProposalRow): Promise<string 
     const [f] = await engine.executeRaw<{ slug: string | null }>('SELECT source_markdown_slug AS slug FROM facts WHERE id = $1', [p.target_id]);
     return f?.slug ? pageRef(p.source_id, f.slug) : null;
   }
-  if (p.target_table === 'takes') {
-    const [t] = await engine.executeRaw<{ slug: string }>('SELECT p.slug FROM takes t JOIN pages p ON p.id = t.page_id WHERE t.id = $1', [p.target_id]);
+  if (p.target_table === 'takes' || p.target_table === 'timeline_entries') {
+    const [t] = await engine.executeRaw<{ slug: string }>(`SELECT p.slug FROM ${p.target_table} t JOIN pages p ON p.id = t.page_id WHERE t.id = $1`, [p.target_id]);
     return t ? pageRef(p.source_id, t.slug) : null;
   }
   return null;
 }
 
-function proposalItem(p: TrustProposalRow, page: string | null): TrustReviewItem {
+/** #6550: an agent edit lowered the page to unknown only because its frontmatter still carries an `unknown` marker. */
+async function loweredByUnknownMarker(engine: BrainEngine, p: TrustProposalRow): Promise<boolean> {
+  const s = lowerPageState(p);
+  if (s.edited_tier !== 'unknown' || s.prior_tier === 'unknown') return false;
+  const [row] = await engine.executeRaw<{ marker: string | null }>(`SELECT frontmatter->>'trust_tier' AS marker FROM pages WHERE id = $1`, [p.target_id]);
+  return row?.marker === 'unknown';
+}
+
+function proposalItem(p: TrustProposalRow, page: string | null, markerRepair = false): TrustReviewItem {
   const ref = trustProposalRef(p.id);
   if (p.action === 'lower_page') {
     const s = lowerPageState(p);
@@ -121,13 +143,15 @@ function proposalItem(p: TrustProposalRow, page: string | null): TrustReviewItem
       ref, kind: 'lowered_page', detail: p.action, source_id: p.source_id, page, day: day(p.updated_at), created_at: p.created_at,
       tier: s.edited_tier, label: trustLabel(s.edited_tier),
       summary: `An agent edit lowered ${page ?? `page ${p.target_id}`} from "${trustLabel(s.prior_tier)}" to "${trustLabel(s.edited_tier)}"`,
-      commands: { confirm: trust('confirm', ref), ...(s.version_id !== null ? { revert: trust('revert', ref) } : {}), drop: trust('drop', ref), explain: trust('explain', ref) },
+      commands: { confirm: trust('confirm', ref), ...(s.version_id !== null ? { revert: trust('revert', ref) } : {}), drop: trust('drop', ref),
+        ...(markerRepair ? { repair: [...TRUST_MARKER_REPAIR_COMMAND] } : {}), explain: trust('explain', ref) },
     };
   }
   const tier = storedTrustTier(p.after_state.tier ?? p.before_state.related_tier ?? p.before_state.new_tier);
   const target = rowRef(p.target_table, p.target_id);
   const related = rowRef(p.related_table, p.related_id);
-  const what = p.action === 'forget' ? `An agent asked to forget ${target}`
+  const held = p.action === 'forget' ? HELD_VERBS[String(p.before_state.change)] : undefined;
+  const what = held ? `A lower-trust write would ${held} ${target}` : p.action === 'forget' ? `An agent asked to forget ${target}`
     : `${related || 'A lower-trust write'} would ${p.action === 'confirm' ? 'confirm' : 'supersede'} ${target}`;
   return {
     ref, kind: 'proposal', detail: p.action, source_id: p.source_id, page, day: day(p.created_at), created_at: p.created_at,
@@ -170,6 +194,41 @@ async function holds(engine: BrainEngine, filter: TrustReviewFilter): Promise<Tr
   }));
 }
 
+/** Pending decide_proposals whose two facts are both active (a decided or stale pair is not listed). */
+async function contradictions(engine: BrainEngine, filter: TrustReviewFilter): Promise<TrustReviewItem[]> {
+  const active = (a: string) => `${a}.expired_at IS NULL AND (${a}.valid_until IS NULL OR ${a}.valid_until > now())`;
+  const rows = await engine.executeRaw<Record<string, unknown>>(
+    `SELECT p.id, p.source_id, p.sweep_id, p.created_at, p.new_fact_id, p.old_fact_id, n.fact AS new_fact, o.fact AS old_fact, n.trust_tier,
+            n.entity_slug, COALESCE(n.source_markdown_slug, o.source_markdown_slug) AS slug, n.claim_metric, n.claim_unit, n.claim_period,
+            n.claim_value AS new_value, o.claim_value AS old_value
+       FROM decide_proposals p
+       JOIN facts n ON n.id = p.new_fact_id AND n.source_id = p.source_id AND ${active('n')}
+       JOIN facts o ON o.id = p.old_fact_id AND o.source_id = p.source_id AND ${active('o')}
+      WHERE p.status = 'pending' AND ($1::text IS NULL OR p.source_id = $1) AND ($2::timestamptz IS NULL OR p.created_at >= $2)
+      ORDER BY p.created_at, p.id LIMIT 1000`, [filter.sourceId ?? null, filter.since?.toISOString() ?? null]);
+  return rows.map(r => {
+    const id = String(Number(r.id)), newer = `f${Number(r.new_fact_id)}`, older = `f${Number(r.old_fact_id)}`;
+    const created = new Date(r.created_at as string).toISOString();
+    const tier = storedTrustTier(r.trust_tier);
+    const claimLane = String(r.sweep_id).startsWith('claim_conflicts:');
+    const slot = [r.claim_metric, r.claim_unit, r.claim_period].filter(Boolean).join(' ');
+    const values = claimLane ? ` (${slot}: ${Number(r.new_value)} vs ${Number(r.old_value)})` : '';
+    const decide = (verb: string) => ['gbrain', 'decide', 'proposals', verb, id];
+    return {
+      ref: `dp${id}`, kind: 'contradiction' as const, detail: claimLane ? 'claim_conflict' : 'conflict', source_id: String(r.source_id),
+      page: r.slug ? pageRef(String(r.source_id), String(r.slug)) : null, day: day(created), created_at: created, tier, label: trustLabel(tier),
+      summary: `${newer} "${snippet(r.new_fact, 60)}" contradicts ${older} "${snippet(r.old_fact, 60)}"${values} about ${r.entity_slug ?? 'no entity'}`,
+      commands: { supersede: decide('accept'), forget: ['gbrain', 'forget', newer.slice(1), '--source', String(r.source_id)], confirm: trust('confirm', newer), drop: decide('reject') },
+      command_meta: {
+        supersede: { actor: 'agent', consent: 'ask_user', durable: false, undo: decide('undo'), why: `The proposed fact is right: ${newer} supersedes ${older}.` },
+        forget: { actor: 'agent', consent: 'ask_user', durable: true, why: `The proposed fact is wrong: withdraw ${newer}; ${older} stays current and dp${id} goes stale. A withdrawal has no undo.` },
+        confirm: { actor: 'user', consent: 'owner_tty', durable: false, why: `Raise ${newer} to confirmed by you (typed at the terminal); dp${id} stays pending until you supersede or drop it.` },
+        drop: { actor: 'agent', consent: 'ask_user', durable: false, why: `Not a contradiction: reject dp${id}; both facts stay current and the pair is not proposed again.` },
+      },
+    };
+  });
+}
+
 /** The review queue, filtered. Read-only. */
 export async function buildTrustReview(engine: BrainEngine, filter: TrustReviewFilter = {}): Promise<TrustReview> {
   const items: TrustReviewItem[] = [];
@@ -178,11 +237,12 @@ export async function buildTrustReview(engine: BrainEngine, filter: TrustReviewF
       : filter.kind === 'lowered_page' ? 'lower_page' : undefined;
     for (const p of await listTrustProposals(engine, { status: 'pending', sourceId: filter.sourceId, action, since: filter.since, limit: 1000 })) {
       if (filter.kind === 'proposal' && p.action === 'lower_page') continue;
-      items.push(proposalItem(p, await pageOf(engine, p)));
+      items.push(proposalItem(p, await pageOf(engine, p), p.action === 'lower_page' && await loweredByUnknownMarker(engine, p)));
     }
   }
   if (wants(filter, 'preference')) items.push(...await standingPreferences(engine, filter));
   if (wants(filter, 'hold')) items.push(...await holds(engine, filter));
+  if (wants(filter, 'contradiction')) items.push(...await contradictions(engine, filter));
   items.sort((a, b) => a.day.localeCompare(b.day) || (a.page ?? '').localeCompare(b.page ?? '') || a.created_at.localeCompare(b.created_at) || a.ref.localeCompare(b.ref));
   const groups: TrustReview['groups'] = [];
   for (const item of items) {
@@ -228,7 +288,7 @@ export function renderTrustReview(review: TrustReview): string {
   }
   const c = review.counts;
   if (review.items.length) {
-    lines.push('', `${review.items.length} item(s): ${c.proposal} proposal(s), ${c.lowered_page} lowered page(s), ${c.preference} unconfirmed preference(s), ${c.hold} held write(s).`,
+    lines.push('', `${review.items.length} item(s): ${c.proposal} proposal(s), ${c.lowered_page} lowered page(s), ${c.preference} unconfirmed preference(s), ${c.hold} held write(s)${c.contradiction ? `, ${c.contradiction} contradiction(s)` : ''}.`,
       'Confirming or releasing raises trust: run the command yourself in a terminal and type the token it asks for. Explain any item: gbrain trust explain <ref>.');
   }
   return lines.join('\n');

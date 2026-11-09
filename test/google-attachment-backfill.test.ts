@@ -12,18 +12,24 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
+import { legacyForget } from './helpers/legacy-forget.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { sanitizeRemoteBody } from '../src/core/remote-body.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { syncLockId } from '../src/core/db-lock.ts';
+import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 import { createConnectorFixture, options, json, settleConnectorWrites, sourceCheckpoint } from './helpers/connector-fixture.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { testWaitMs } from './helpers/wait-for.ts';
 
 const { engines, env, source, boundSource, setup, teardown } = createConnectorFixture();
-beforeAll(setup, 120_000);
-afterAll(teardown);
+// Every repair below asserts its receipt write committed, so each publish waits the fixture's slow-host settle time
+// (as settleConnectorWrites does) instead of the 5 s production publish wait, which a loaded VM overruns (write_pending).
+let restoreWriteWait = () => {};
+beforeAll(async () => { restoreWriteWait = __setMaintenanceWriteWaitForTests(testWaitMs(30_000)); await setup(); }, 120_000);
+afterAll(async () => { restoreWriteWait(); await teardown(); });
 const config = { kind: 'google', g_account: 'reader@example.com', g_services: 'gmail', g_access: 'env', g_token_env: 'CONNECTOR_TEST_TOKEN' };
 const claim = 'syntheticwithdrawalsentinel prefers amber fixtures';
 const ctx = (engine: BrainEngine, sourceId: string) => ({ engine, sourceId, config: { engine: engine.kind }, remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } });
@@ -188,7 +194,9 @@ test('withdrawal wins after receipt preparation but before real canonical public
     expect(claimed.id).toBe(admitted.id);
     const prepared = await prepareConnectorMutation(engine, claimed);
     const [fact] = await engine.executeRaw<{ id: number }>('SELECT id FROM facts WHERE source_id=$1 ORDER BY id LIMIT 1', [f.id]);
-    await submitForgetMutation(ctx(engine, f.id), 'forget_fact', { id: Number(fact.id) });
+    // A current forget queues behind the claimed request on its root; a gbrain before G4 sharing the brain still commits
+    // its withdrawal database-first, at any moment (test/helpers/legacy-forget.ts).
+    await legacyForget(ctx(engine, f.id), Number(fact.id));
     const result = await publishMutation(engine, claimed, prepared);
     expect(result.state).toBe('conflict');
     const current = (await engine.readPageSnapshot(slug(1), { sourceId: f.id }))!;

@@ -39,7 +39,7 @@ import { managedPersistenceEnabled } from './persistence/ownership.ts';
  */
 
 import { existsSync, mkdirSync, renameSync, rmSync, lstatSync, realpathSync } from 'fs';
-import { join, dirname, basename, resolve as resolvePath } from 'path';
+import { join, dirname, basename, isAbsolute, resolve as resolvePath } from 'path';
 import { isPathContained, msysToNativePath } from './path-confine.ts';
 import { mkdirPrivate } from './atomic-write.ts';
 import { randomBytes } from 'crypto';
@@ -56,9 +56,13 @@ import {
 } from './git-remote.ts';
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
+import { googleTuningConfig } from './google/source-config.ts';
+import { isSyncStrategy, type SyncStrategy } from './sync.ts';
 import { DEFAULT_CALENDAR_ID } from './google/types.ts';
 import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 import { deleteSourceRow } from './source-delete.ts';
+import { defaultCloneDir, isOwnedClone } from './url-clone.ts';
+import { hookSessionCwd } from './session-cwd.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -120,6 +124,8 @@ export interface SourceListEntry {
   local_path: string | null;
   remote_url: string | null;
   federated: boolean;
+  /** Persisted `config.strategy` (`gbrain sources set-strategy`); null means sync falls back to 'markdown'. */
+  strategy: SyncStrategy | null;
   page_count: number;
   last_sync_at: string | null;
 }
@@ -149,6 +155,8 @@ export interface AddSourceOpts {
   expectedIncarnation?: string;
   localPath?: string | null;
   remoteUrl?: string;
+  /** The URL came from a remote caller: its clone and every later pull run without git-lfs downloads. */
+  addedByRemoteCaller?: boolean;
   federated?: boolean | null;
   /**
    * Override clone destination. Defaults to $GBRAIN_HOME/clones/<id>/.
@@ -196,6 +204,12 @@ export interface AddSourceOpts {
     historyDays: number;
     /** Calendar swept by this source (default DEFAULT_CALENDAR_ID). */
     calendarId?: string;
+    /** #4845: directory under `dir` for contact pages (`g_contacts_dir`; default `people`). */
+    contactsDir?: string;
+    /** #5442: days ahead the calendar sweep covers (`g_future_days`; default CALENDAR_HORIZON_DAYS when absent). */
+    futureDays?: number;
+    /** #5445: Gmail label names/ids whose threads never enter loop extraction (`g_loops_exclude_labels`). */
+    loopsExcludeLabels?: string[];
     /** Managed dir where pages are materialized. */
     dir: string;
     /** Token acquisition: gbrain vault (default), a token-printing command, or an env var. */
@@ -203,6 +217,18 @@ export interface AddSourceOpts {
     tokenCommand?: string;
     tokenEnv?: string;
   };
+  /**
+   * Register a meetings-kind source (meeting notes from a provider API). The
+   * API key lives in the connector credential store or the env var named by
+   * `tokenEnv`; no secret lands in sources.config. See src/core/meetings/.
+   */
+  meetings?: import('./meetings/source-add.ts').AddSourceMeetingsOpts;
+  /**
+   * Register a slack-kind source (channel history from the Slack Web API). The
+   * token lives in the connector credential store or the env var named by
+   * `tokenEnv`; no secret lands in sources.config. See src/core/slack/.
+   */
+  slack?: import('./slack/source-add.ts').AddSourceSlackOpts;
 }
 
 export interface RemoveSourceOpts {
@@ -302,11 +328,6 @@ async function countVisiblePages(engine: BrainEngine, id: string): Promise<numbe
   return rows[0]?.n ?? 0;
 }
 
-/** Default clone dir for a remote-URL source: $GBRAIN_HOME/clones/<id>/ */
-export function defaultCloneDir(id: string): string {
-  return gbrainPath('clones', id);
-}
-
 /** Temp clone dir under $GBRAIN_HOME/clones/.tmp/<id>-<rand>/ */
 function makeTempCloneDir(id: string): string {
   const rand = randomBytes(6).toString('hex');
@@ -318,39 +339,8 @@ function makeTempCloneDir(id: string): string {
 // importers (and recloneIfMissing below) keep working unchanged.
 export { isPathContained };
 
-/**
- * Did gbrain CREATE this clone (so re-clone/delete is safe)? Ownership, NOT
- * path-containment — a user-supplied working tree is NEVER owned, even if it
- * happens to sit under $GBRAIN_HOME. This is the #1881 guard: recloneIfMissing
- * deletes local_path, so it must only ever fire on a clone gbrain owns.
- *
- * Ownership is proven by either:
- *   1. config.managed_clone === true — written by addSource's --url path
- *      (covers both default-location and --clone-dir clones), OR
- *   2. local_path === defaultCloneDir(id) — back-compat for clones created
- *      before the marker existed (gbrain's default location), via exact
- *      normalized-path equality (symlink-free, so none of isPathContained's
- *      symlinked-parent / lexical-escape edge cases apply).
- *
- * Everything else is fail-closed (NOT owned → refuse to touch): the bug's
- * federated row (remote_url + a user tree), and pre-marker --clone-dir clones
- * (rare, local-only) which are byte-for-byte indistinguishable from it. Those
- * must be re-added to regain auto-reclone — the correct trade-off when ownership
- * is unprovable.
- */
-export function isOwnedClone(src: {
-  id: string;
-  local_path: string | null;
-  config: unknown;
-}): boolean {
-  if (!src.local_path) return false;
-  const cfg =
-    typeof src.config === 'string'
-      ? (JSON.parse(src.config) as Record<string, unknown>)
-      : ((src.config ?? {}) as Record<string, unknown>);
-  if (cfg.managed_clone === true) return true;
-  return resolvePath(src.local_path) === resolvePath(defaultCloneDir(src.id));
-}
+// `isOwnedClone` and `defaultCloneDir` live in url-clone.ts (shared with the #6946 write guards).
+export { defaultCloneDir, isOwnedClone };
 
 /**
  * Recovery hint for an unowned source with a remote_url. Splits guidance by
@@ -417,6 +407,8 @@ export async function assertNoOverlappingPath(
   const realPath = real(path);
   for (const other of others) {
     const b = other.local_path;
+    // #7630: a relative local_path names whatever directory gbrain runs from, never a tree, so it overlaps nothing.
+    if (!isAbsolute(b)) continue;
     if (overlaps(path, b) || overlaps(realPath, real(b))) {
       throw new SourceOpError(
         'overlapping_path',
@@ -439,6 +431,32 @@ export async function assertNoOverlappingPath(
  * explicit ask). Callers who want to register before git-init exists opt in
  * via `force: true` (CLI: `--force`).
  */
+/**
+ * Path E of `addSource`: `--kind meetings` and `--kind slack`. API-backed, so nothing is cloned.
+ * `database` records keep no directory (local_path NULL); `git` records commit
+ * pages into --dir, inside a Git checkout that no other source covers (a nested
+ * root would import every page twice).
+ */
+async function insertApiSource(engine: BrainEngine, opts: AddSourceOpts, kind: 'meetings' | 'slack'): Promise<void> {
+  const { chooseMeetingsRecord, meetingsSourceConfig } = await import('./meetings/source-add.ts');
+  const { slackSourceConfig } = await import('./slack/source-add.ts');
+  const request = kind === 'slack' ? opts.slack! : opts.meetings!;
+  const choice = chooseMeetingsRecord(opts.id, request.record, request.dir, kind);
+  if (choice.dir) {
+    const overlap = (await engine.executeRaw<{ id: string; local_path: string }>('SELECT id,local_path FROM sources WHERE local_path IS NOT NULL'))
+      .find(row => isPathContained(choice.dir!, row.local_path) || isPathContained(row.local_path, choice.dir!));
+    if (overlap) throw new SourceOpError('overlapping_path',
+      `${choice.dir} overlaps source "${overlap.id}" at ${overlap.local_path}; its pages would be imported by both sources. Choose a directory no other source covers.`);
+    mkdirPrivate(choice.dir);
+  }
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, local_path, config)
+         VALUES ($1, $2, $3, $4::text::jsonb)`,
+    [opts.id, opts.name ?? opts.id, choice.dir, JSON.stringify(kind === 'slack' ? slackSourceConfig(opts.slack!, choice, opts.federated, false)
+      : meetingsSourceConfig(opts.meetings!, choice, opts.federated, false))],
+  );
+}
+
 export async function addSource(
   engine: BrainEngine,
   opts: AddSourceOpts,
@@ -503,7 +521,7 @@ export async function addSource(
     !!opts.localPath &&
     !opts.remoteUrl &&
     !opts.github &&
-    !opts.google;
+    !opts.google && !opts.meetings && !opts.slack;
   if (existing.length > 0 && !attachPath) {
     const pathNote = existing[0]!.local_path
       ? ` with local_path ${existing[0]!.local_path}`
@@ -543,7 +561,7 @@ export async function addSource(
     mkdirSync(dirname(tempDir), { recursive: true });
 
     try {
-      cloneRepo(parsedUrl.url, tempDir);
+      cloneRepo(parsedUrl.url, tempDir, { skipLfs: opts.addedByRemoteCaller === true });
     } catch (e) {
       // Clone failed before we've touched the DB. tempDir may or may not
       // exist; nuke it just in case.
@@ -558,10 +576,8 @@ export async function addSource(
     // recloneIfMissing to rm+replace this clone — gbrain created it, here or at
     // a --clone-dir path. A user-tree row (created by an external INSERT, no
     // --url) never carries this, so it can never be deleted by reclone.
-    const config: Record<string, unknown> = {
-      remote_url: parsedUrl.url,
-      managed_clone: true,
-    };
+    const config: Record<string, unknown> = { remote_url: parsedUrl.url, managed_clone: true };
+    config.added_by_remote_caller = opts.addedByRemoteCaller === true;
     if (opts.federated !== null && opts.federated !== undefined) {
       config.federated = opts.federated;
     }
@@ -659,9 +675,7 @@ export async function addSource(
       g_history_days: opts.google.historyDays,
       // Only written when non-default so every existing source's config keeps
       // its exact shape (DEFAULT_CALENDAR_ID stays the parse-time fallback).
-      ...(opts.google.calendarId && opts.google.calendarId !== DEFAULT_CALENDAR_ID
-        ? { g_calendar_id: opts.google.calendarId }
-        : {}),
+      ...googleTuningConfig(opts.google),
       // Non-vault access (v0.47): 'command' runs g_token_command locally at
       // sync time (same trust class as recipe health_check argv — the google
       // kind is hard-rejected on remote sources_add and these keys are not
@@ -683,6 +697,8 @@ export async function addSource(
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
     );
+  } else if (opts.meetings || opts.slack) {
+    await insertApiSource(engine, opts, opts.slack ? 'slack' : 'meetings');
   } else {
     // ── Path B: --path or no path (existing behavior, pre-v0.28) ─────────
     // #2707: only validate when the path actually exists — a not-yet-created
@@ -713,7 +729,7 @@ export async function addSource(
           `is not enough (the walker reads through git objects, so untracked files ` +
           `stay invisible). Fix: \`git -C ${q} init && git -C ${q} add -A && ` +
           `git -C ${q} commit -m "initial import"\`, then re-run this command. To ` +
-          `register anyway and git-init later, pass --force.`,
+          `register it as a plain directory, pass --force: sync then imports its files without Git, and a file removed from it keeps its page.`,
       );
     }
     if (attachPath) {
@@ -837,7 +853,7 @@ export interface ScopedSourceResolution {
  */
 export async function resolveScopedSourceOrThrow(
   engine: BrainEngine,
-  cwd: string = process.cwd(),
+  cwd: string = hookSessionCwd(),
 ): Promise<ScopedSourceResolution> {
   const resolved = await resolveSourceWithTier(engine, null, cwd);
   if (resolved.tier !== 'seed_default') {
@@ -895,6 +911,7 @@ export async function listSources(
       local_path: r.local_path,
       remote_url: typeof cfg.remote_url === 'string' ? cfg.remote_url : null,
       federated: cfg.federated === true,
+      strategy: isSyncStrategy(cfg.strategy) ? cfg.strategy : null,
       page_count: await countVisiblePages(engine, r.id),
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
     });
@@ -984,7 +1001,11 @@ export async function removeSource(
   const gManaged = ghCfg.kind === 'google' && ghCfg.g_managed === true;
   const cloneRoot = gbrainPath('clones');
   let cloneRemoved = false;
-  if (
+  if (!opts.keepStorage && src.local_path && (remoteUrl || ghManaged || gManaged) && !isAbsolute(src.local_path)) {
+    console.error(
+      `[gbrain] WARN: clone cleanup skipped for "${opts.id}": its stored local_path "${src.local_path}" is relative, so it would name the current directory. Delete the clone by hand if you still want it gone.`,
+    );
+  } else if (
     !opts.keepStorage &&
     src.local_path &&
     (remoteUrl || ghManaged || gManaged) && // only auto-clean when gbrain managed the dir
@@ -1072,6 +1093,12 @@ export async function getSourceStatus(
 
 // ── recloneIfNeeded (used by sources.ts restore path) ──────────────────────
 
+/** A source a remote caller added by URL never downloads git-lfs objects: its repository names the LFS endpoint. */
+export function lfsDownloadsOff(config: unknown): boolean {
+  const parsed = typeof config === 'string' ? (() => { try { return JSON.parse(config) as unknown; } catch { return null; } })() : config;
+  return (parsed as Record<string, unknown> | null)?.added_by_remote_caller === true;
+}
+
 /**
  * Re-clone a source's remote_url into its local_path if the clone is
  * missing on disk. Used by `gbrain sources restore` after an operator
@@ -1102,6 +1129,10 @@ export async function recloneIfMissing(
   }
   const remoteUrl = getRemoteUrl(src.config);
   if (!remoteUrl || !src.local_path) return false;
+  if (!isAbsolute(src.local_path)) {
+    throw new SourceOpError('unmanaged_path',
+      `Refusing to re-clone "${id}": its stored local_path "${src.local_path}" is relative, so it would name the current directory. Run gbrain sources set-path ${id} <absolute-directory>, then retry.`);
+  }
 
   const state = validateRepoState(src.local_path, remoteUrl);
   if (state === 'healthy') return false;
@@ -1123,7 +1154,7 @@ export async function recloneIfMissing(
   const rand = randomBytes(6).toString('hex');
   const tempDir = join(parent, `.gbrain-reclone-${basename(src.local_path)}-${rand}`);
   try {
-    cloneRepo(remoteUrl, tempDir);
+    cloneRepo(remoteUrl, tempDir, { skipLfs: lfsDownloadsOff(src.config) });
   } catch (e) {
     rmSync(tempDir, { recursive: true, force: true });
     if (e instanceof GitOperationError) {

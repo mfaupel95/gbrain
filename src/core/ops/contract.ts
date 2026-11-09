@@ -65,6 +65,9 @@ export type ErrorCode =
   // eslint-disable-next-line @typescript-eslint/ban-types
   | (string & {});      // OPEN union for forward-compat (eE7 / D13)
 
+/** `withdrawn` on a `fact_withdrawn` refusal: `subject` is the entity slug, or `all_entities` for a claim forgotten without one. */
+export interface WithdrawnDetail { at: string; subject: string; visibility: 'world' | 'private' }
+
 export class OperationError extends Error {
   /**
    * MEMORY_VERBS v1: verb handlers set `protocolVersion` (=1) and may set
@@ -76,6 +79,8 @@ export class OperationError extends Error {
   public protocolVersion?: number;
   public writeRequest?: WriteReceipt;
   public writeError?: WriteErrorCode;
+  /** #6989: the request ID of a write that may have committed although its reply was not delivered (`response_too_large`); never invented for a read. */
+  public requestId?: string;
   /** Agent contract v1 (A1): which cause, when one code covers several. */
   public reason?: string;
   /** Agent contract v1: why it happened, for the agent to explain and weigh. */
@@ -89,6 +94,12 @@ export class OperationError extends Error {
   /** #6188 (D16, D18): a fence refusal's location and its blocking issues; location and class only, never a cell value. */
   public fence?: Record<string, unknown>;
   public fenceIssues?: Array<Record<string, unknown>>;
+  /** A `fact_withdrawn` refusal's withdrawal: when and for which subject the exact claim was forgotten. Absence carries no meaning. */
+  public withdrawn?: WithdrawnDetail;
+  /** A write-grant refusal's writable sources: only ids the caller's own grant lets it write, never another source (GBRA-200). */
+  public writableSourceIds?: string[];
+  /** #6643: a managed-sync refusal's owner-side classification (knock-on root, cursor fence snapshot); stored as the receipt's error_detail, never in the envelope. */
+  public syncRefusal?: Record<string, unknown>;
   /** Set to 1 by opError(); toJSON() emits `contract_version` only when set. */
   public contractVersion?: 1;
   /**
@@ -144,6 +155,7 @@ export class OperationError extends Error {
       detail: this.detail,
       protocol_version: this.protocolVersion,
       ...(this.writeRequest ? { write_request: publicWriteReceipt(this.writeRequest) } : {}),
+      ...(this.requestId ? { request_id: this.requestId } : {}),
       ...(this.writeError ? { write_error: this.writeError } : {}),
       ...(this.reason !== undefined ? { reason: this.reason } : {}),
       ...(this.why !== undefined ? { why: this.why } : {}),
@@ -151,6 +163,8 @@ export class OperationError extends Error {
       ...(this.notices?.length ? { notices: this.notices.map(n => wireRenderer ? wireRenderer.notice(n) : n) } : {}),
       ...(this.fence ? { fence: this.fence } : {}),
       ...(this.fenceIssues?.length ? { fence_issues: this.fenceIssues } : {}),
+      ...(this.withdrawn ? { withdrawn: this.withdrawn } : {}),
+      ...(this.writableSourceIds ? { writable_source_ids: this.writableSourceIds } : {}),
       ...(this.contractVersion !== undefined ? { contract_version: this.contractVersion } : {}),
     };
   }
@@ -177,6 +191,14 @@ export interface OpErrorOpts {
  * positional and required. Use `OperationError.bare()` only when no next step
  * can be named at the throw site.
  */
+const notAdmittedWrites = new WeakSet<OperationError>();
+/**
+ * A write refusal raised after its admission transaction rolled back, so nothing was admitted: the agent contract's
+ * safe-recovery rule (only idempotent mutations read retryable) gives way for it. Only write admission marks errors.
+ */
+export function markNotAdmitted(error: OperationError): OperationError { notAdmittedWrites.add(error); return error; }
+export function provesNotAdmitted(error: unknown): boolean { return error instanceof OperationError && notAdmittedWrites.has(error); }
+
 export function opError(code: RegistryCode, message: string, suggestion: string, opts: OpErrorOpts = {}): OperationError {
   const e = new OperationError(opts.legacy_error ?? code, message, suggestion, opts.docs);
   if (opts.legacy_error !== undefined) e.canonical = code;
@@ -235,16 +257,32 @@ export function verbError(
 }
 
 export interface ParamDef {
-  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'object' | 'array';
   required?: boolean;
   description?: string;
   default?: unknown;
   enum?: string[];
+  /**
+   * GST-927: the valid range's lower bound (inclusive / exclusive). Read by normalizeOptionalParams and carried in the
+   * operation manifest, never in the tools/list schema. Only on read ops (test/tool-args-empty-optional-sol.test.ts): on an optional param whose range excludes 0, a 0 reads as omitted. Declare it only where 0 refuses.
+   */
+  minimum?: number;
+  exclusiveMinimum?: number;
+  /** GST-927: on an optional array param, `[]` reads as omitted when this is at least 1. Not in tools/list. */
+  minItems?: number;
+  /** GST-927: a flag that acts only when true, so an optional `false` reads as omitted. Not in tools/list. */
+  actsWhenTrue?: boolean;
+  /** GST-927: the param has no effect without this one, so any value of it reads as omitted when that param is absent. Not in tools/list. */
+  appliesWith?: string;
   items?: ParamDef;
   /** Object members (O-DX-3); a member with `required: true` lands in the schema's `required`. */
   properties?: Record<string, ParamDef>;
   /** Advertised on the full MCP surface only (keeps the starter tool list inside its size budget). */
   fullSurfaceOnly?: boolean;
+  /** An object param the CLI takes as repeated `--flag key=value` (`key=a,b` is a list); MCP passes the object. */
+  cliKeyValue?: boolean;
+  /** An object window the CLI also takes as `N-M` (inclusive) or `N`: the [start, length] member names. */
+  cliRange?: readonly [string, string];
 }
 
 export interface Logger {
@@ -258,6 +296,20 @@ export interface AuthInfo {
   clientId: string;
   /** Durable, verifier-derived identity. Never infer this from a display name or request data. */
   principal?: { kind: 'oauth_client' | 'legacy_token'; id: string };
+  /**
+   * GBRA-218: the live member this credential is bound to and its groups, joined by the verifier
+   * (null = unbound). Undefined when no verifier joined it; src/core/access/caller.ts then looks the
+   * binding up from `principal` (fail closed). Never set from request data.
+   */
+  member?: { id: string; groups: string[] } | null;
+  /** GBRA-218: the stored `may_act_for` audience list (shared agents, PR B); stored and reported only. */
+  mayActFor?: string[] | null;
+  /**
+   * GST-359 C1: the live right to name the person a call serves (x-qm-actor), joined by the verifier: the system and
+   * the operations an attested call may run. Null when the credential holds none, is bound to a member, or (an OAuth
+   * client) its token did not come from the client-credentials grant. Undefined when no verifier joined it.
+   */
+  attest?: { system: string; ops: string[]; sources: string[] | null } | null;
   /**
    * Human-readable agent name resolved at token-verification time.
    * For OAuth clients this is `oauth_clients.client_name`; for legacy
@@ -386,6 +438,13 @@ export interface AuthInfo {
    * but never lower it. Undefined = no floor (or a brain before the column).
    */
   minTrust?: TrustTier;
+  /**
+   * GBRA-156: the grant's `private_pages: granted_sources` axis, set at token
+   * verification from the live row. `sources` are the sources the grant names
+   * explicitly (`privatePagesSources`); MCP dispatch makes them the
+   * private-readable set of each non-mutating call. Undefined = `none`.
+   */
+  privatePages?: { mode: 'granted_sources'; sources: string[] };
   /** Current transport ceiling applied to this authenticated request. */
   effectiveSurface?: 'verbs' | 'starter' | 'full';
   /**
@@ -434,6 +493,13 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * #6696 (A5): who this caller's writes are for, set only by trusted host-side entry points (the CLI, the MCP
+   * transports). Unset is `background`; it is never derived from `remote` (persistence/admission-origin.ts).
+   */
+  admissionOrigin?: import('../persistence/admission-origin.ts').AdmissionOrigin;
+  /** The caller's self-declared agent label, read by an HTTP transport from X-Gbrain-Agent-Label (persistence/attribution.ts). Unverified text, never authority. */
+  agentLabel?: string;
+  /**
    * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
    * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
    * untrusted) but has no per-token auth (local pipe), so identity ops like
@@ -445,6 +511,12 @@ export interface OperationContext {
    * (network transports), independent of the remote trust flag.
    */
   transport?: 'stdio' | 'http';
+  /**
+   * Largest request frame this connection reads, in bytes, set by the transport that built the context (legacy HTTP:
+   * GBRAIN_HTTP_MAX_BODY_BYTES; OAuth /mcp: the SDK's 4 MiB; stdio: its message buffer). Sizes upload parts
+   * (persistence/page-upload.ts partMaxFrameBytes); never a trust input.
+   */
+  inboundFrameBytes?: number;
   /**
    * WP2/D3: response-meta side channel. Handlers that compute out-of-band
    * result metadata (retrieval degradation, strict-mode warnings) publish it
@@ -462,6 +534,14 @@ export interface OperationContext {
    */
   emitNotice?: (n: Notice) => void;
   /**
+   * Wakeshift (docs/guides/wakeshift.md): the MCP caller as the transport saw it, which Wakeshift uses to tell agent
+   * programs apart: `clientInfo.name` (stdio) or the OAuth `client_name` (HTTP), the HTTP User-Agent and the request's
+   * `_meta`. Set by the MCP transports only, never from tool arguments; shape only, never authority.
+   */
+  mcpCaller?: { client?: string; userAgent?: string; meta?: Record<string, unknown> };
+  /** Wakeshift: a handler's addition, rendered as the result's last text block plus `_meta` keys. A credential: never log it. */
+  emitToolTail?: (tail: { text?: string; meta?: Record<string, unknown> }) => void;
+  /**
    * WP4 (D2): the SERVER surface ceiling for this transport (force-clamped),
    * threaded by the MCP dispatch layer. Consumed by `request_tools`: the
    * catalog never names ops above the ceiling, and the persist branch
@@ -470,6 +550,13 @@ export interface OperationContext {
    * treated as 'full'.
    */
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
+  /**
+   * GBRA-218 local `--as <member>`: the member identity a trusted local read previews. Set only by the
+   * CLI with `applyRemoteReadPolicy`; `remote` stays false, so upload confinement and write trust are unchanged.
+   */
+  accessIdentity?: readonly string[];
+  /** GBRA-218: page reads apply the remote read policy (readers and privacy) although the caller is local (`--as`). */
+  applyRemoteReadPolicy?: boolean;
   /** The stdio session's surface (stdio MCP only): `request_tools` widens it for this session, `whoami` reports it. */
   stdioSurface?: StdioSurfaceState;
   /**
@@ -519,6 +606,16 @@ export interface OperationContext {
    */
   replayAuthority?: WriteAuthority;
   /**
+   * GST-359 D: the attested operation a nested write serves (memory_write saves through remember). Set by the handler,
+   * never from arguments; the stored authority keeps it, so publication re-checks that operation's attest right.
+   */
+  attestedOp?: string;
+  /**
+   * GST-1113: the scope source an attested memory_write named (source_id), allowed by the credential's attest_sources
+   * (access/attest-sources.ts). Set by the handler, never from arguments; the stored authority keeps it.
+   */
+  attestedSource?: string;
+  /**
    * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
    * noEmbed and the standing embed machinery (embed phase / phase-end
    * backfill / the stale-embed sweep) picks the chunks up via the
@@ -545,6 +642,22 @@ export interface OperationContext {
    * Shape only, never authority: nothing security-relevant reads it.
    */
   resultRows?: 'lean' | 'full';
+  /**
+   * Large pages (Wave A): the caller identified itself as gbrain's thin client
+   * (X-Gbrain-Client header). A thin client that names no `body` mode on
+   * get_page renders compiled_truth as the whole page, so the read is full
+   * or refused, never a window. Shape only, never authority.
+   */
+  thinClient?: boolean;
+  /**
+   * Whether this caller can call `opName` on its surface right now: the MCP
+   * dispatch predicate (the stdio session's surface after any `request_tools`
+   * widening, the HTTP client's effective surface and scopes under the
+   * server ceiling). Set by MCP dispatch only; publish-gated ops read as not
+   * callable. Unset on local and in-process callers. Shape only, never
+   * authority: dispatch enforces callability itself.
+   */
+  isCallable?: (opName: string) => boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers
@@ -694,6 +807,11 @@ export interface Operation {
   name: string;
   description: string;
   params: Record<string, ParamDef>;
+  /**
+   * GST-1493: one sentence with a valid call as JSON, appended to the suggestion when dispatch refuses an unknown
+   * parameter, so a client that never read the schema gets the whole required shape, not only the nearest name.
+   */
+  callShape?: string;
   handler: (ctx: OperationContext, params: Record<string, unknown>) => Promise<unknown>;
   outputRedaction: OutputRedactionPolicy;
   mutating?: boolean;
@@ -740,7 +858,7 @@ export interface Operation {
    * fail-closed call-time backstop; stdio (local pipe) bypasses publish
    * gates entirely. Resolution lives in src/mcp/publish-gates.ts.
    */
-  publishGateKey?: 'mcp.publish_skills' | 'mcp.publish_advisor';
+  publishGateKey?: 'mcp.publish_skills' | 'mcp.publish_advisor' | 'mcp.publish_memory_settings' | 'mcp.publish_wakeshift';
   /**
    * MEMORY_VERBS v1: marks the seven frozen protocol verbs (recall, remember,
    * entity, synthesize, forget, context_pack, delta). `gbrain serve --surface

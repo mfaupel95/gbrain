@@ -13,6 +13,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
+import { noteBelief } from './belief/ledger.ts';
 import {
   assessFactForGate, assessTakeForGate, normalizeForGate,
   type GateFactRow, type GateTakeRow, type WriteGateAssessment, type WriteGateConfig, type WriteGateInput, type WriteGateOrigin, type WriteGateReasonFamily,
@@ -118,6 +119,8 @@ export async function recordWriteGateHold(tx: Exec, input: WriteGateHoldInput): 
     [input.kind, input.sourceId, input.slug ?? '', holdFingerprint(input.kind, input.texts), a.detectorVersion, a.tier, a.families, reasonList(a),
       a.detectorError, JSON.stringify(input.payload), input.origin ? JSON.stringify(input.origin) : null, input.requestId ?? null]);
   const holdId = Number(rows[0]!.id);
+  const fingerprint = holdFingerprint(input.kind, input.texts);
+  noteBelief({ kind: 'held', holdKind: input.kind, fingerprint, holdId, slug: input.slug ?? '', tier: a.tier, valueHash: fingerprint });
   const receiptId = await recordWriteGateReceipt(tx, { targetTable: 'write_gate_holds', targetId: holdId, sourceId: input.sourceId, assessment: { ...a, verdict: 'quarantine' }, requestId: input.requestId });
   return { holdId, receiptId };
 }

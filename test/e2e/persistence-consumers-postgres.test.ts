@@ -34,7 +34,8 @@ import { admitWrite } from '../../src/core/persistence/journal.ts';
 import { claimPhaseStamp, startClaimPhase } from '../../src/core/persistence/claim-phase.ts';
 import { runPersistenceAdministration } from '../../src/core/persistence/administration.ts';
 import { MOVEMENT_WATERMARK_SQL } from '../../src/core/persistence/sync-movement.ts';
-import { consumersWithoutHeartbeatCheck, hostIdentityMismatchCheck, twoConsumersOnHostCheck } from '../../src/commands/doctor/checks/persistence-consumers.ts';
+import { consumersWithoutHeartbeatCheck, hostIdentityMismatchCheck, serveBuildDriftCheck, twoConsumersOnHostCheck } from '../../src/commands/doctor/checks/persistence-consumers.ts';
+import { VERSION } from '../../src/version.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { hasDatabase } from './helpers.ts';
 import { withEnv } from '../helpers/with-env.ts';
@@ -181,6 +182,19 @@ describe.skipIf(!hasDatabase())('consumer heartbeat rows (Postgres, #6317)', () 
     await engine.executeRaw("UPDATE persistence_requests SET claim_expires_at=now()-interval '1 second' WHERE id=$1::uuid", [row.id]);
     expect(await ownersWithoutHeartbeat(engine, hostId)).toEqual([]);
     await engine.executeRaw("UPDATE persistence_requests SET state='cancelled',execution_token=NULL,claim_expires_at=NULL WHERE id=$1::uuid", [row.id]);
+  }), 60_000);
+
+  test('#6696 C6: doctor serve_build_drift warns for a live serve heartbeat on an older build and reads ok once it runs this build', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    await clear();
+    await seedRow(identity(6696), { kind: 'serve' });
+    const older = await serveBuildDriftCheck(engine, hostId);
+    expect(older.status).toBe('warn');
+    expect(older.message).toContain('serve is running an older build than this checkout; restart serve and workers');
+    expect(older.message).toContain('serve pid 6696 v0.60.100.0');
+    expect(older.details).toMatchObject({ count: 1, this_version: VERSION, owner: { kind: 'serve', pid: 6696, version: '0.60.100.0' } });
+    await engine.executeRaw('UPDATE persistence_consumers SET version=$1 WHERE pid=6696', [VERSION]);
+    expect((await serveBuildDriftCheck(engine, hostId)).status).toBe('ok');
+    await clear();
   }), 60_000);
 
   test('T3: two GBRAIN_HOMEs against one brain mint two identities; doctor host_identity_mismatch names both files and the GBRAIN_HOME fix', async () => {

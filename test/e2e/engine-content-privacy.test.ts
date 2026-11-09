@@ -5,6 +5,7 @@ import type { BrainEngine } from '../../src/core/engine.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { listEntityIdentities, linkEntityIdentity, unionLinksAcrossIdentity } from '../../src/core/entity-identity.ts';
 import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
+import { fenceTranscriptText } from '../../src/core/search/transcript-quote.ts';
 import { runGather } from '../../src/core/think/gather.ts';
 import { runThink } from '../../src/core/think/index.ts';
 import { __resetPrivateVisibilityCacheForTests } from '../../src/core/search/private-visibility.ts';
@@ -310,7 +311,7 @@ for (const kind of ['pglite', 'postgres'] as const) {
       expect(gathered.takes.map(r => r.claim)).toEqual(['privacy retrieval public']);
       const remote = { engine, remote: true, sourceId: A, auth: { allowedSources: [A, B] } } as OperationContext;
       for (const [op, args] of [['takes_list', {}], ['takes_search', { query: 'privacy retrieval' }]] as const) {
-        expect((await operationsByName[op].handler(remote, args) as Array<{ claim: string }>).map(r => r.claim)).toEqual(['privacy retrieval public']);
+        expect((await operationsByName[op].handler(remote, args) as Array<{ claim: string }>).map(r => r.claim)).toEqual([fenceTranscriptText('privacy retrieval public', 'people/takes-shared')]); // #8377: quoted below the owner's tier
       }
       expect(await engine.listTakes({ sourceIds: [A, B] })).toHaveLength(3);
       expect(await engine.getScorecard(scope, ['world'])).toMatchObject({ total_bets: 1, resolved: 1, correct: 1, incorrect: 0 });
@@ -393,7 +394,7 @@ for (const kind of ['pglite', 'postgres'] as const) {
         const paths = await engine.traversePathsDetailed('people/root', { ...scope, direction, depth: 3 });
         expect(JSON.stringify(paths)).not.toContain(PRIVATE);
         expect(paths.paths.some(r => r.to_slug === 'people/tail' || r.to_slug === 'people/origin-target')).toBe(false);
-        expect(paths.paths).toHaveLength(direction === 'in' ? 0 : direction === 'both' ? 2 : 1);
+        expect(paths.paths).toHaveLength(direction === 'in' ? 0 : 1);
         expect(paths.paths.every(r => [r.from_slug, r.to_slug].every(slug => ['people/root', 'people/z-visible'].includes(slug)))).toBe(true);
       }
       expect(await engine.traverseGraph('people/a-private', 3, scope)).toEqual([]);

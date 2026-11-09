@@ -21,6 +21,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import type { BrainEngine } from '../../engine.ts';
+import { boundedBodyPrefixSql } from '../../page-window/bounded-lead.ts';
 import { loadConfigSnapshot } from '../../config-snapshot.ts';
 import { readDecideConfig, type DecideConfig } from './config.ts';
 import { CONFLICT_INSTRUCTIONS, CONFLICT_MIN_COSINE, CONFLICT_NEIGHBOURS, CONFLICT_OPTIONS } from './conflict.ts';
@@ -29,8 +30,9 @@ import { packShape } from './pack.ts';
 import { resolveSlotPolicy, type SlotPolicy } from './policy.ts';
 import { writeReceipts } from './receipts.ts';
 import { reviewWithdrawOn } from '../../facts/withdrawal.ts';
+import { withdrawalCoversFactSql } from '../../access/member-facts.ts';
 import { flushDecideWrites, hmacRef, listCalibrations, receiptSalt, recentResolvedModels } from './store.ts';
-import { DecideError, type ChoiceAnswer, type DecideQuestion, type EvidenceItem } from './types.ts';
+import { DecideError, partialOf, type ChoiceAnswer, type DecideQuestion, type EvidenceItem } from './types.ts';
 
 export const REVIEW_KINDS = ['withdraw', 'duplicate_page', 'duplicate_entity'] as const;
 export type ReviewKind = typeof REVIEW_KINDS[number];
@@ -214,7 +216,7 @@ async function withdrawAnchor(engine: BrainEngine, row: QueueRow, cfg: DecideCon
     `SELECT f.id, f.fact, f.entity_slug, f.visibility, f.embedding IS NOT NULL AS has_embedding,
             EXISTS (SELECT 1 FROM fact_withdrawals w WHERE w.source_id = f.source_id AND w.visibility = f.visibility
               AND w.fact_hash IN (gbrain_fact_fingerprint(f.fact), gbrain_fact_fingerprint_v1(f.fact))
-              AND (w.subject = '*' OR w.subject = COALESCE(f.entity_slug, '*'))) AS withdrawn
+              AND ${withdrawalCoversFactSql('w', 'f')}) AS withdrawn
        FROM facts f WHERE f.id = $1 AND f.source_id = $2`, [anchorId, row.source_id]);
   if (!anchor || !anchor.withdrawn) return { skip: 'no_candidates' };
   if (!anchor.has_embedding) return { skip: 'no_embedding' };
@@ -243,7 +245,7 @@ async function withdrawAnchor(engine: BrainEngine, row: QueueRow, cfg: DecideCon
 
 async function pagePairAnchor(engine: BrainEngine, row: QueueRow): Promise<Anchor | { skip: string }> {
   const pages = await engine.executeRaw<{ slug: string; title: string; compiled_truth: string }>(
-    `SELECT slug, title, compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
+    `SELECT slug, title, ${boundedBodyPrefixSql('pages')} AS compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
     [row.source_id, [row.a_ref, row.b_ref]]);
   const a = pages.find(p => p.slug === row.a_ref);
   const b = pages.find(p => p.slug === row.b_ref);
@@ -321,7 +323,7 @@ export async function runReviewLane(engine: BrainEngine, opts: { kind: ReviewKin
         provider: policy.provider, lane: 'background', signal: opts.signal }, { engine, config: cfg, sourceId });
     } catch (err) {
       const reason = err instanceof DecideError ? err.reason : 'provider_error';
-      receipts.push(writeReceipts(engine, { ...base, mode, provider: policy.provider, policy, questions, outcomes: {}, fallbackOutcome: 'error', reason }));
+      receipts.push(writeReceipts(engine, { ...base, mode, provider: policy.provider, policy, questions, outcomes: {}, fallbackOutcome: 'error', reason, partial: partialOf(err) }));
       result.skipped++;
       if (PERMANENT_FAILURES.has(reason)) await clearQueue(engine, row);
       else { await deferQueue(engine, row, reason); result.deferred++; }

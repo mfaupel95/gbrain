@@ -24,6 +24,7 @@ import type { Principal } from '../persistence/model.ts';
 import type { OwnerConfirmation } from './confirm.ts';
 import type { TrustTable } from './schema.ts';
 import { TRUST_PROPOSAL_ACTIONS, TRUST_PROPOSAL_STATUSES } from './schema.ts';
+import { noteBelief } from '../belief/ledger.ts';
 
 export type TrustProposalAction = typeof TRUST_PROPOSAL_ACTIONS[number];
 export type TrustProposalStatus = typeof TRUST_PROPOSAL_STATUSES[number];
@@ -107,12 +108,16 @@ export async function insertTrustProposal(tx: BrainEngine, input: NewTrustPropos
         NULLIF(current_setting('gbrain.write_principal_kind', true), ''), NULLIF(current_setting('gbrain.write_principal_id', true), ''),
         NULLIF(current_setting('gbrain.write_request', true), '')::uuid)
       ON CONFLICT DO NOTHING RETURNING id`, params);
-  if (inserted) return { id: Number(inserted.id), created: true };
+  if (inserted) {
+    noteBelief({ kind: 'contested', table: input.target.table, rowId: input.target.id, proposalId: Number(inserted.id), guard: input.proposer });
+    return { id: Number(inserted.id), created: true };
+  }
   const [existing] = await tx.executeRaw<{ id: number }>(
     `SELECT id FROM trust_proposals WHERE status = 'pending' AND action = $1 AND target_table = $2 AND target_id = $3
        AND related_table IS NOT DISTINCT FROM $4 AND related_id IS NOT DISTINCT FROM $5 ORDER BY id LIMIT 1`,
     [input.action, input.target.table, input.target.id, input.related?.table ?? null, input.related?.id ?? null]);
   if (!existing) throw new Error('trust proposal insert conflicted but no pending row was found');
+  noteBelief({ kind: 'contested', table: input.target.table, rowId: input.target.id, proposalId: Number(existing.id), guard: input.proposer });
   return { id: Number(existing.id), created: false };
 }
 
@@ -195,8 +200,11 @@ export interface TrustProposalHandler {
 }
 
 const handlers = new Map<TrustProposalAction, TrustProposalHandler>();
-export function registerTrustProposalHandler(action: TrustProposalAction, handler: TrustProposalHandler): void {
+/** Registers the handler for an action; returns the call that puts the previous registration back (a test stub must restore it: the registry is process-global). */
+export function registerTrustProposalHandler(action: TrustProposalAction, handler: TrustProposalHandler): () => void {
+  const previous = handlers.get(action);
   handlers.set(action, handler);
+  return () => { if (previous) handlers.set(action, previous); else handlers.delete(action); };
 }
 
 /**

@@ -8,11 +8,12 @@ import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, openSync, re
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { LockStolenError, LockUnavailableError, withRefreshingLock } from '../db-lock.ts';
-import { discoverGitRoot } from '../sync-git.ts';
+import { discoverGitRoot, discoverGitRootAsync } from '../sync-git.ts';
 import { authorityDigest, currentRemoteJobAuthority, currentJobSignal } from './submission-authority.ts';
 import { assertLegacyFilesystemWriter, assertManagedFilesystemWrite } from '../persistence/filesystem-guard.ts';
 
-const heldRoots = new AsyncLocalStorage<ReadonlyArray<{ root: string; active: boolean }>>();
+/** `resolved` keeps the lock root each path resolved to when the lock was taken, so a nested check spawns no git. */
+const heldRoots = new AsyncLocalStorage<ReadonlyArray<{ root: string; active: boolean; resolved?: ReadonlyMap<string, string> }>>();
 const filesystemSignal = new AsyncLocalStorage<AbortSignal>();
 const filesystemLeases = new AsyncLocalStorage<Array<{ key: string; lost: boolean }>>();
 export function currentSourceFilesystemSignal(): AbortSignal | undefined {
@@ -29,28 +30,42 @@ export function assertSourceFilesystemActive(allowCallerAbort = false): void {
   // Some Bun versions drop an asynchronously created AbortSignal reason.
   if (signal?.aborted) throw signal.reason ?? new DOMException('Source filesystem work cancelled or lock lease lost', 'AbortError');
 }
-function lockRoot(path: string): string {
+function lockCandidate(path: string): string {
   let canonical = resolve(path);
   try { canonical = realpathSync(canonical); } catch { /* local initialization may create it */ }
   try { if (statSync(canonical).isFile()) canonical = dirname(canonical); } catch { /* nonexistent local target */ }
+  return canonical;
+}
+function lockRoot(path: string): string {
+  const canonical = lockCandidate(path);
   try { return realpathSync(discoverGitRoot(canonical)); } catch { return canonical; }
+}
+/** GBRA-133 2b.3: `lockRoot` without blocking the event loop (every sync takes this lock, in residents too). */
+async function lockRootAsync(path: string): Promise<string> {
+  const canonical = lockCandidate(path);
+  try { return realpathSync(await discoverGitRootAsync(canonical)); } catch { return canonical; }
+}
+function holdsLockOn(canonical: string): boolean {
+  return [...heldRoots.getStore() ?? []].some(held => held.active && encloses(held.root, canonical));
 }
 function encloses(root: string, path: string): boolean {
   const rel = relative(root, path);
   return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
 }
 export function hasSourceFilesystemLock(path: string): boolean {
-  const canonical = lockRoot(path);
-  return [...heldRoots.getStore() ?? []].some(held => held.active && encloses(held.root, canonical));
+  const held = heldRoots.getStore() ?? [];
+  if (!held.some(entry => entry.active)) return false;
+  const known = held.find(entry => entry.resolved?.has(path))?.resolved?.get(path);
+  return holdsLockOn(known ?? lockRoot(path));
 }
-async function registeredLockRoot(engine: BrainEngine, path: string): Promise<string> {
-  let root = lockRoot(path);
+async function registeredLockRoot(engine: BrainEngine, pathRoot: string): Promise<string> {
+  let root = pathRoot;
   const sources = await engine.executeRaw<{ local_path: string }>(`SELECT local_path FROM sources WHERE local_path IS NOT NULL AND local_path <> ''`);
   // A registered non-Git parent can contain a Git source. Canonicalize every
   // registered source through the same worktree rule, then choose the outermost
   // ancestor so overlapping sources agree regardless of which one starts first.
   for (const source of sources) {
-    const candidate = lockRoot(source.local_path);
+    const candidate = await lockRootAsync(source.local_path);
     if (encloses(candidate, root)) root = candidate;
   }
   return root;
@@ -58,9 +73,10 @@ async function registeredLockRoot(engine: BrainEngine, path: string): Promise<st
 export async function withSourceFilesystemLock<T>(engine: BrainEngine, path: string, fn: () => Promise<T>, opts: { signal?: AbortSignal; waitMs?: number } = {}): Promise<T> {
   await assertLegacyFilesystemWriter(engine, path);
   assertSourceFilesystemActive();
-  if (hasSourceFilesystemLock(path)) return fn();
-  const root = await registeredLockRoot(engine, path);
-  const rootContext = { root, active: true };
+  const pathRoot = await lockRootAsync(path);
+  if (holdsLockOn(pathRoot)) return fn();
+  const root = await registeredLockRoot(engine, pathRoot);
+  const rootContext = { root, active: true, resolved: new Map([[path, pathRoot]]) };
   const held = [...heldRoots.getStore() ?? [], rootContext];
   const key = `gbrain-fs:${authorityDigest(root)}`;
   const inheritedSignal = currentSourceFilesystemSignal();

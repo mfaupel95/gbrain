@@ -25,6 +25,8 @@ import { stampEvidence } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
 import { resolveExcludePrivatePages, isPrivatePage } from '../search/private-visibility.ts';
+import { assertMemberPageWriter, assertScopePageWriter } from '../access/member-facts.ts';
+import { pageNotVisibleError, remoteTargetHidden } from '../persistence/page-visibility.ts';
 
 // --- Agent-contract fixes shared by the op error sites ---
 
@@ -373,6 +375,8 @@ export function slugOutsideCallerFence(ctx: OperationContext, slug: string): boo
  * 'notes-archive/...' by startsWith construction.
  */
 export function enforceClientSlugFence(ctx: OperationContext, slug: string, opName: string): void {
+  assertMemberPageWriter(ctx, slug, opName);
+  assertScopePageWriter(ctx, slug, opName);
   if (ctx.auth?.fenceProjectionDegraded) {
     throw opError(
       'permission_denied',
@@ -456,8 +460,11 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
   'add_link', 'remove_link', 'add_timeline_entry', 'revert_version',
   // #5616: edit_page enforces the slug fence in its handler and submission.
   'edit_page',
+  // Wave B: append_page is fenced on submission as edit_page is.
+  'append_page',
   // #6007: put_pages fences every page as the put_page it is submitted as.
   'put_pages',
+  'begin_page_upload', 'upload_page_part', 'get_page_upload', 'commit_page_upload', 'abort_page_upload',
   'put_raw_data', 'think',
   // submit_agent enforces bound_slug_prefixes itself (it is the op the column
   // was introduced for — see its bound_* binding check), so denying it here
@@ -476,6 +483,14 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
   'get_write_request', 'list_write_requests', 'cancel_write_request',
   'takes_add', 'takes_update', 'takes_resolve', 'takes_supersede', 'takes_remove',
   'put_skill', 'delete_skill',
+  // #5913: remember fences the one slug it writes (the caller's entity, or
+  // memory/unattributed) in planRememberTarget (persistence/memory-mutations.ts)
+  // before admission, so an inferred or unattributed target outside the
+  // prefixes is refused, and `replaces` is confined to the same entity and
+  // page (facts/single-prepare.ts decideReplacement). forget/forget_fact stay
+  // off the list: a withdrawal's write set (withdrawal-discovery.ts) reaches
+  // pages the fenced slug does not name, so they wait for a confined closure.
+  'remember',
 ]);
 
 /**
@@ -1050,7 +1065,9 @@ export async function requireWritablePage(
     sourceId: writeSource,
     includeDeleted: true,
   });
-  if (writable) {
+  // GBRA-218: a page the remote caller cannot read under the member-access part answers exactly as a missing slug.
+  const hidden = !!writable && await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, slug);
+  if (writable && !hidden) {
     if (ctx.viaSubagent === true && ctx.auth && isPrivatePage(writable)
       && await resolveExcludePrivatePages(ctx.engine, ctx.remote)) {
       throw opError('permission_denied', `${operation}: this page is outside your write visibility.`,
@@ -1058,15 +1075,18 @@ export async function requireWritablePage(
     }
     return;
   }
-  if (allowCreate) return;
+  if (allowCreate) {
+    if (hidden) throw pageNotVisibleError();
+    return;
+  }
 
   const visibleScope = federatedSearchScope(ctx);
-  const spansAnotherSource =
-    (visibleScope.sourceIds?.some((sourceId) => sourceId !== writeSource) ?? false) ||
-    (visibleScope.sourceId !== undefined && visibleScope.sourceId !== writeSource);
-  if (spansAnotherSource) {
-    const visible = await ctx.engine.getPage(slug, visibleScope);
-    if (visible && visible.source_id !== writeSource) {
+  // GBRA-218: the diagnostic reads only the other sources, under the caller's read policy, so a page the caller cannot
+  // read there (or a hidden row in the write source) answers exactly as a missing slug.
+  const otherSources = (visibleScope.sourceIds ?? (visibleScope.sourceId !== undefined ? [visibleScope.sourceId] : [])).filter(id => id !== writeSource);
+  if (otherSources.length) {
+    const visible = await ctx.engine.getPage(slug, await readPolicyOpts(ctx, { sourceIds: otherSources }));
+    if (visible && !await remoteTargetHidden(ctx.engine, ctx.remote, visible.source_id, slug)) {
       throw opError(
         'permission_denied',
         `${operation}${endpoint === 'page' ? '' : ` ${endpoint}`} page "${slug}" is readable from source "${visible.source_id}" but this client writes to source "${writeSource}".`,
@@ -1220,7 +1240,10 @@ export function stampEvidenceSafe(results: SearchResult[]): void {
 }
 
 export function stampDeepResearchIds(results: SearchResult[]): void {
-  for (const r of results) (r as SearchResult & { id?: string }).id = encodeDeepResearchId(r.source_id, r.slug);
+  // Large pages (T24): a hit past the page's first chunk names its chunk, so fetch can return that evidence from a page too
+  // large to send whole (the first window already holds chunk 0, whose id stays the plain page id).
+  for (const r of results) if (r.result_type !== 'fact') (r as SearchResult & { id?: string }).id = encodeDeepResearchId(r.source_id, r.slug,
+    Number.isSafeInteger(r.chunk_id) && r.chunk_id > 0 && r.chunk_index > 0 ? { chunkId: r.chunk_id } : undefined);
 }
 
 /** T4 — shared eval-capture for the `search` op (keyword-only + cheap-hybrid paths). */

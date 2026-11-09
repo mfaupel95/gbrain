@@ -13,6 +13,10 @@
  * `--no-llm` keeps the model-tier file held; `--no-repair` refuses every
  * repair-class hold as before. Sentinel claim text must never reach a hold,
  * an outcome, a receipt or a printed line.
+ *
+ * #6712 PR 4b: a non-company source runs the live pass, so status reports the pass (`convergence`, no cursor), a
+ * database-only edit of a file that also changed is held `file_drift` (side both) where the cursor held
+ * `concurrent_write`, and a printed sync carries opt-outs only while the pass's opt-out episode is open.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -26,7 +30,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readSyncStatus, unblockSync } from '../src/core/persistence/sync-status.ts';
-import { classifySyncFault, HOLD_ATTEMPTS_NEEDS_HUMAN, SYNC_FAULT_TABLE } from '../src/core/persistence/sync-fault-class.ts';
+import { classifySyncFault, HOLD_ATTEMPTS_NEEDS_HUMAN, HOLD_ESCALATE_MS, SYNC_FAULT_TABLE } from '../src/core/persistence/sync-fault-class.ts';
 import { readGitHoldRetryPaths, readGitHold, readGitSourceHolds } from '../src/core/persistence/sync-holds.ts';
 import { runSyncUnblock } from '../src/commands/sync/operator.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
@@ -62,8 +66,14 @@ test('the classifier: every table code has a class and at least one safe action;
     expect(verdict).toMatchObject({ class: rule.class, safe_actions: rule.safe_actions, needs_human: rule.needs_human });
   }
   expect(classifySyncFault({ code: 'worktree_dirty', attempts: 1 })).toMatchObject({ class: 'page', safe_actions: ['retry_when_clean'], needs_human: false });
-  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN })).toMatchObject({ class: 'page', safe_actions: ['none'], needs_human: true });
-  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN }).human_reason).toContain(`held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times`);
+  // #6712 PR 2 (L4): escalation needs the failed attempts AND a day since the path was first held; a live editor never escalates.
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN })).toMatchObject({ class: 'page', safe_actions: ['retry_when_clean'], needs_human: false });
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN, held_for_ms: HOLD_ESCALATE_MS - 1 })).toMatchObject({ needs_human: false });
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN - 1, held_for_ms: 10 * HOLD_ESCALATE_MS })).toMatchObject({ needs_human: false });
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN, held_for_ms: HOLD_ESCALATE_MS })).toMatchObject({ class: 'page', safe_actions: ['none'], needs_human: true });
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: HOLD_ATTEMPTS_NEEDS_HUMAN, held_for_ms: HOLD_ESCALATE_MS }).human_reason).toContain(`held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times over 24 h`);
+  expect(classifySyncFault({ code: 'worktree_dirty', attempts: 9, held_for_ms: 9 * HOLD_ESCALATE_MS, live_editor: true })).toMatchObject({ needs_human: false });
+  expect(classifySyncFault({ code: 'managed_image_sync_unsupported', attempts: 9, held_for_ms: 9 * HOLD_ESCALATE_MS })).toMatchObject({ needs_human: false });
   expect(classifySyncFault({ code: 'concurrent_write' })).toMatchObject({ class: 'page', safe_actions: ['reconcile'], needs_human: true });
   expect(classifySyncFault({ code: 'source_changed', detail: 'pinned_git_worktree_conflict' })).toMatchObject({ class: 'page', safe_actions: ['retry'], needs_human: false });
   expect(classifySyncFault({ code: 'storage_error', message: 'write ECONNABORTED db.example.invalid:5432' })).toMatchObject({ class: 'connection', safe_actions: ['retry'], needs_human: false });
@@ -73,13 +83,15 @@ test('the classifier: every table code has a class and at least one safe action;
   expect(classifySyncFault({ code: 'something_new' }).human_reason).toContain('gbrain errors something_new');
 });
 
-test('status joins the cursor, the recent commits, each hold with its triple and one next; unblock schedules a committed dirty file, refuses a still-dirty one and a concurrent write by name', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+test('status joins the pass, the recent commits, each hold with its triple and one next; unblock schedules a committed dirty file, refuses a still-dirty one and a file drift by name', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   const f = await fixture({ 'a.md': note('Alpha one.'), 'b.md': note('Beta one.'), 'c.md': note('Gamma one.'), 'd.md': note('Delta one.') });
   expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
   const clean = await readSyncStatus(engine, f.id);
-  expect(clean).toMatchObject({ source_id: f.id, cursor: { index: 4, total: 4, done: true }, holds: [], last_error: null, needs_human: false, next: null });
+  expect(clean).toMatchObject({ source_id: f.id, cursor: null, state: 'synced', convergence: { kind: 'full', outcome: 'synced', settled: 4, remaining: 0, episode: null },
+    holds: [], last_error: null, needs_human: false, next: null });
   expect(clean.committed_last_10m).toBe(4);
-  expect(clean.resume_argv).toEqual(['--source', f.id, '--no-pull', '--no-embed', '--no-extract']);
+  // The pass converged and closed its opt-out episode, so the plain sync carries no inherited opt-out.
+  expect(clean.resume_argv).toEqual(['--source', f.id, '--no-pull']);
   for (const name of ['a', 'b', 'c', 'd']) writeFileSync(join(f.root, `${name}.md`), note(`${name} two.`));
   const pin = commit(f.root, 'version two');
   const abort = new AbortController();
@@ -90,18 +102,18 @@ test('status joins the cursor, the recent commits, each hold with its triple and
   await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.putPage('d', { type: 'note', title: 'Example', compiled_truth: 'Delta, edited in the database.', timeline: '', frontmatter: {}, content_hash: 'd-db' }, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION));
   const resumed = await performManagedSync(engine, f.opts);
   expect(resumed.status).toBe('synced');
-  expect(resumed.held?.map(hold => [hold.path, hold.code]).sort()).toEqual([['b.md', 'worktree_dirty'], ['c.md', 'worktree_dirty'], ['d.md', 'concurrent_write']]);
+  expect(resumed.held?.map(hold => [hold.path, hold.code]).sort()).toEqual([['b.md', 'worktree_dirty'], ['c.md', 'worktree_dirty'], ['d.md', 'file_drift']]);
 
   const status = await readSyncStatus(engine, f.id);
-  expect(status.cursor).toMatchObject({ index: 4, total: 4, pinned_target: pin, done: true });
+  expect(status).toMatchObject({ cursor: null, convergence: { target: pin, outcome: 'synced', remaining: 0 } });
   expect(status.holds.map(hold => ({ path: hold.path, code: hold.code, class: hold.class, safe_actions: hold.safe_actions, needs_human: hold.needs_human, attempts: hold.attempts })).sort((x, y) => x.path.localeCompare(y.path))).toEqual([
     { path: 'b.md', code: 'worktree_dirty', class: 'page', safe_actions: ['retry_when_clean'], needs_human: false, attempts: 1 },
     { path: 'c.md', code: 'worktree_dirty', class: 'page', safe_actions: ['retry_when_clean'], needs_human: false, attempts: 1 },
-    { path: 'd.md', code: 'concurrent_write', class: 'page', safe_actions: ['reconcile'], needs_human: true, attempts: 1 },
+    { path: 'd.md', code: 'file_drift', class: 'page', safe_actions: ['reconcile'], needs_human: true, attempts: 1 },
   ]);
   expect(status.needs_human).toBe(true);
-  expect(status.human_reason).toContain('reconcile');
-  expect(status.next).toMatchObject({ argv: ['gbrain', 'sources', 'reconcile', f.id, 'd', '--preview'] });
+  expect(status.human_reason).toContain('which version wins');
+  expect(status.next).toMatchObject({ argv: ['gbrain', 'repair', 'file-drift', '--source', f.id, '--slug', 'd', '--prefer', 'database'] });
   expect(status.next!.user_message).toContain('page d');
   expect(JSON.stringify(status)).not.toContain('edited and not committed');
 
@@ -111,17 +123,21 @@ test('status joins the cursor, the recent commits, each hold with its triple and
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [f.id]);
   const preview = await unblockSync(engine, f.id, { apply: false });
   expect(preview.applied.map(entry => [entry.path, entry.action])).toEqual([['b.md', 'retry_when_clean']]);
-  expect(preview.refused.map(entry => [entry.path, entry.code, entry.needs_human]).sort()).toEqual([['c.md', 'worktree_dirty', false], ['d.md', 'concurrent_write', true]]);
+  expect(preview.refused.map(entry => [entry.path, entry.code, entry.needs_human]).sort()).toEqual([['c.md', 'worktree_dirty', false], ['d.md', 'file_drift', true]]);
   expect(preview.refused.find(entry => entry.path === 'c.md')!.reason).toContain('still_dirty');
   expect(preview.next).toMatchObject({ argv: ['gbrain', 'sync', 'unblock', '--source', f.id, '--apply', '--json'] });
   expect(await readGitHoldRetryPaths(engine, f.id, source.incarnation)).toEqual([]);
   const applied = await unblockSync(engine, f.id, { apply: true });
   expect(applied.applied.map(entry => entry.path)).toEqual(['b.md']);
-  expect(applied.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull', '--no-embed', '--no-extract'] });
+  expect(applied.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull'] });
   expect(await readGitHoldRetryPaths(engine, f.id, source.incarnation)).toEqual(['b.md']);
   // Idempotent.
   await unblockSync(engine, f.id, { apply: true });
   expect(await readGitHoldRetryPaths(engine, f.id, source.incarnation)).toEqual(['b.md']);
+  // #6712 PR 2 (L4): each applied unblock that found c.md still dirty is one failed attempt on its hold (the preview counted
+  // none); three within minutes by a live editor never page a person.
+  expect((await readGitHold(engine, f.id, source.incarnation, 'c.md'))?.meta.attempts).toBe(3);
+  expect((await readSyncStatus(engine, f.id)).holds.find(hold => hold.path === 'c.md')).toMatchObject({ attempts: 3, needs_human: false, safe_actions: ['retry_when_clean'] });
   // The sync it names imports b, keeps c held, keeps d held; status then points the agent at d's human step only.
   const after = await performManagedSync(engine, f.opts);
   expect(after.status).toBe('synced');
@@ -136,7 +152,7 @@ test('status joins the cursor, the recent commits, each hold with its triple and
   expect(noHuman.map(hold => hold.path)).toEqual(['c.md']);
 }), 120_000);
 
-test('status reports an older release\'s recorded failure as a retryable page fault with --retry-failed as next', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+test('status reports an older release\'s recorded failure as a retryable page fault with the plain sync as next', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   const f = await fixture({ 'a.md': note('Alpha one.'), 'b.md': note('Beta one.') });
   expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
   writeFileSync(join(f.root, 'a.md'), note('Alpha two.')); writeFileSync(join(f.root, 'b.md'), note('Beta two.'));
@@ -146,10 +162,10 @@ test('status reports an older release\'s recorded failure as a retryable page fa
   try { expect((await performManagedSync(engine, f.opts)).status).toBe('blocked_by_failures'); }
   finally { await engine.executeRaw("DELETE FROM config WHERE key='sync.holds'"); }
   const status = await readSyncStatus(engine, f.id);
-  expect(status.cursor).toMatchObject({ index: 1, total: 2, done: false });
+  expect(status).toMatchObject({ cursor: null, state: 'resumable', convergence: { outcome: 'blocked', stop_reason: 'blocked_by_failures', candidates: 2, remaining: 2, counts: { modified: 1 } } });
   expect(status.last_error).toMatchObject({ code: 'source_changed', class: 'page', safe_actions: ['retry'], needs_human: false, path: 'b.md', phase: 'receipt' });
   expect(status.needs_human).toBe(false);
-  expect(status.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull', '--no-embed', '--no-extract', '--retry-failed'] });
+  expect(status.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull', '--no-embed', '--no-extract'] });
   const converted = await performManagedSync(engine, { ...f.opts, retryFailed: true });
   expect(converted).toMatchObject({ status: 'synced', held: [{ path: 'b.md', code: 'worktree_dirty' }] });
   expect((await readSyncStatus(engine, f.id)).last_error).toBeNull();
@@ -222,12 +238,13 @@ test('#6377: unblock --apply repairs an invalid_fence hold through the fences ki
   const applied = await unblockSync(engine, f.id, { apply: true, noLlm: true });
   const repaired = applied.applied.find(entry => entry.path === 'people/holder.md');
   expect(repaired).toMatchObject({ code: 'invalid_fence', action: 'repair', repair: { kind: 'fences', outcome: 'repaired', tier: 'resolver', receipt: { mode: 'managed', path: 'people/holder.md', tier: 'resolver', classes: 'holder_verified', hold_cleared: true, committed: 'queued' } } });
-  expect(repaired!.action === 'repair' && repaired!.repair.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull', '--no-embed', '--no-extract'] });
+  // The pass that held the fences converged and closed its opt-out episode, so the printed sync carries no inherited opt-out.
+  expect(repaired!.action === 'repair' && repaired!.repair.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull'] });
   const model = applied.applied.find(entry => entry.path === 'people/model.md');
   // The model-tier file was kept out of the plan (--no-llm); the kind recorded llm_disabled on its hold, and its next step is the hold's own paid fix.
   expect(model).toMatchObject({ action: 'repair', repair: { kind: 'fences', outcome: 'held', reason: 'llm_disabled', next: { argv: ['gbrain', 'config', 'set', 'fences.repair.llm', 'true'], consent: ['paid'] } } });
   expect(applied.refused.map(entry => entry.path)).toEqual(['people/manual.md']);
-  expect(applied.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull', '--no-embed', '--no-extract'] });
+  expect(applied.next).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull'] });
   expect(applied.next!.why).toContain('1 repaired by the content-repair lane');
   expect(await readGitHoldRetryPaths(engine, f.id, source.incarnation)).toEqual(['people/holder.md']);
   expect(readFileSync(join(f.root, 'people/holder.md'), 'utf8')).toContain('people/alice-example');

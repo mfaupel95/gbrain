@@ -17,7 +17,6 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../engine.ts';
@@ -27,6 +26,7 @@ import { liveServeOwner } from '../exclusive-fix.ts';
 import { opError, type OperationError } from '../ops/contract.ts';
 import { acquireKernelLockOnly, inspectLockHolder, PgliteBusyError, peekLock, releaseLock, type LockHandle } from '../pglite-lock.ts';
 import { localHostId } from './identity.ts';
+import { readManagedMode } from './managed-mode.ts';
 import { quiesceAutopilot } from '../../commands/migrate-engine.ts';
 import { LATEST_VERSION } from '../migrate.ts';
 import {
@@ -112,7 +112,7 @@ export interface GraduationDeps {
   initTargetSchema(target: BrainEngine, source: BrainEngine): Promise<void>;
   claimAutopilotPause(): Promise<(() => void) | null>;
   /** Failing check names of `gbrain doctor --no-migrate --json` against the fenced target. */
-  runTargetDoctor(runId: string, mainUrl: string): Promise<{ failing: readonly string[]; exempted: readonly string[] }>;
+  runTargetDoctor(runId: string, mainUrl: string, sourcePersistenceEnabled: boolean): Promise<{ failing: readonly string[]; exempted: readonly string[] }>;
   /** Failing source checks, measured with the source open under the run's lock. */
   runSourceDoctor(source: BrainEngine): Promise<readonly string[]>;
   hostId(): string;
@@ -154,7 +154,7 @@ export function defaultGraduationDeps(): GraduationDeps {
       await sized.initSchema(dimensions && model ? { embedding: { dimensions, model } } : {});
     },
     claimAutopilotPause: () => withStdoutOnStderr(() => quiesceAutopilot()),
-    async runTargetDoctor(runId, mainUrl) { return spawnTargetDoctor(runId, mainUrl); },
+    async runTargetDoctor(runId, mainUrl, sourcePersistenceEnabled) { return spawnTargetDoctor(runId, mainUrl, sourcePersistenceEnabled); },
     async runSourceDoctor(source) {
       // In process, on the engine this run (or plan) already opened; GBRAIN_GRADUATION_RUN keeps doctor read-only.
       const { buildChecks } = await import('../../commands/doctor.ts');
@@ -168,7 +168,7 @@ export function defaultGraduationDeps(): GraduationDeps {
       }
     },
     hostId: () => localHostId(),
-    mountsPath: () => process.env.GBRAIN_MOUNTS_PATH || join(homedir(), '.gbrain', 'mounts.json'),
+    mountsPath: () => process.env.GBRAIN_MOUNTS_PATH || join(configDir(), 'mounts.json'),
   };
 }
 
@@ -184,10 +184,11 @@ async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); } finally { console.log = log; }
 }
 
-function spawnTargetDoctor(runId: string, mainUrl: string): { failing: readonly string[]; exempted: readonly string[] } {
+function spawnTargetDoctor(runId: string, mainUrl: string, sourcePersistenceEnabled: boolean): { failing: readonly string[]; exempted: readonly string[] } {
   const script = process.argv[1] && /\.(ts|js|mjs)$/.test(process.argv[1]) ? [process.argv[1]] : [];
   const child = spawnSync(process.execPath, [...script, 'doctor', '--no-migrate', '--json', '--scope=brain'], {
-    env: { ...process.env, GBRAIN_DATABASE_URL: mainUrl, GBRAIN_GRADUATION_RUN: runId },
+    env: { ...process.env, GBRAIN_DATABASE_URL: mainUrl, GBRAIN_GRADUATION_RUN: runId,
+      GBRAIN_GRADUATION_SOURCE_PERSISTENCE: sourcePersistenceEnabled ? 'enabled' : 'disabled' },
     encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024,
   });
   try {
@@ -654,7 +655,7 @@ async function quiesceFresh(run: Run, input: PlanInputs, expect: string): Promis
   run.m.source = plan.source;
   run.m.triggerBypass = plan.triggerBypass!;
   const [pending] = await run.source!.executeRaw<{ request_id: string | null }>(
-    `SELECT request_id::text AS request_id FROM persistence_requests WHERE state IN ('queued','running','recovering') ORDER BY sequence LIMIT 1`).catch(() => [{ request_id: null }]);
+    `SELECT request_id::text AS request_id FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering') ORDER BY sequence LIMIT 1`).catch(() => [{ request_id: null }]);
   run.m.replayRequestId = pending?.request_id ?? null;
   save(run);
 }
@@ -881,7 +882,7 @@ async function stepVerify(run: Run): Promise<void> {
     runId: run.m.runId, expectFence: true,
     runDoctor: async () => {
       phase(run, 'doctor');
-      const doctor = await run.deps.runTargetDoctor(run.m.runId, run.m.targetUrls!.main);
+      const doctor = await run.deps.runTargetDoctor(run.m.runId, run.m.targetUrls!.main, await readManagedMode(run.source!));
       exempted = doctor.exempted;
       return doctor.failing;
     },
@@ -903,11 +904,11 @@ async function stepVerify(run: Run): Promise<void> {
 async function stepCutover(run: Run): Promise<void> {
   phase(run, 'cutover');
   await run.deps.copySequences({ source: run.source!, target: run.main! }, { runId: run.m.runId });
-  const [brain] = await run.source!.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton = 1');
+  const sourceEnabled = await readManagedMode(run.source!);
   const [seq] = await run.source!.executeRaw<{ s: string }>('SELECT COALESCE(max(sequence), 0)::text AS s FROM persistence_requests');
   const row = await readGraduationRow(run.source!);
   if (row?.state !== 'cutover') await withSourceWritable(run.source!, tx => setSourceState(tx, run.m.runId, 'cutover', { cutoverSequence: seq?.s ?? '0' }));
-  if (run.m.state !== 'cutover') advance(run, 'cutover', { sourceEnabled: brain?.enabled === true, cutoverSequence: seq?.s ?? '0' });
+  if (run.m.state !== 'cutover') advance(run, 'cutover', { sourceEnabled, cutoverSequence: seq?.s ?? '0' });
   await boundary(run, 'source_cutover');
   const source = run.source!;
   run.lock = await source.closeRetainingLock();

@@ -131,13 +131,32 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default null
    */
   inflight_timeout: number | null;
-  /** GBrain: called once per connection the in-flight watchdog retired. */
-  onstuck: (stuck: { age_ms: number; queued: number; statement: string }) => void;
+  /**
+   * GBrain (#6543): seconds a head statement may run in total, whatever the server keeps sending, before the
+   * connection is retired with `CONNECTION_STUCK` (`reason: 'age'`). A statement after a declared
+   * `statement_timeout` above the budget gets that timeout plus `inflight_grace`; a declared 0 disables both clocks.
+   * @default null
+   */
+  inflight_max: number | null;
+  /** GBrain (#6543): seconds added to a declared statement_timeout that raises a statement's budget. @default null */
+  inflight_grace: number | null;
+  /** GBrain: called once per connection the in-flight watchdog retired; `reason` is `age` when bytes kept arriving, else `idle`. */
+  onstuck: (stuck: { age_ms: number; queued: number; statement: string; reason: 'age' | 'idle'; budget_ms: number }) => void;
+  /** GBrain (#6543): a connection retired by an incident (`stuck`, `desync`, `closed` under statements) completed a new startup. */
+  onrecovered: (recovered: { connection: number; cause: 'stuck' | 'desync' | 'closed' }) => void;
+  /** GBrain (#6543): the reconnect of a connection retired by an incident failed; it stays marked until one succeeds. */
+  onrecoveryfailed: (failed: { connection: number; cause: 'stuck' | 'desync' | 'closed'; code: string }) => void;
   /**
    * GBrain: called when a statement fails to build (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`);
-   * `statement` is its text with `$n` placeholders, never parameter values.
+   * `statement` is its text with `$n` placeholders, never parameter values; `parameter` is the 1-based
+   * index of an undefined parameter value, undefined when the failure names none (an array element).
    */
-  onbuilderror: (code: string, statement: string) => void;
+  onbuilderror: (code: string, statement: string, parameter?: number) => void;
+  /**
+   * GBrain: called once per connection retired because a statement's answer arrived with no statement
+   * waiting for it; `statement` is the last statement written on it, with `$n` placeholders.
+   */
+  ondesync: (desync: { message: string; connection: number; statement: string }) => void;
   /**
    * GBrain: share the parameter types of a described statement across this pool's
    * connections, so a connection running it for the first time skips the describe
@@ -145,6 +164,18 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default true
    */
   shared_types: boolean | Map<string, number[]>;
+  /**
+   * GBrain (#6930): the array types the first connection to a database fetched, shared with every later
+   * connection (of any pool given the same object), so only that first connection runs the pg_type query.
+   * @default null
+   */
+  array_types: { rows: Array<[number, number]> | null } | null;
+  /**
+   * GBrain (#6930): the pipeline depth on a connection its owner holds (sql.begin, sql.reserve) while every statement
+   * in flight leaves it inside a transaction; used when above max_pipeline (a transaction-mode pooler's 0).
+   * @default 0
+   */
+  transaction_pipeline: number;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
   keep_alive: number | null;
@@ -745,12 +776,21 @@ declare namespace postgres {
 
     begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
     begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
+    /**
+     * GBrain (#6930): with transaction_pipeline in force, the first statement `first` accepts (its text, `$n` for
+     * parameters) is sent behind BEGIN before BEGIN's answer. If BEGIN fails it runs in autocommit, so `first` must
+     * accept only a read or a transaction-local set_config, never a write.
+     * GBrain (GBRA-156): on any pool that pipelines inside a transaction, every statement `early` accepts, in order, is
+     * sent behind BEGIN before BEGIN's answer; the first it refuses, and every later one, waits. The same rule applies.
+     */
+    begin<T>(options: { mode?: string; first?: (statement: string) => boolean; early?: (statement: string) => boolean }, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
 
     reserve(options?: { signal?: AbortSignal }): Promise<ReservedSql<TTypes>>
   }
 
   interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes>  {
     discard(): void;
+    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
     savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
     savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
 
@@ -759,6 +799,7 @@ declare namespace postgres {
 
   interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
     discard(): void;
+    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
     release(): void;
   }
 }

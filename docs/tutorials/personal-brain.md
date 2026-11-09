@@ -2,6 +2,8 @@
 
 By the end of this tutorial you'll have your own AI agent running on a server you control, talking to you over Telegram, with a brain that remembers everything you tell it. About two hours end-to-end, $100 to $150 a month sustained.
 
+> **Want the result without the two hours?** [gbrain.io](https://gbrain.io/?ref=personal-brain) is hosted GBrain: nothing to deploy, always on, and connected to ChatGPT, Claude and Cursor. Prefer a hand? Email support@gbrain.io and a person will set up your first skill with you. Read on if you want to own every piece of the stack.
+
 This is the install I'd run if I were setting up the whole stack from scratch today. I documented it live during a setup session with a collaborator (we used Granola to capture the screen because "this is already too complicated for an archetypical person"). The tutorial is the cleaned-up version of that session.
 
 > "This is the Apple I, we're just soldering breadboards over here."
@@ -106,7 +108,7 @@ In the AlphaClaw UI (Providers tab):
 - **OpenAI API Key.** Required for embeddings if you use the OpenAI provider.
 - **Anthropic API Key.** Required for Claude (the main model the agent talks through).
 - **Perplexity API Key.** Optional, for web search.
-- **Voyage API Key.** Recommended. GBrain ships with Voyage as the default embedder + reranker (`voyage-4` + `rerank-2.5`) — one key covers both, at about half OpenAI's embedding price.
+- **Voyage API Key.** Recommended. GBrain ships with Voyage as the default embedder + reranker (`voyage-4` + `rerank-3-lite`) — one key covers both, at about half OpenAI's embedding price.
 
 You can use the same keys across multiple agents.
 
@@ -121,14 +123,14 @@ Once OpenClaw is running, installation is two commands — one in the brain repo
 gbrain init --supabase
 
 # In the AGENT WORKSPACE repo (where OpenClaw runs):
-gbrain skillpack scaffold --all
+gbrain skillpack scaffold --harness openclaw --workspace .
 ```
 
 `gbrain init --supabase` walks a short wizard that asks for your Supabase connection string and creates the schema. You'll get that connection string in Step 7 — read 7a and 7b first so you paste the right one (the transaction pooler, not the direct connection). If you'd rather try things locally before paying for a database, `gbrain init --pglite` gives you a zero-config embedded engine instead; you can move it to Supabase later with `gbrain migrate --to postgres` ([guide](../guides/move-to-postgres.md)).
 
-`gbrain skillpack scaffold --all` copies the 50+ bundled skills into your agent workspace as first-class files you can edit freely.
+`gbrain skillpack scaffold --harness openclaw` copies the five brain-first skills (`query`, `brain-ops`, `capture`, `data-loss-gate`, `resolve-before-asking`) into your agent workspace as first-class files you can edit freely. OpenClaw lists every workspace skill in every prompt, so add the others by name as the agent needs them (`--skill meeting-ingestion`), or all 50+ with `--all`.
 
-From this point, the agent has working memory and access to every skill.
+From this point, the agent has working memory and the core skills.
 
 ---
 

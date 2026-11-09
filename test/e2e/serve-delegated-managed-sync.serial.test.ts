@@ -221,7 +221,7 @@ describeWithDb('serve-delegated managed sync on Postgres (#6317 D1 a′)', () =>
     const result = await runSync(['--source', 'other', '--no-pull', '--no-embed', '--json'], { GBRAIN_SOURCE: 'other' }, 120_000);
     // The ladder reached the serve (through the legacy URL-keyed socket), was told source_mismatch, and kept the own consumer;
     // what the unclaimed source does after that is the in-process path's business.
-    expect(result.err).toMatch(/\[sync\] the serve is bound to a different source than this sync targets.*this run uses its own consumer beside the serve \(PID \d+\)/);
+    expect(result.err).toMatch(/\[sync\] the serve is bound to a different source than this sync targets.*this run does not delegate to the serve \(PID \d+\)/);
     expect(result.err).not.toMatch(/running the managed catch-up inside it/);
   }, 300_000);
 });

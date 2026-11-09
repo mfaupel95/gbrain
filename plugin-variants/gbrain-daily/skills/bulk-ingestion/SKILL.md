@@ -113,7 +113,7 @@ source_id: <id>       # unique ID from the source system
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 tags: []
-access: <per your brain's access policy>
+# no visibility, access or readable_by: see conventions/page-privacy.md
 ---
 
 # Title

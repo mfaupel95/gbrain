@@ -26,6 +26,7 @@ export const SWEEP_HELP = `gbrain sweep — run the serve-resident maintenance s
 Usage:
   gbrain sweep --once [--source <id>] [--budget-ms <n>] [--batch-limit <n>] [--json]
   gbrain sweep --assign-corpus <source> [--session <id>] [--apply] [--json]
+  gbrain sweep --retry-failed [--apply] [--json]
 
 Runs the three bounded sweep passes against the connected brain:
   1. facts-fence reconciliation (zero-LLM): recently-modified pages with a
@@ -50,7 +51,17 @@ files recorded their source (on a brain with more than one source), and
 sessions whose source never resolved, are held. --assign-corpus previews
 which held sessions would be mapped to <source>; --apply records the
 mapping (a session that already names a source is never changed), and the
-next sweep extracts them there. --session limits it to one session.
+next sweep extracts them there. Dream synthesis and extract_atoms hold the
+same files, already extracted ones included, until they are mapped (#7805,
+#7846). --session limits it to one session.
+
+Failed windows (#6785): a corpus window whose extraction fails after the
+model call (the fence write was refused, the provider errored) is retried
+on the next sweep, then after 10, 20 and 40 minutes, then no longer paid
+for: the sweep skips it as corpus_window_dead_lettered. An extraction-config change (model, provider,
+key presence) retries it once more. --retry-failed lists the files waiting
+or stopped; --apply clears their failure counts so the next sweep pays to
+extract those windows again.
 
 Exit codes: 0 = success or partial (see "skipped" in the report);
 1 = total failure (every pass errored). Local-only; never runs over MCP.
@@ -85,6 +96,10 @@ export async function runSweep(engine: BrainEngine, args: string[]): Promise<voi
   }
   if (args.includes('--assign-corpus')) {
     await runAssignCorpus(engine, args);
+    return;
+  }
+  if (args.includes('--retry-failed')) {
+    await runRetryFailed(engine, args);
     return;
   }
   if (!args.includes('--once')) {
@@ -146,6 +161,50 @@ export async function runSweep(engine: BrainEngine, args: string[]): Promise<voi
   }
 }
 
+async function sessionCorpusDir(engine: BrainEngine): Promise<string> {
+  const dir = await engine.getConfig('dream.synthesize.session_corpus_dir');
+  if (dir) return dir;
+  const { configDir } = await import('../core/config.ts');
+  const { join } = await import('node:path');
+  return join(configDir(), 'transcripts', 'corpus');
+}
+
+/** #6785: preview (default) or clear the failure counts of corpus windows that keep failing after the model call. */
+async function runRetryFailed(engine: BrainEngine, args: string[]): Promise<void> {
+  const json = jsonRequested(args);
+  const apply = args.includes('--apply');
+  const { CORPUS_SPOOL_SUBDIR, CORPUS_WINDOW_FAILURE_CAP, corpusSpoolDir, listCorpusFailures } = await import('../core/context/corpus-segments.ts');
+  const { clearCorpusFailure } = await import('../core/context/corpus-windows.ts');
+  const dir = await sessionCorpusDir(engine);
+  const files = [
+    ...listCorpusFailures(corpusSpoolDir(dir)).map(f => ({ ...f, label: `${CORPUS_SPOOL_SUBDIR}/${f.name}` })),
+    ...listCorpusFailures(dir).map(f => ({ ...f, label: f.name })),
+  ];
+  if (apply) for (const f of files) await clearCorpusFailure(f.full);
+  const rows = files.map(f => ({
+    file: f.label,
+    attempts: f.record.count,
+    stopped: f.record.count >= CORPUS_WINDOW_FAILURE_CAP,
+    last_code: f.record.last_code,
+    last_failed_at: new Date(f.record.last_at).toISOString(),
+  }));
+  if (json) {
+    console.log(JSON.stringify({ applied: apply, cap: CORPUS_WINDOW_FAILURE_CAP, files: rows }, null, 2));
+    return;
+  }
+  if (!rows.length) {
+    console.log('No corpus window is waiting on a failed extraction.');
+    return;
+  }
+  console.log(apply
+    ? `Cleared the failure counts of ${rows.length} corpus file(s); the next sweep pays to extract their windows again (gbrain sweep --once).`
+    : `${rows.length} corpus file(s) have a window that failed after the model call:`);
+  for (const r of rows) {
+    console.log(`  ${r.file}: ${r.attempts} failed attempt(s), last ${r.last_code} at ${r.last_failed_at}${r.stopped ? ' (stopped)' : ' (retrying with backoff)'}`);
+  }
+  if (!apply) console.log('Fix the cause first (the last code names it), then retry them (paid): gbrain sweep --retry-failed --apply');
+}
+
 /** #6268: preview (default) or apply the operator's source mapping for held session files. */
 async function runAssignCorpus(engine: BrainEngine, args: string[]): Promise<void> {
   const json = jsonRequested(args);
@@ -166,15 +225,10 @@ async function runAssignCorpus(engine: BrainEngine, args: string[]): Promise<voi
       'sweep', { json }));
     return;
   }
-  let dir = await engine.getConfig('dream.synthesize.session_corpus_dir');
-  if (!dir) {
-    const { configDir } = await import('../core/config.ts');
-    const { join } = await import('node:path');
-    dir = join(configDir(), 'transcripts', 'corpus');
-  }
+  const dir = await sessionCorpusDir(engine);
   const { assignCorpusSessions, listCorpusSourceHolds } = await import('../core/context/corpus-source.ts');
   const sources = await engine.executeRaw<{ id: string }>('SELECT id FROM sources ORDER BY id LIMIT 2');
-  const holds = listCorpusSourceHolds(dir, sources.length === 1);
+  const holds = listCorpusSourceHolds(dir, sources.length === 1, { includeIngested: true });
   const sessions = holds.sessions.filter(s => onlySession === undefined || s === onlySession);
   const apply = args.includes('--apply');
   const assigned = apply ? assignCorpusSessions(dir, sessions, sourceId) : [];
@@ -186,6 +240,6 @@ async function runAssignCorpus(engine: BrainEngine, args: string[]): Promise<voi
     for (const s of sessions) console.log(`  ${s}`);
     if (sessions.length) console.log(`Apply: gbrain sweep --assign-corpus ${sourceId}${onlySession ? ` --session ${onlySession}` : ''} --apply`);
   } else {
-    console.log(`Mapped ${assigned.length} held session(s) to source ${sourceId}; the next sweep extracts them (gbrain sweep --once).`);
+    console.log(`Mapped ${assigned.length} held session(s) to source ${sourceId}; the next sweep extracts them (gbrain sweep --once) and dream synthesis and extract_atoms write them there.`);
   }
 }

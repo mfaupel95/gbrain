@@ -95,8 +95,95 @@
           }
         ]
       },
+      "getChunkPage": {
+        "default": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 4,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "sourceIds+excludePrivate": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 4,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "getChunkWindows": {
         "default": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 8,
             "unsafeOptions": {
@@ -108,6 +195,15 @@
           }
         ],
         "scopedPrivateSafe": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 9,
             "unsafeOptions": {
@@ -121,6 +217,15 @@
       },
       "getChunks": {
         "default": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 0,
             "unsafeOptions": {
@@ -151,6 +256,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
@@ -161,6 +275,15 @@
           }
         ],
         "includeEmbedding": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 0,
             "unsafeOptions": {
@@ -191,6 +314,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
@@ -211,6 +343,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
@@ -221,6 +362,15 @@
           }
         ],
         "sourceIds": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 0,
             "unsafeOptions": {
@@ -429,6 +579,48 @@
           }
         ]
       },
+      "listEmbeddingStateRows": {
+        "default": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "sourceIds": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "listStaleChunks": {
         "default": [
           {
@@ -551,6 +743,104 @@
           }
         ]
       },
+      "readEmbeddingStateCounts": {
+        "full": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "full+sourceIds": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "ops": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "setPageEmbeddingSignature": {
         "default": [
           {
@@ -661,9 +951,18 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -743,9 +1042,18 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -816,9 +1124,18 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -889,7 +1206,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
               "simple": false
@@ -970,9 +1287,18 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -1002,7 +1328,7 @@
       "searchKeyword": {
         "cjk": [
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1012,18 +1338,18 @@
           },
           {
             "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
               "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "prepare": false,
+              "simple": false
             },
             "via": "unsafe"
           },
@@ -1038,7 +1364,7 @@
         ],
         "cjk+sourceIds+detailLow": [
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1048,18 +1374,18 @@
           },
           {
             "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
               "simple": true
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "prepare": false,
+              "simple": false
             },
             "via": "unsafe"
           },
@@ -1077,11 +1403,20 @@
         "cjk": [
           {
             "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
-            "paramCount": 0,
-            "via": "tagged"
+            "paramCount": 2,
+            "unsafeOptions": {
+              "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 7,
@@ -1095,11 +1430,20 @@
         "cjk+sourceId": [
           {
             "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
-            "paramCount": 0,
-            "via": "tagged"
+            "paramCount": 2,
+            "unsafeOptions": {
+              "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 8,
@@ -1176,6 +1520,17 @@
             "via": "unsafe"
           }
         ],
+        "chunkId": [
+          {
+            "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
         "default": [
           {
             "paramCount": 3,
@@ -1200,6 +1555,17 @@
         ]
       },
       "getCallersOf": {
+        "chunkId": [
+          {
+            "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
         "default": [
           {
             "paramCount": 3,
@@ -1539,7 +1905,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 5,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1556,7 +1922,25 @@
             "via": "tagged"
           },
           {
-            "paramCount": 25,
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1580,7 +1964,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 25,
+            "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1589,7 +1973,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 24,
+            "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1598,7 +1982,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 3,
+            "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1611,7 +1995,7 @@
       "listFactsByEntity": {
         "allFilters": [
           {
-            "paramCount": 8,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1635,7 +2019,7 @@
       "listFactsBySession": {
         "allFilters": [
           {
-            "paramCount": 8,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1681,7 +2065,7 @@
         ],
         "strictTime": [
           {
-            "paramCount": 4,
+            "paramCount": 3,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1694,7 +2078,7 @@
       "listFactsSince": {
         "allFilters": [
           {
-            "paramCount": 10,
+            "paramCount": 9,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1729,7 +2113,7 @@
         ],
         "since+visibility": [
           {
-            "paramCount": 4,
+            "paramCount": 3,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -1781,6 +2165,15 @@
       },
       "migrateFactsToCanonical": {
         "default": [
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 6,
             "via": "tagged"
@@ -2152,6 +2545,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
@@ -2288,6 +2690,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
@@ -2363,7 +2774,7 @@
       "traverseGraph": {
         "default": [
           {
-            "paramCount": 3,
+            "paramCount": 4,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2374,7 +2785,7 @@
         ],
         "excludePrivate": [
           {
-            "paramCount": 3,
+            "paramCount": 4,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2385,7 +2796,7 @@
         ],
         "frontierCap": [
           {
-            "paramCount": 4,
+            "paramCount": 5,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2396,7 +2807,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 6,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2407,7 +2818,7 @@
         ],
         "sourceIds": [
           {
-            "paramCount": 6,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2420,7 +2831,7 @@
       "traversePaths": {
         "default": [
           {
-            "paramCount": 10,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2433,7 +2844,7 @@
       "traversePathsDetailed": {
         "both": [
           {
-            "paramCount": 10,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2444,7 +2855,7 @@
         ],
         "both+sourceIds+excludePrivate": [
           {
-            "paramCount": 14,
+            "paramCount": 12,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2455,7 +2866,7 @@
         ],
         "default": [
           {
-            "paramCount": 10,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2466,7 +2877,7 @@
         ],
         "in": [
           {
-            "paramCount": 10,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2477,7 +2888,7 @@
         ],
         "out+sourceId+linkType": [
           {
-            "paramCount": 13,
+            "paramCount": 12,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2489,6 +2900,61 @@
       }
     },
     "pages": {
+      "countPagesBy": {
+        "grouped+since+remote": [
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 4,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "totals": [
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
+      "countStaleFrontmatterKeyPages": {
+        "default": [
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "countStalePagesForExtraction": {
         "attendance-blocked+sourceId": [
           {
@@ -2578,7 +3044,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 10,
+            "paramCount": 11,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -2666,6 +3132,30 @@
         "default": [
           {
             "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
+      "findPages": {
+        "glob+types+sourceIds+remote": [
+          {
+            "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
+        "name": [
+          {
+            "paramCount": 4,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -3037,6 +3527,19 @@
           }
         ]
       },
+      "listStaleFrontmatterKeyPages": {
+        "default": [
+          {
+            "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "listStalePagesForExtraction": {
         "afterPageId+versionTs+sourceId": [
           {
@@ -3135,6 +3638,15 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "dryRun": [
@@ -3153,6 +3665,15 @@
         "blankBody": [
           {
             "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -3244,6 +3765,15 @@
             "via": "unsafe"
           },
           {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 18,
             "unsafeOptions": {
               "cancelFence": false,
@@ -3293,6 +3823,15 @@
           {
             "paramCount": 3,
             "unsafeOptions": {
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
               "prepare": true,
               "simple": false
             },
@@ -3502,6 +4041,15 @@
       "restorePage": {
         "default": [
           {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
             "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
@@ -3512,6 +4060,15 @@
           }
         ],
         "sourceId": [
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 2,
             "unsafeOptions": {
@@ -3533,9 +4090,27 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "sourceId": [
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 3,
             "unsafeOptions": {
@@ -3689,6 +4264,19 @@
           }
         ]
       },
+      "stripStaleFrontmatterKeys": {
+        "default": [
+          {
+            "paramCount": 4,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "updatePageContextualRetrievalState": {
         "default": [
           {
@@ -3704,6 +4292,59 @@
       },
       "updateSlug": {
         "moved": [
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 11,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 3,
             "unsafeOptions": {
@@ -3793,9 +4434,44 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "noop": [
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 11,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
           {
             "paramCount": 3,
             "unsafeOptions": {
@@ -4438,7 +5114,7 @@
       "listTakes": {
         "default": [
           {
-            "paramCount": 20,
+            "paramCount": 25,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4449,7 +5125,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 21,
+            "paramCount": 26,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4460,7 +5136,7 @@
         ],
         "sourceIds+excludePrivate": [
           {
-            "paramCount": 21,
+            "paramCount": 26,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,

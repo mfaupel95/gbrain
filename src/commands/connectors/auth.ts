@@ -5,7 +5,9 @@
  * from stdin so the secret never lands in argv/`ps`. `--try-oauth` (chatgpt)
  * attempts the best-effort OAuth PKCE loopback first, then probes and falls back
  * to cookie guidance. Every path ends with a probe + a one-line verdict; nothing
- * is saved on a failed probe unless `--force`.
+ * is saved on a failed probe unless `--force`. A ChatGPT cookie first mints a
+ * token through the same client; a failed mint is the verdict and no probe
+ * follows it (#7515).
  */
 
 import type { BrainEngine } from '../../core/engine.ts';
@@ -14,11 +16,10 @@ import { shellQuote } from '../../core/agent-output.ts';
 import { agentBlock } from '../../core/agent-markers.ts';
 import { isInteractive } from '../../core/interaction.ts';
 import { readStdinPayload } from '../../core/stdin-read.ts';
-import { ConnectorClient } from '../../core/connectors/client.ts';
-import type { ConnectorFetch } from '../../core/connectors/client.ts';
+import { ConnectorClient, probeFailure } from '../../core/connectors/client.ts';
 import { deleteCredential, saveCredential } from '../../core/connectors/credentials.ts';
 import { getConnectorProvider, isConnectorProviderName } from '../../core/connectors/registry.ts';
-import type { ChatHistoryProvider, ConnectorCredential } from '../../core/connectors/types.ts';
+import { isTokenProviderName, type ChatHistoryProvider, type ConnectorCredential, type ProbeResult } from '../../core/connectors/types.ts';
 
 interface AuthFlags {
   cookie?: string;
@@ -43,13 +44,18 @@ function parseFlags(args: string[]): { provider: string; flags: AuthFlags } {
   return { provider, flags };
 }
 
+/** A pasted credential is a header or key, never megabytes; more is refused, not truncated. */
+export const CREDENTIAL_MAX_BYTES = 64 * 1024;
+/** A credential arrives in one paste or pipe write; a stream that stalls mid-credential is discarded after 10 s. */
+export const CREDENTIAL_INACTIVITY_MS = 10_000;
+
 /** A person pasting a cookie at the terminal gets 5 minutes for the first byte. */
 const PASTE_WAIT_MS = 300_000;
 
 /** Bounded credential read (C5): an open-but-silent stdin times out with a message instead of hanging. */
 async function readStdin(firstByteMs?: number): Promise<string | null> {
   const read = await readStdinPayload("printf '%s' \"$COOKIE\" | gbrain connectors auth <provider> --cookie -",
-    firstByteMs !== undefined ? { firstByteMs } : {});
+    { credential: true, maxBytes: CREDENTIAL_MAX_BYTES, inactivityMs: CREDENTIAL_INACTIVITY_MS, ...(firstByteMs !== undefined ? { firstByteMs } : {}) });
   if (read.ok) return read.text.trim();
   console.error(read.message);
   return null;
@@ -80,15 +86,25 @@ function makeProbeClient(provider: ChatHistoryProvider, cred: ConnectorCredentia
   return new ConnectorClient({
     baseUrl: provider.baseUrl,
     headers: () => provider.authHeaders(cred),
-    refresh: provider.refreshAccessToken
-      ? () => provider.refreshAccessToken!(cred, fetch as unknown as ConnectorFetch)
-      : undefined,
+    refresh: provider.refreshAccessToken ? (client) => provider.refreshAccessToken!(cred, client) : undefined,
   });
+}
+
+/** chatgpt: mint an accessToken from the cookie up front, so the first sync doesn't start with a 401→refresh round-trip. */
+async function mintToken(provider: ChatHistoryProvider, cred: ConnectorCredential, client: ConnectorClient): Promise<ProbeResult> {
+  if (!cred.cookie || !provider.refreshAccessToken) return { ok: true };
+  try {
+    if (await provider.refreshAccessToken(cred, client)) return { ok: true };
+    return { ok: false, kind: 'unauthorized', detail: 'the session endpoint returned no access token' };
+  } catch (e) {
+    return probeFailure(e);
+  }
 }
 
 async function probeAndReport(provider: ChatHistoryProvider, cred: ConnectorCredential): Promise<boolean> {
   const client = makeProbeClient(provider, cred);
-  const r = await provider.probe(client);
+  const minted = await mintToken(provider, cred, client);
+  const r = minted.ok ? await provider.probe(client) : minted;
   if (r.ok) {
     console.log(`✓ ${provider.name}: credential verified — conversation history is reachable.`);
     return true;
@@ -126,8 +142,13 @@ function printFirstRun(provider: string): void {
 
 export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Promise<void> {
   const { provider, flags } = parseFlags(args);
+  if (isTokenProviderName(provider)) {
+    const { runApiTokenAuth } = await import('./auth-token.ts');
+    await runApiTokenAuth(provider, flags);
+    return;
+  }
   if (!isConnectorProviderName(provider)) {
-    console.error(`Usage: gbrain connectors auth <chatgpt|claude> [--cookie -|--token V] [--try-oauth] [--force]`);
+    console.error(`Usage: gbrain connectors auth <chatgpt|claude> [--cookie -|--token V] [--try-oauth] [--force], or gbrain connectors auth <fireflies|slack> --token -`);
     setCliExitVerdict(1);
     return;
   }
@@ -188,12 +209,6 @@ export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Pr
     accessToken: token || undefined,
     savedAt: new Date().toISOString(),
   };
-  // chatgpt: mint an accessToken from the cookie up front so the first sync
-  // doesn't start with a guaranteed 401→refresh round-trip.
-  if (cred.cookie && prov.refreshAccessToken) {
-    await prov.refreshAccessToken(cred, fetch as unknown as ConnectorFetch);
-  }
-
   const ok = await probeAndReport(prov, cred);
   if (!ok && !flags.force) {
     console.error('Credential NOT saved (probe failed). Re-run with --force to save anyway.');
@@ -242,8 +257,8 @@ async function tryOauth(prov: ChatHistoryProvider, flags: AuthFlags): Promise<bo
 
 export async function runConnectorLogout(args: string[]): Promise<void> {
   const provider = args.find((a) => !a.startsWith('-')) ?? '';
-  if (!isConnectorProviderName(provider)) {
-    console.error('Usage: gbrain connectors logout <chatgpt|claude>');
+  if (!isConnectorProviderName(provider) && !isTokenProviderName(provider)) {
+    console.error('Usage: gbrain connectors logout <chatgpt|claude|fireflies|slack>');
     setCliExitVerdict(1);
     return;
   }

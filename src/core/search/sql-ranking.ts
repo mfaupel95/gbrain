@@ -19,8 +19,8 @@
 
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
-import { privatePagesFilterFragment } from './private-visibility.ts';
-import { currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { privatePagesFilterForCaller } from './private-visibility.ts';
+import { chunkVisibleFilter, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
 import { pageEligibleSql } from '../eligibility/sql.ts';
 import type { TrustTier } from '../trust/tier.ts';
 
@@ -191,6 +191,12 @@ export function buildVisibilityClause(
     /** #5575: the read floor and proactive activation control (eligibility/sql.ts), applied before LIMIT. */
     minTrust?: TrustTier;
     suppressFlagged?: boolean;
+    /**
+     * Wave B: the chunk table alias when the statement reads `content_chunks`
+     * rows joined to the page; adds the live body generation predicate
+     * (`chunkVisibleFilter`) in place of the page-only projection filter.
+     */
+    chunkAlias?: string;
   },
 ): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
@@ -199,12 +205,16 @@ export function buildVisibilityClause(
   // #4352 remediation: the predicate text lives ONCE in private-visibility.ts
   // (shared with listPages + the relational-arm hydrate) so it cannot drift.
   const privateClause = opts?.excludePrivate
-    ? ` AND ${privatePagesFilterFragment(pageAlias)}`
+    ? ` AND ${privatePagesFilterForCaller(pageAlias)}`
     : '';
   const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
+  // C4: a pinned question's page holds only the question and owner notes; it is
+  // read through questions_* and never ranks in retrieval (questions/pages.ts).
+  const pinnedQuestion = ` AND NOT (COALESCE(${pageAlias}.frontmatter, '{}'::jsonb) ? 'pinned_question')`;
   const trustClause = opts?.minTrust || opts?.suppressFlagged
     ? ` AND ${pageEligibleSql(pageAlias, { floor: opts.minTrust, suppressFlagged: opts.suppressFlagged })}` : '';
-  return `AND ${pageAlias}.deleted_at IS NULL AND ${currentTextProjectionFilter(pageAlias)} AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}${chunksClause}${trustClause}`;
+  const projection = opts?.chunkAlias ? chunkVisibleFilter(pageAlias, opts.chunkAlias) : currentTextProjectionFilter(pageAlias);
+  return `AND ${pageAlias}.deleted_at IS NULL AND ${projection} AND NOT ${sourceAlias}.archived AND ${quarantine}${pinnedQuestion}${privateClause}${chunksClause}${trustClause}`;
 }
 
 // ============================================================
@@ -354,13 +364,25 @@ export function buildOrFallbackWebsearchQuery(query: string): string | null {
   // F3 operator guard: any double quote, or a dash LEADING a token
   // (whitespace/start boundary — interior hyphens like "foo-bar" are fine).
   if (query.includes('"') || /(^|\s)-\S/.test(query)) return null;
-  const tokens = query
+  const tokens = orFallbackTokens(query);
+  return tokens.length < 2 ? null : tokens.join(' OR ');
+}
+
+/**
+ * The OR fallback's terms: word tokens without the literal OR/AND words, each
+ * once (case-insensitive, first spelling kept). A repeated word adds no match
+ * and only makes ts_rank evaluate the lexeme again on every matching row:
+ * 4.5 s against 0.55 s over a 16,840-page match set, with identical scores
+ * (#7135, diagnosed by @veltri-23 in #7136). Callers apply the operator guard.
+ */
+export function orFallbackTokens(query: string): string[] {
+  const seen = new Set<string>();
+  return query
     .normalize('NFKC')
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
-    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; });
-  if (tokens.length < 2) return null;
-  return tokens.join(' OR ');
+    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; })
+    .filter(t => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
 // ============================================================
@@ -446,4 +468,18 @@ export function buildRecencyComponentSql(opts: {
 }
 
 // Exported for unit tests
+/**
+ * #7175: keyword ranking has no phrase term, so a chunk holding the query's words as one contiguous phrase
+ * (a rare exact phrase in a long transcript) ranked like any chunk that merely repeats them. A chunk that
+ * matches the query as a phrase (`phraseto_tsquery`, stemmed, stopword gaps kept) scores this many times higher.
+ * A one-word query matches every candidate equally, so its order is unchanged. Opt-in: `search.keyword_phrase true` turns it on.
+ */
+export const KEYWORD_PHRASE_FACTOR = 2;
+
+/** The phrase multiplier on a chunk's ts_rank; `param` is the SQL placeholder holding the rank query text. */
+export function keywordPhraseFactorSql(ftsLang: string, param: string, enabled = false, vector = 'cc.search_vector'): string {
+  if (!enabled) return '1';
+  return `(CASE WHEN ${vector} @@ phraseto_tsquery('${ftsLang}', ${param}) THEN ${KEYWORD_PHRASE_FACTOR} ELSE 1 END)`;
+}
+
 export const __test__ = { escapeLikePattern, escapeSqlLiteral, buildLikePrefixLiteral };

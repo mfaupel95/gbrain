@@ -13,6 +13,7 @@
  *   gbrain recall --include-expired
  *   gbrain recall --as-context              # prompt-injection-ready markdown
  *   gbrain recall --json                    # structured output
+ *   gbrain recall --question "<q>"          # facts ranked by relevance to the question
  *
  *   gbrain forget <fact-id>                  # durable withdrawal (forget_fact / forget verb)
  *   gbrain forget <fact-id> --purge          # owner-only purge (src/commands/forget-purge.ts)
@@ -32,13 +33,17 @@
  */
 
 import type { BrainEngine, FactRow, FactKind } from '../core/engine.ts';
+import type { Notice } from '../core/agent-output.ts';
+import type { DegradedStamp } from '../core/degraded-stamp.ts';
+import { clampSearchLimit } from '../core/engine.ts';
 import { effectiveConfidence } from '../core/facts/decay.ts';
 import { resolveEntitySlug } from '../core/entities/resolve.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
-import { callRemoteTool, RemoteMcpError, unpackToolResult } from '../core/mcp-client.ts';
-import { readCursor, writeCursor } from '../core/recall-cursor-state.ts';
+import { RemoteMcpError } from '../core/remote-mcp-error.ts';
+import { readRecallCursor, writeCursor, writePagedCursor, type RecallCursor } from '../core/recall-cursor-state.ts';
 import { resolveSourceId, resolveSourceIdEngineFree, SourceTargetError } from '../core/source-resolver.ts';
 import { usageError } from '../cli/cli-error.ts';
+import { parseSinceParam, SINCE_GRAMMAR } from '../core/facts/since-parse.ts';
 
 // Same kebab-case shape gate the source-resolver applies. v0.32: applied
 // locally on thin-client where the canonical resolver's assertSourceExists
@@ -57,8 +62,10 @@ const KIND_ICON: Record<FactKind, string> = {
   idea: '💡',
 };
 
-interface ParsedFlags {
+export interface ParsedFlags {
   entity: string | null;
+  /** #4828/#7166: the entity came from --entity (never split or widened), not the bare positional. */
+  entityExplicit: boolean;
   since: Date | null;
   sessionId: string | null;
   grep: string | null;
@@ -72,6 +79,7 @@ interface ParsedFlags {
   // MEMORY_VERBS v1 [c4]: recall's verb params, routed through the recall OP
   // (this hand-rolled CLI otherwise ignores unknown flags silently).
   query: string | null;
+  question: string | null;
   budgetTokens: number | null;
   budgetPolicy: string | null;
   sourceExplicit: boolean;
@@ -90,9 +98,10 @@ const WATCH_THIN_CLIENT_WARN_THRESHOLD = 30;
 const WATCH_MAX_CONSECUTIVE_FAILURES = 5;
 const DEFAULT_FALLBACK_HOURS = 24;
 
-function parseFlags(args: string[]): ParsedFlags {
+export function parseFlags(args: string[]): ParsedFlags {
   const out: ParsedFlags = {
     entity: null,
+    entityExplicit: false,
     since: null,
     sessionId: null,
     grep: null,
@@ -104,6 +113,7 @@ function parseFlags(args: string[]): ParsedFlags {
     source: 'default',
     limit: 50,
     query: null,
+    question: null,
     budgetTokens: null,
     budgetPolicy: null,
     sourceExplicit: false,
@@ -113,11 +123,50 @@ function parseFlags(args: string[]): ParsedFlags {
     watchSeconds: null,
   };
   let positional = '';
+  let entityFlag: string | null = null;
   let rawBudget: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--since') { out.since = parseSinceParam(args[++i] ?? ''); continue; }
-    if (a === '--session' || a === '--session-id') { out.sessionId = args[++i] ?? null; continue; }
+    if (a === '--since') {
+      const raw = args[i + 1];
+      const valueGiven = raw !== undefined && !raw.startsWith('--');
+      const since = valueGiven ? parseSinceParam(raw) : null;
+      if (!since || !Number.isFinite(since.getTime())) {
+        throw usageError(valueGiven ? `--since is not a date or duration (got "${raw.slice(0, 60)}").` : '--since requires a date or duration.',
+          `Pass ${SINCE_GRAMMAR}.`, {
+            why: `An unreadable time bound must not silently widen recall to every fact. --since takes ${SINCE_GRAMMAR}.`,
+            fix: { argv: ['gbrain', 'recall', '--help'], consent: [], actor: 'agent', why: 'Shows the accepted --since forms.', requires_exclusive: false },
+          });
+      }
+      out.since = since;
+      i++;
+      continue;
+    }
+    if (a === '--session' || a === '--session-id') {
+      const raw = args[i + 1];
+      if (raw === undefined || raw.trim().length === 0 || raw.startsWith('--')) {
+        throw usageError(`${a} requires a session ID.`, `Pass the session ID after the flag, e.g. ${a} <id>.`, {
+          why: 'A missing session bound must not silently widen recall to every session.',
+          fix: { argv: ['gbrain', 'recall', '--help'], consent: [], actor: 'agent', why: 'Shows the recall selectors.', requires_exclusive: false },
+        });
+      }
+      out.sessionId = raw;
+      i++;
+      continue;
+    }
+    // #7166: --entity matches the recall op's `entity` parameter (same as the bare positional).
+    if (a === '--entity' || a.startsWith('--entity=')) {
+      const raw = a === '--entity' ? args[i + 1] : a.slice('--entity='.length);
+      if (raw === undefined || raw.trim() === '' || (a === '--entity' && raw.startsWith('--'))) {
+        throw usageError('--entity requires an entity name or slug.', 'Pass it after the flag, e.g. --entity people/alice-example.', {
+          why: 'An empty entity must not silently widen recall to every fact.',
+          fix: { argv: ['gbrain', 'recall', '--help'], consent: [], actor: 'agent', why: 'Shows the recall selectors.', requires_exclusive: false },
+        });
+      }
+      entityFlag = raw;
+      if (a === '--entity') i++;
+      continue;
+    }
     if (a === '--grep') { out.grep = (args[++i] ?? '').toLowerCase(); continue; }
     if (a === '--today') { out.today = true; continue; }
     if (a === '--supersessions') { out.supersessions = true; continue; }
@@ -142,6 +191,8 @@ function parseFlags(args: string[]): ParsedFlags {
       out.limit = Number(raw); continue;
     }
     if (a === '--query') { out.query = args[++i] ?? null; continue; }
+    if (a === '--question') { out.question = args[++i] ?? null; continue; }
+    if (a.startsWith('--question=')) { out.question = a.slice('--question='.length); continue; }
     if (a === '--budget-tokens') { rawBudget = args[++i]; continue; }
     if (a === '--budget-policy') {
       const next = args[i + 1];
@@ -166,7 +217,15 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a.startsWith('--')) continue; // skip unknown flags silently
     if (!positional) positional = a;
   }
-  if (positional) out.entity = positional;
+  if (entityFlag !== null && positional && positional !== entityFlag) {
+    throw usageError(`--entity "${entityFlag.slice(0, 60)}" and the positional "${positional.slice(0, 60)}" name different entities.`,
+      'Pass the entity once: either --entity <name> or the bare positional.', {
+        why: 'recall reads one entity per call; two different names would silently drop one.',
+        fix: { argv: ['gbrain', 'recall', '--entity', entityFlag], consent: [], actor: 'agent', why: 'Recall the --entity value only.', requires_exclusive: false },
+      });
+  }
+  if (entityFlag !== null) { out.entity = entityFlag; out.entityExplicit = true; }
+  else if (positional) out.entity = positional;
   out.budgetTokens = (out.budgetPolicy === 'query_first' && out.query?.trim()
     ? Number(rawBudget)
     : parseInt(rawBudget ?? '', 10)) || null;
@@ -178,31 +237,13 @@ function parseFlags(args: string[]): ParsedFlags {
   return out;
 }
 
-/** Only `--query`/`--budget-tokens` without --budget-policy runs the recall op in-process; every other form has a thin-client path. */
+/** Only `--query`/`--budget-tokens` without --budget-policy or --question runs the recall op in-process; every other form has a thin-client path. */
 export function recallNeedsLocalEngine(args: string[]): boolean {
   const flags = parseFlags(args);
-  return flags.budgetPolicy === null && (flags.query !== null || flags.budgetTokens !== null);
+  return flags.budgetPolicy === null && flags.question === null && (flags.query !== null || flags.budgetTokens !== null);
 }
 
-function parseSinceParam(raw: string): Date | null {
-  if (!raw) return null;
-  const iso = Date.parse(raw);
-  if (Number.isFinite(iso)) return new Date(iso);
-  const ago = raw.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)(?:\s+ago)?$/i);
-  if (ago) {
-    const n = parseInt(ago[1], 10);
-    const unit = ago[2].toLowerCase();
-    const ms =
-      unit.startsWith('s') ? n * 1000 :
-      unit.startsWith('m') ? n * 60 * 1000 :
-      unit.startsWith('h') ? n * 60 * 60 * 1000 :
-      n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() - ms);
-  }
-  return null;
-}
-
-function validateAndNormalizeFlags(flags: ParsedFlags): void {
+export function validateAndNormalizeFlags(flags: ParsedFlags): void {
   if (flags.sinceLastRun && flags.since) {
     process.stderr.write('Error: --since-last-run and --since are mutually exclusive.\n');
     process.exit(2);
@@ -235,6 +276,7 @@ async function resolveSourceForRecall(
   // cannot distinguish "user asked for the default source" from "user
   // passed no source flag".
   sourceExplicit: boolean,
+  routing: RecallRouting = callerRouting(),
 ): Promise<string> {
   if (thinClient) {
     // #5535: an explicit `--source default` is a real selector, not an
@@ -256,7 +298,7 @@ async function resolveSourceForRecall(
     // #5535: pass the flag's literal value (including 'default') when it
     // was explicit so tier 1 of the resolver wins; null only when the flag
     // was omitted, which keeps the env/dotfile/config-default chain.
-    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null);
+    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null, routing.cwd, { env: routing.env });
   } catch (e) {
     process.stderr.write(
       `[recall] source not registered: ${flagValue}. Falling back to literal value.\n`,
@@ -265,42 +307,40 @@ async function resolveSourceForRecall(
   }
 }
 
+const RECALL_HELP = `Usage: gbrain recall [<entity>] [options]
+
+Find saved facts (MEMORY_VERBS v1). A question goes in --question; the bare
+positional is an entity name, then a literal piece of fact text.
+
+  gbrain recall <entity>                 facts about one entity (person, company, "user"); same as --entity <entity>
+  gbrain recall --question "<q>"         facts ranked by relevance to a natural-language question
+  gbrain recall --query "<q>"            facts plus matching pages
+  gbrain recall --grep <text>            facts whose text contains <text>
+  gbrain recall --since "8 hours ago"    facts from a time window (--today: today, rendered by kind)
+  gbrain recall --session <id>           facts from one session
+
+--since-last-run shows facts created since the previous run. When more than
+--limit facts arrived, it shows the oldest --limit of them and the next run
+continues after the last one shown (local brains; a thin client warns instead).
+
+--since takes an ISO 8601 date or datetime, a duration ("8 hours ago", "30m",
+"2d") or a relative phrase ("6 weeks ago", "last month"). An unreadable
+--since or a --session with no ID is refused (invalid_params, exit 2).
+
+Options: --limit N, --include-expired, --json, --as-context, --source <id>,
+--budget-tokens N, --budget-policy facts_first|query_first, --supersessions,
+--since-last-run, --pending, --rollup, --watch [SECONDS].
+Withdraw a fact with gbrain forget <fact-id>.
+`;
+
 export async function runRecall(engine: BrainEngine, args: string[]): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) { process.stdout.write(RECALL_HELP); return; }
   const flags = parseFlags(args);
-  if (flags.budgetPolicy !== null) {
-    const { MEMORY_VERBS_VERSION, operationsByName, verbError } = await import('../core/operations.ts');
-    const { validateParams } = await import('../mcp/validate-params.ts');
-    const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+  if (isOneShotRecall(flags)) {
     try {
-      const error = validateParams(operationsByName.recall, { budget_policy: flags.budgetPolicy })
-        ?? (flags.watchSeconds !== null || flags.sinceLastRun || flags.rollup || flags.asContext
-          ? '--budget-policy cannot be combined with --watch, --since-last-run, --rollup, or --as-context.' : null);
-      if (error) throw verbError('invalid_params', error,
-        'Use --budget-policy facts_first or query_first on a one-shot recall, or omit the policy for CLI-only behavior.');
-      const selector = flags.sourceExplicit ? flags.source : process.env.GBRAIN_SOURCE || undefined;
-      if (selector !== undefined && !SOURCE_ID_RE.test(selector)) {
-        throw verbError('invalid_params', 'recall requires a concrete source id matching [a-z0-9-]{1,32}.',
-          'Choose a registered source id, or omit the source selector to use your existing scope.', 'source_id');
-      }
-      const thinClient = isThinClient(loadConfig());
-      const sourceId = resolveSourceIdEngineFree(flags.sourceExplicit ? flags.source : null)
-        ?? (thinClient ? undefined : await resolveSourceId(engine, null));
-      await runRecallVerb(engine, flags, sourceId);
+      await renderRecallVerbResult(flags, await oneShotRecallResult(engine, flags));
     } catch (error) {
-      if (error instanceof RemoteMcpError) {
-        const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
-        const detail = { protocol_version: MEMORY_VERBS_VERSION, ...error.toJSON() };
-        if (flags.json) await writeStdoutFinal(JSON.stringify(detail, null, 2) + '\n');
-        console.error(`Error [${detail.error}]: ${detail.message}`);
-        if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
-        setCliExitVerdict(1);
-        return;
-      }
-      if (error instanceof SourceTargetError) {
-        error = verbError('not_found', error.message,
-          'Choose an active source with the source selector, or repair your local source configuration.', 'unknown_source');
-      }
-      if (!await reportPersistenceCliError(error, flags.json)) throw error;
+      await reportOneShotRecallError(error, flags);
     }
     return;
   }
@@ -320,8 +360,8 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
 
   // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
   // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
-  if (flags.query !== null || flags.budgetTokens !== null) {
-    await runRecallVerb(engine, flags, sourceId);
+  if (flags.query !== null || flags.budgetTokens !== null || flags.question !== null) {
+    await renderRecallVerbResult(flags, await recallVerbResult(engine, flags, sourceId));
     return;
   }
 
@@ -332,16 +372,109 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
   await runRecallOnce(engine, flags, sourceId, thinClient, 'briefing');
 }
 
+/** The caller's GBRAIN_SOURCE and cwd for source resolution; the warm CLI socket passes the CLI's, never the serve's. */
+export interface RecallRouting { cwd: string; env: string | undefined }
+
+function callerRouting(): RecallRouting {
+  return { cwd: process.cwd(), env: process.env.GBRAIN_SOURCE };
+}
+
+/** MEMORY_VERBS v1 one-shot recall (`--budget-policy` or `--question`). */
+export function isOneShotRecall(flags: ParsedFlags): boolean {
+  return flags.budgetPolicy !== null || flags.question !== null;
+}
+
+/** The recall forms that run the recall op (and only it) before rendering: one-shot, `--query`, `--budget-tokens`. */
+export function isRecallVerbForm(flags: ParsedFlags): boolean {
+  return isOneShotRecall(flags) || flags.query !== null || flags.budgetTokens !== null;
+}
+
+/** One-shot recall: validates the combination, resolves the source and runs the recall op. */
+export async function oneShotRecallResult(engine: BrainEngine, flags: ParsedFlags, routing: RecallRouting = callerRouting()): Promise<RecallVerbResult> {
+  const { operationsByName, verbError } = await import('../core/operations.ts');
+  const { validateParams } = await import('../mcp/validate-params.ts');
+  const option = flags.budgetPolicy !== null ? '--budget-policy' : '--question';
+  const error = (flags.budgetPolicy !== null ? validateParams(operationsByName.recall, { budget_policy: flags.budgetPolicy }) : null)
+    ?? (flags.watchSeconds !== null || flags.sinceLastRun || flags.rollup || flags.asContext
+      ? `${option} cannot be combined with --watch, --since-last-run, --rollup, or --as-context.` : null);
+  if (error) throw verbError('invalid_params', error, flags.budgetPolicy !== null
+    ? 'Use --budget-policy facts_first or query_first on a one-shot recall, or omit the policy for CLI-only behavior.'
+    : 'Use --question on a one-shot recall, or drop it for the watch, cursor, rollup and context renders.');
+  const selector = flags.sourceExplicit ? flags.source : routing.env || undefined;
+  if (selector !== undefined && !SOURCE_ID_RE.test(selector)) {
+    throw verbError('invalid_params', 'recall requires a concrete source id matching [a-z0-9-]{1,32}.',
+      'Choose a registered source id, or omit the source selector to use your existing scope.', 'source_id');
+  }
+  const thinClient = isThinClient(loadConfig());
+  const sourceId = resolveSourceIdEngineFree(flags.sourceExplicit ? flags.source : null, routing.cwd, { env: routing.env })
+    ?? (thinClient ? undefined : await resolveSourceId(engine, null, routing.cwd, { env: routing.env }));
+  return recallVerbResult(engine, flags, sourceId);
+}
+
+/** How a one-shot recall failure is reported (exit code and envelope); rethrows what it does not own. */
+export async function reportOneShotRecallError(error: unknown, flags: ParsedFlags): Promise<void> {
+  const { MEMORY_VERBS_VERSION, verbError } = await import('../core/operations.ts');
+  const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+  if (error instanceof RemoteMcpError) {
+    const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
+    const detail = { protocol_version: MEMORY_VERBS_VERSION, ...error.toJSON() };
+    if (flags.json) await writeStdoutFinal(JSON.stringify(detail, null, 2) + '\n');
+    console.error(`Error [${detail.error}]: ${detail.message}`);
+    if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
+    setCliExitVerdict(1);
+    return;
+  }
+  if (error instanceof SourceTargetError) {
+    error = verbError('not_found', error.message,
+      'Choose an active source with the source selector, or repair your local source configuration.', 'unknown_source');
+  }
+  if (!await reportPersistenceCliError(error, flags.json)) throw error;
+}
+
+/**
+ * The recall op result for a verb form, without printing: the source a
+ * non-one-shot form resolves (with its stderr fallback notice) and the op.
+ * The warm CLI socket's serve-side half; the CLI renders what it returns.
+ */
+export async function recallVerbForCaller(engine: BrainEngine, args: string[], routing: RecallRouting): Promise<RecallVerbResult | null> {
+  const flags = parseFlags(args);
+  if (!isRecallVerbForm(flags)) return null;
+  if (isOneShotRecall(flags)) return oneShotRecallResult(engine, flags, routing);
+  return recallVerbResult(engine, flags, await resolveSourceForRecall(engine, flags.source, false, flags.sourceExplicit, routing));
+}
+
+export type RecallVerbResult = {
+  facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string; relevance?: number; rank_score?: number; contested?: { fact_id?: string } }>;
+  facts_order?: 'relevance' | 'newest';
+  facts_groups?: Array<{ source_id: string; entity_slug: string | null; fact_ids: string[] }>;
+  entity_unspecified?: { candidates: Array<{ source_id: string; entity_slug: string }>; suggestion: string };
+  facts_degraded?: { reason?: string; unembedded?: number };
+  results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
+  search_degraded?: string;
+  /** GBRA-200: the degraded stamp (CLI only; MCP carries it as `_meta.degraded`). */
+  degraded?: DegradedStamp;
+  budget_tokens?: number;
+  budget_used?: number;
+  dropped_count?: number;
+};
+
 /**
  * MEMORY_VERBS v1 — `gbrain recall --query ... [--budget-tokens N]` routes
- * through the recall OP (same code path MCP exercises) and renders facts +
- * search results with the budget footer. `--json` prints the raw envelope.
+ * through the recall OP (same code path MCP exercises); renderRecallVerbResult
+ * prints facts + search results with the budget footer. `--json` prints the
+ * raw envelope.
  */
-async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<void> {
+async function recallVerbResult(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<RecallVerbResult> {
   const { operationsByName } = await import('../core/operations.ts');
+  const { degradedStampFor } = await import('../core/degraded-stamp.ts');
   const op = operationsByName['recall'];
+  // GBRA-200: the stamp reads the op's retrieval stages and degraded notices.
+  let retrieval: Record<string, unknown> | null = null;
+  const notices: Notice[] = [];
   const ctx = {
     engine,
+    emitResponseMeta: (key: string, value: unknown) => { if (key === 'retrieval' && value && typeof value === 'object') retrieval = value as Record<string, unknown>; },
+    emitNotice: (notice: Notice | null | undefined) => { if (notice) notices.push(notice); },
     config: loadConfig() || { engine: 'pglite' as const },
     logger: {
       info: (m: string) => process.stderr.write(`[info] ${m}\n`),
@@ -352,43 +485,62 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?:
     remote: false as const,
     sourceId: sourceId ?? 'default',
   };
+  const oneShot = flags.budgetPolicy !== null || flags.question !== null;
   const params = {
     ...(flags.entity ? { entity: flags.entity } : {}),
+    ...(flags.question !== null ? { question: flags.question } : {}),
     ...(flags.query ? { query: flags.query } : {}),
     ...(flags.budgetTokens ? { budget_tokens: flags.budgetTokens } : {}),
     ...(flags.since ? { since: flags.since.toISOString() } : {}),
     ...(flags.grep ? { grep: flags.grep } : {}),
     include_expired: flags.includeExpired,
     limit: flags.limit,
-    ...(flags.budgetPolicy !== null ? {
-      budget_policy: flags.budgetPolicy,
+    ...(oneShot ? {
+      ...(flags.budgetPolicy !== null ? { budget_policy: flags.budgetPolicy } : {}),
       ...(sourceId !== undefined ? { source_id: sourceId } : {}),
       ...(flags.sessionId ? { session_id: flags.sessionId } : {}),
       ...(flags.supersessions ? { supersessions: true } : {}),
       ...(flags.pending ? { include_pending: true } : {}),
     } : {}),
   };
-  const result = (flags.budgetPolicy !== null && isThinClient(ctx.config)
-    ? unpackToolResult(await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 }))
-    : await op.handler(ctx, params)) as {
-    facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string }>;
-    results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
-    search_degraded?: string;
-    budget_tokens?: number;
-    budget_used?: number;
-    dropped_count?: number;
-  };
+  const stamped = (result: RecallVerbResult, stamp: RecallVerbResult['degraded'] | null): RecallVerbResult => (stamp ? { ...result, degraded: stamp } : result);
+  if (!oneShot || !isThinClient(ctx.config)) {
+    const result = await op.handler(ctx, params) as RecallVerbResult;
+    return stamped(result, degradedStampFor('recall', result, { retrieval }, notices));
+  }
+  const { callRemoteTool, extractResponseMeta, unpackToolResult } = await import('../core/mcp-client.ts');
+  const raw = await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 });
+  const result = unpackToolResult(raw) as RecallVerbResult;
+  const meta = extractResponseMeta(raw);
+  return stamped(result, (meta?.degraded as RecallVerbResult['degraded'] | undefined) ?? degradedStampFor('recall', result, meta, []));
+}
 
+export async function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbResult): Promise<void> {
+  // An older server ignores `question` (warn-mode params) and answers without facts_order.
+  const unranked = flags.question !== null && result.facts_order !== 'relevance'
+    ? 'note: this brain did not rank facts by the question (its server predates question ranking); facts are newest first.' : null;
+  const matched = result.facts.length + (result.results?.length ?? 0);
+  await markRecallMiss(flags, matched);
   if (flags.json) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    if (unranked) process.stderr.write(unranked + '\n');
     return;
   }
   const lines: string[] = [];
   if (result.facts.length) {
-    lines.push('Facts:');
-    for (const f of result.facts) {
-      lines.push(`  #${f.fact_id} [${f.kind}]${f.entity_slug ? ` (${f.entity_slug})` : ''} ${f.fact} — ${f.provenance}`);
+    lines.push(result.facts_order === 'relevance' ? 'Facts (ranked by relevance to the question):' : 'Facts:');
+    const factLine = (f: RecallVerbResult['facts'][number], indent: string) =>
+      `${indent}#${f.fact_id} [${f.kind}]${f.entity_slug ? ` (${f.entity_slug})` : ''} ${f.fact} — ${f.provenance}${typeof f.relevance === 'number' ? ` (relevance ${f.relevance.toFixed(2)})` : ''}${f.contested?.fact_id ? ` (contested by #${f.contested.fact_id})` : ''}`;
+    const byId = new Map(result.facts.map(f => [f.fact_id, f]));
+    if (result.facts_groups?.length) {
+      for (const g of result.facts_groups) {
+        lines.push(`  ${g.entity_slug ?? 'No entity'}:`);
+        for (const id of g.fact_ids) { const f = byId.get(id); if (f) lines.push(factLine(f, '    ')); }
+      }
+    } else {
+      for (const f of result.facts) lines.push(factLine(f, '  '));
     }
+    if (result.entity_unspecified) lines.push(`note: ${result.entity_unspecified.candidates.length} entities answer this question; rerun with an entity to read one (${result.entity_unspecified.candidates.map(c => c.entity_slug).join(', ')}).`);
   }
   if (result.results?.length) {
     lines.push('Pages:');
@@ -397,8 +549,14 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?:
       if (r.chunk) lines.push(`    ${r.chunk.replace(/\s+/g, ' ').slice(0, 160)}`);
     }
   }
-  if (!lines.length) lines.push('Nothing recalled.');
+  if (!lines.length) lines.push(result.facts_order === 'relevance' ? 'No saved fact matched the question.' : 'Nothing recalled.');
+  if (unranked) lines.push(unranked);
+  if (result.facts_degraded) {
+    const d = result.facts_degraded;
+    lines.push(`note: fact ranking degraded (${[d.reason, d.unembedded ? `${d.unembedded} fact(s) without a comparable embedding` : null].filter(Boolean).join('; ')})`);
+  }
   if (result.search_degraded) lines.push(`note: search degraded (${result.search_degraded})`);
+  if (result.degraded) process.stderr.write((await import('../core/degraded-stamp.ts')).degradedStampLine(result.degraded) + '\n');
   if (result.budget_tokens !== undefined) {
     lines.push(`budget: ${result.budget_used}/${result.budget_tokens} tokens used, ${result.dropped_count} dropped`);
   }
@@ -413,7 +571,7 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?:
  * already ran); --supersessions/--session-id keep their own arms.
  */
 function entityTextFallbackApplies(flags: ParsedFlags, matched: number): boolean {
-  return matched === 0 && !!flags.entity && !flags.grep && !flags.supersessions && !flags.sessionId;
+  return matched === 0 && !!flags.entity && !flags.entityExplicit && !flags.grep && !flags.supersessions && !flags.sessionId;
 }
 
 function noteEntityTextFallback(entity: string, matched: number): void {
@@ -422,35 +580,142 @@ function noteEntityTextFallback(entity: string, matched: number): void {
   );
 }
 
+/**
+ * Cat 41 run 4: agents ask `gbrain recall "how do I take my coffee?"`. The
+ * positional is an entity, then a literal fact-text substring (#4720), so a
+ * question matches neither and recall answered "No matching facts." while
+ * `--question` ranked the fact first. On a brain without embeddings (opted
+ * out or no provider), where question ranking is keyword-only anyway, a
+ * multi-word positional that matched nothing is ranked as a question, with a
+ * note. Brains with embeddings keep their output and get a hint instead.
+ */
+async function keylessQuestionFallback(engine: BrainEngine, flags: ParsedFlags, sourceId: string): Promise<boolean> {
+  const question = flags.entity?.trim() ?? '';
+  if (!/\s/.test(question) || !entityTextFallbackApplies(flags, 0) || flags.since || flags.sinceLastRun || flags.today || flags.asContext || flags.rollup) return false;
+  const { factRecallIsKeywordOnly } = await import('../core/facts/keyword-only.ts');
+  if (!await factRecallIsKeywordOnly(engine, loadConfig())) {
+    process.stderr.write(`[recall] no entity or fact text matched '${question}'. To rank facts against it as a question: gbrain recall --question ${JSON.stringify(question)}\n`);
+    return false;
+  }
+  process.stderr.write(`[recall] no entity or fact text matched '${question}'; ranked facts by relevance to it as a question (keyword-only: this brain has no embeddings).\n`);
+  const questionFlags = { ...flags, entity: null, question };
+  await renderRecallVerbResult(questionFlags, await recallVerbResult(engine, questionFlags, sourceId));
+  return true;
+}
+
+/**
+ * #4828: agents ask `gbrain recall "<name> <topic>"`. The bare positional is
+ * resolved as one entity (the whole phrase names none), then grepped as one
+ * literal string (the topic words are a paraphrase), so recall answered "No
+ * matching facts." while the person's facts were there. When a multi-word
+ * positional matched nothing, try the leading (then trailing) one to three
+ * words as the entity, with recall's own resolver (an exact page, alias,
+ * basename, or a bare name only one page expands to), and show that entity's facts with those mentioning the other words
+ * first. No model or embedding call; an explicit --entity is never split.
+ */
+const SPLIT_MAX_NAME_WORDS = 3;
+
+function entitySplitApplies(flags: ParsedFlags): boolean {
+  return !!flags.entity && !flags.entityExplicit && /\s/.test(flags.entity.trim()) && !flags.grep && !flags.supersessions && !flags.sessionId;
+}
+
+/** Name spans to try, longest first: leading words, then trailing words. */
+export function entitySplitSpans(positional: string): Array<{ name: string; topic: string }> {
+  const words = positional.trim().split(/\s+/);
+  const out: Array<{ name: string; topic: string }> = [];
+  for (let k = Math.min(SPLIT_MAX_NAME_WORDS, words.length - 1); k >= 1; k--) {
+    out.push({ name: words.slice(0, k).join(' '), topic: words.slice(k).join(' ') });
+    out.push({ name: words.slice(words.length - k).join(' '), topic: words.slice(0, words.length - k).join(' ') });
+  }
+  return out;
+}
+
+const topicStems = (topic: string) => [...new Set(topic.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 3).map(w => w.slice(0, 4)))];
+
+/** Facts that share more topic word stems first; otherwise the input (recency) order. */
+export function rankByTopic(rows: FactRow[], topic: string): FactRow[] {
+  const stems = topicStems(topic);
+  if (!stems.length) return rows;
+  const score = (f: FactRow) => {
+    const words = f.fact.toLowerCase().split(/[^\p{L}\p{N}]+/u);
+    return stems.filter(s => words.some(w => w.startsWith(s))).length;
+  };
+  return rows.map((r, i) => ({ r, i, s: score(r) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.r);
+}
+
+function noteEntitySplit(positional: string, name: string, slug: string, topic: string, n: number): void {
+  process.stderr.write(
+    `[recall] no facts matched '${positional}' as one entity or text; '${name}' is ${slug}: showing its ${n} fact(s), those mentioning '${topic}' first. ` +
+    `Same as: gbrain recall --entity ${slug} (add --question ${JSON.stringify(topic)} to rank them by meaning).\n`,
+  );
+}
+
+async function entitySplitLocal(engine: BrainEngine, flags: ParsedFlags, sourceId: string, resolvedSince: Date | null): Promise<FactRow[]> {
+  if (!entitySplitApplies(flags)) return [];
+  const spans = entitySplitSpans(flags.entity!);
+  if (!await splitMayMatch(engine, sourceId, spans.map(s => s.name))) return [];
+  const { resolveEntitySlugWithSource } = await import('../core/entities/resolve.ts');
+  for (const span of spans) {
+    const resolved = await resolveEntitySlugWithSource(engine, sourceId, span.name);
+    if (!resolved || resolved.source === 'fallback_slugify') continue;
+    const rows = await fetchRowsLocal(engine, { ...flags, entity: resolved.slug, entityExplicit: true }, sourceId, resolvedSince);
+    if (!rows.length) continue;
+    noteEntitySplit(flags.entity!, span.name, resolved.slug, span.topic, rows.length);
+    return rankByTopic(rows, span.topic);
+  }
+  return [];
+}
+
+/**
+ * One statement before the per-span resolution (four statements a span): a
+ * span can only show facts when some fact is keyed under a slug whose last
+ * segment starts with its name, or the name is a page alias. A miss, the
+ * common case for a topic phrase, then costs one round trip instead of up to
+ * twenty-four (test/e2e/retrieval-round-trip-budget.test.ts).
+ */
+async function splitMayMatch(engine: BrainEngine, sourceId: string, names: string[]): Promise<boolean> {
+  const { slugify } = await import('../core/entities/resolve.ts');
+  const { normalizeAlias } = await import('../core/search/alias-normalize.ts');
+  const tokens = [...new Set(names.map(n => slugify(n)).filter(Boolean))];
+  if (!tokens.length) return false;
+  try {
+    const rows = await engine.executeRaw(
+      `SELECT 1 FROM facts WHERE source_id = $1 AND entity_slug ~ ANY($2::text[])
+       UNION ALL SELECT 1 FROM page_aliases WHERE source_id = $1 AND alias_norm = ANY($3::text[])
+       LIMIT 1`,
+      [sourceId, tokens.map(t => `(^|/)${t}(-|$)`), [...new Set(names.map(n => normalizeAlias(n)).filter(Boolean))]]);
+    return rows.length > 0;
+  } catch {
+    return true;
+  }
+}
+
 async function runRecallOnce(
   engine: BrainEngine,
   flags: ParsedFlags,
   sourceId: string,
   thinClient: boolean,
   cursorVariant: 'briefing' | 'watch',
-  cursorOverride?: Date | null,
-): Promise<Date> {
+  cursorOverride?: RecallCursor | null,
+): Promise<RecallCursor> {
   // Codex round 1 #2: T_start is captured BEFORE the first read SQL fires.
   // Facts inserted during render/write get included by the next run.
   const tStart = new Date();
 
-  let resolvedSince: Date | null = flags.since;
-  if (flags.sinceLastRun) {
-    if (cursorOverride !== undefined) {
-      resolvedSince = cursorOverride;
-    } else {
-      resolvedSince = readCursor(sourceId, cursorVariant);
-    }
-    if (!resolvedSince) {
-      resolvedSince = new Date(Date.now() - DEFAULT_FALLBACK_HOURS * 60 * 60 * 1000);
-    }
-  }
+  const cursor: RecallCursor | null = flags.sinceLastRun
+    ? (cursorOverride !== undefined ? cursorOverride : readRecallCursor(sourceId, cursorVariant)) ?? wallClockCursor(defaultCursorStart())
+    : null;
+  const resolvedSince: Date | null = cursor ? cursor.since : flags.since;
+  // #6945: only the local cursor read can page (oldest first, by keyset);
+  // thin-client and --supersessions keep the newest-N window.
+  const pageable = cursor !== null && !thinClient && !flags.supersessions;
 
   let rows: FactRow[];
   let pendingCount: number | undefined;
 
   if (thinClient) {
     const cfg = loadConfig();
+    const { callRemoteTool, unpackToolResult } = await import('../core/mcp-client.ts');
     const params: Record<string, unknown> = {
       limit: flags.limit,
       include_expired: flags.includeExpired,
@@ -496,7 +761,11 @@ async function runRecallOnce(
       }
     }
   } else {
-    rows = await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
+    rows = pageable
+      ? await fetchCursorPage(engine, flags, sourceId, cursor!)
+      : await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
+    if (rows.length === 0 && !pageable) rows = await entitySplitLocal(engine, flags, sourceId, resolvedSince);
+    if (rows.length === 0 && cursorVariant === 'briefing' && await keylessQuestionFallback(engine, flags, sourceId)) return wallClockCursor(tStart);
     if (flags.pending) {
       pendingCount = await engine.countUnconsolidatedFacts(sourceId);
     }
@@ -516,6 +785,7 @@ async function runRecallOnce(
     const payload: Record<string, unknown> = {
       facts: rows.map(factRowToJson),
       total: rows.length,
+      ...(recallMissed(flags, rows.length) ? { status: 'no_results' } : {}),
     };
     if (rollup) payload.top_entities = rollup;
     if (pendingCount !== undefined) payload.pending_consolidation_count = pendingCount;
@@ -534,11 +804,109 @@ async function runRecallOnce(
     }
   }
 
-  if (flags.sinceLastRun) {
-    writeCursor(sourceId, tStart, cursorVariant);
-  }
+  await markRecallMiss(flags, rows.length);
+  return cursor ? advanceCursor(sourceId, cursorVariant, rows, flags.limit, pageable, thinClient, tStart) : wallClockCursor(tStart);
+}
 
-  return tStart;
+/**
+ * #7177: a recall that looked something up (an entity or text, --grep,
+ * --question, --query) and matched nothing is a miss: the list render's
+ * --json adds `status: "no_results"` (the verb path prints the operation's
+ * envelope verbatim, where `total: 0` says it), and GBRAIN_FAIL_ON_EMPTY=1
+ * exits NO_RESULTS_EXIT_CODE.
+ * A feed read (--watch, --since-last-run, no filter) with nothing new is not.
+ */
+function recallMissed(flags: ParsedFlags, matched: number): boolean {
+  const lookup = !!flags.entity || !!flags.grep || flags.question !== null || !!flags.query;
+  return matched === 0 && lookup && flags.watchSeconds === null && !flags.sinceLastRun;
+}
+
+async function markRecallMiss(flags: ParsedFlags, matched: number): Promise<void> {
+  if (recallMissed(flags, matched)) (await import('../cli/no-results.ts')).markNoResults('recall');
+}
+
+function wallClockCursor(since: Date): RecallCursor {
+  return { since, resumeAfter: null };
+}
+
+function defaultCursorStart(): Date {
+  return new Date(Date.now() - DEFAULT_FALLBACK_HOURS * 60 * 60 * 1000);
+}
+
+/**
+ * Move the --since-last-run cursor past what this run showed. A run that
+ * filled its --limit window may have older unseen facts behind it: a pageable
+ * run resumes strictly after the newest fact it delivered (moving to tStart
+ * would skip the rest for good); any other full run warns. A run with room to
+ * spare is caught up and records tStart.
+ */
+function advanceCursor(
+  sourceId: string,
+  variant: 'briefing' | 'watch',
+  rows: FactRow[],
+  limit: number,
+  pageable: boolean,
+  thinClient: boolean,
+  tStart: Date,
+): RecallCursor {
+  const windowFull = rows.length >= clampSearchLimit(limit, 50);
+  if (windowFull && pageable) {
+    const newest = rows[0];
+    const resumeAfter = { createdAt: newest.created_at_iso ?? newest.created_at.toISOString(), id: newest.id };
+    writePagedCursor(sourceId, variant, resumeAfter);
+    return { since: new Date(Date.parse(resumeAfter.createdAt)), resumeAfter };
+  }
+  if (windowFull) {
+    process.stderr.write(
+      `[recall] ${rows.length} facts filled the --limit window; older facts since the last run may not be shown` +
+      `${thinClient ? ' (thin-client recall cannot page the cursor)' : ''}. Re-run with a larger --limit.\n`,
+    );
+  }
+  writeCursor(sourceId, tStart, variant);
+  return wallClockCursor(tStart);
+}
+
+/**
+ * One --since-last-run page from the local engine: the oldest `limit` facts
+ * after the cursor (inclusive of `since` when there is no keyset; id 0 sorts
+ * before every fact), rendered newest-first. Entity with its text fallback,
+ * session, --grep and audit rows narrow in SQL before LIMIT, as in
+ * fetchRowsLocal's cursor arms.
+ */
+async function fetchCursorPage(engine: BrainEngine, flags: ParsedFlags, sourceId: string, cursor: RecallCursor): Promise<FactRow[]> {
+  const after = cursor.resumeAfter ?? { createdAt: cursor.since.toISOString(), id: 0 };
+  const page = (narrow: { entitySlug?: string; grep?: string }) => engine.listFactsKeyset(sourceId, after, {
+    activeOnly: !flags.includeExpired,
+    limit: flags.limit,
+    excludeAuditRows: true,
+    eligibility: {},
+    grep: flags.grep ?? undefined,
+    sessionId: flags.sessionId || undefined,
+    ...narrow,
+  });
+  if (!flags.entity) return (await page({})).reverse();
+  const slugs = await entityFactSlugs(engine, sourceId, (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity);
+  const keyOf = (r: FactRow) => [r.created_at_iso ?? new Date(r.created_at).toISOString(), r.id] as const;
+  const entityRows = (await Promise.all(slugs.map(entitySlug => page({ entitySlug })))).flat()
+    .sort((a, b) => { const [ka, ia] = keyOf(a), [kb, ib] = keyOf(b); return ka < kb ? -1 : ka > kb ? 1 : ia - ib; })
+    .slice(0, flags.limit);
+  if (!entityTextFallbackApplies(flags, entityRows.length)) return entityRows.reverse();
+  const textRows = await page({ grep: flags.entity.toLowerCase() });
+  if (textRows.length === 0) return entityRows.reverse();
+  noteEntityTextFallback(flags.entity, textRows.length);
+  return textRows.reverse();
+}
+
+/** #4828: every entity_slug this entity's facts may be saved under (siblings, title subject, bare basename). */
+async function entityFactSlugs(engine: BrainEngine, sourceId: string, slug: string): Promise<string[]> {
+  const { factEntitySlugs } = await import('../core/mentions/siblings.ts');
+  return factEntitySlugs(engine, sourceId, slug, { excludePrivate: false }).catch(() => [slug]);
+}
+
+function mergeNewestFirst(lists: FactRow[][], limit: number, keyOf: (r: FactRow) => Date | string | null | undefined): FactRow[] {
+  if (lists.length === 1) return lists[0]!;
+  const time = (r: FactRow) => { const v = keyOf(r); return (v instanceof Date ? v.getTime() : v ? Date.parse(String(v)) : 0) || 0; };
+  return lists.flat().sort((a, b) => time(b) - time(a)).slice(0, limit);
 }
 
 async function fetchRowsLocal(
@@ -551,6 +919,7 @@ async function fetchRowsLocal(
     return engine.listSupersessions(sourceId, {
       since: resolvedSince ?? undefined,
       limit: flags.limit,
+      eligibility: {},
     });
   }
   // An explicit `--since DURATION` / `--today` cutoff is a "what happened in
@@ -560,23 +929,29 @@ async function fetchRowsLocal(
   if (flags.entity) {
     const slug = (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity;
     // With a window, entity ANDs onto since in one query (before LIMIT);
-    // without one, the entity arm keeps its valid_from ordering.
-    const rows = resolvedSince
-      ? await engine.listFactsSince(sourceId, resolvedSince, {
+    // without one, the entity arm keeps its valid_from ordering. #4828: read
+    // every slug the entity's facts may be saved under, as the recall op does.
+    const slugs = await entityFactSlugs(engine, sourceId, slug);
+    const lists = await Promise.all(slugs.map(entitySlug => resolvedSince
+      ? engine.listFactsSince(sourceId, resolvedSince, {
           eventTime: windowEventTime,
-          entitySlug: slug,
+          entitySlug,
           sessionId: flags.sessionId || undefined,
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
+          eligibility: {},
         })
-      : await engine.listFactsByEntity(sourceId, slug, {
+      : engine.listFactsByEntity(sourceId, entitySlug, {
+          sessionId: flags.sessionId || undefined,
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
-        });
+          eligibility: {},
+        })));
+    const rows = mergeNewestFirst(lists, flags.limit, resolvedSince && !windowEventTime ? r => r.created_at : r => r.valid_from ?? r.created_at);
     // #4720: the bare positional is entity-first, but keyless/casual usage
     // treats it as a literal word from fact text (`gbrain recall commas`).
     // resolveEntitySlug never returns null for non-empty input (slugify is
@@ -594,6 +969,7 @@ async function fetchRowsLocal(
         limit: flags.limit,
         grep: flags.entity.toLowerCase(),
         excludeAuditRows: true,
+        eligibility: {},
       });
       if (textRows.length > 0) {
         noteEntityTextFallback(flags.entity, textRows.length);
@@ -611,6 +987,7 @@ async function fetchRowsLocal(
         limit: flags.limit,
         grep: flags.grep ?? undefined,
         excludeAuditRows: true,
+        eligibility: {},
       });
     }
     return engine.listFactsBySession(sourceId, flags.sessionId, {
@@ -618,6 +995,7 @@ async function fetchRowsLocal(
       limit: flags.limit,
       grep: flags.grep ?? undefined,
       excludeAuditRows: true,
+      eligibility: {},
     });
   }
   if (resolvedSince) {
@@ -636,6 +1014,7 @@ async function fetchRowsLocal(
       limit: flags.limit,
       grep: flags.grep ?? undefined,
       excludeAuditRows: true,
+      eligibility: {},
     });
   }
   return engine.listFactsSince(sourceId, new Date(0), {
@@ -644,6 +1023,7 @@ async function fetchRowsLocal(
     limit: flags.limit,
     grep: flags.grep ?? undefined,
     excludeAuditRows: true,
+    eligibility: {},
   });
 }
 
@@ -702,10 +1082,7 @@ async function runWatchLoop(
   }
 
   try {
-    let priorTickStart: Date | null = readCursor(sourceId, 'watch');
-    if (!priorTickStart) {
-      priorTickStart = new Date(Date.now() - DEFAULT_FALLBACK_HOURS * 60 * 60 * 1000);
-    }
+    let priorTickStart: RecallCursor = readRecallCursor(sourceId, 'watch') ?? wallClockCursor(defaultCursorStart());
 
     const effectiveFlags: ParsedFlags = { ...flags, sinceLastRun: true };
 
@@ -875,6 +1252,7 @@ export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine
   // remote brain.
   const cfg = loadConfig();
   if (isThinClient(cfg)) {
+    const { callRemoteTool, unpackToolResult } = await import('../core/mcp-client.ts');
     try {
       if (sourceValue) throw opError('invalid_params', '--source cannot override the remote memory writer grant.',
         'Drop --source: on a remote brain the connection\'s memory writer grant decides the source.',

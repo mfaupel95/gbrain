@@ -139,15 +139,15 @@ describe('R4 — cross-platform stdin via fd 0 (PR #1325 regression pin)', () =>
     // import time and brittle to stub safely without mock.module). The
     // source-grep above is the primary regression guard; this test asserts
     // the surrounding shape of the parseOpArgs stdin-reading branch hasn't
-    // drifted (existence of the branch + 5MB cap), since the branch itself
+    // drifted (existence of the branch + page-ceiling cap), since the branch itself
     // is what was modified by PR #1325.
     const path = join(import.meta.dir ?? '.', '..', '..', 'src', 'cli', 'main.ts');
     const src = readFileSync(path, 'utf-8');
 
     // Stdin reading branch still exists in parseOpArgs.
     expect(src).toMatch(/op\.cliHints\?\.stdin/);
-    // 5MB cap is still in place.
-    expect(src).toMatch(/MAX_STDIN\s*=\s*5_000_000/);
+    // The page-ceiling cap is still in place.
+    expect(src).toMatch(/MAX_STDIN\s*=\s*PAGE_MAX_BYTES/);
     // isTTY check still gates stdin reading.
     expect(src).toMatch(/!process\.stdin\.isTTY/);
   });

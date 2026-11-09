@@ -3,7 +3,7 @@
  * (v0.42 self-upgrading-gbrain wave, eng-review Finding 2 — "make the atomic
  * swap claim true for the one method we own").
  *
- * `bun` / `bun-link` / `clawhub` delegate their swap to those package managers.
+ * `bun` / `bun-link` delegate their swap to those package managers.
  * The compiled standalone binary is the only method gbrain itself writes, so
  * it's the only place we can (and now do) guarantee atomicity:
  *
@@ -44,7 +44,7 @@
 
 import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from './spawn.ts';
 import { createHash } from 'node:crypto';
 
 /**
@@ -156,8 +156,17 @@ export interface BinarySelfUpdateDeps {
 }
 
 async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson('https://api.github.com/repos/garrytan/gbrain/releases/latest');
+}
+
+/** GBRA-175: one named release (the stable channel's), in the same shape as the latest release. */
+export function fetchReleaseByTag(tag: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson(`https://api.github.com/repos/garrytan/gbrain/releases/tags/${encodeURIComponent(tag)}`);
+}
+
+async function fetchReleaseJson(url: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const res = await fetch(url, {
       headers: { 'User-Agent': 'gbrain-self-upgrade' },
       signal: AbortSignal.timeout(5_000),
     });

@@ -21,11 +21,16 @@ import type { BrainEngine } from '../engine.ts';
 import type { RemediationStep } from '../remediation-step.ts';
 import { makeRemediationStep } from '../remediation-step.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
+import { renderFragment, sqlFragment, trustedSql, type SqlFragment } from '../engine-sql/fragment.ts';
+import { entityTypePredicateSql, resolveEntityTypes, type EntityTypeFilter, type EntityTypeResolution } from '../schema-pack/entity-types.ts';
 import type { Action } from '../agent-output.ts';
 import { embeddingEnablement, type ReadinessState } from '../readiness.ts';
 import { embeddingsDisabled } from '../embedding-disabled.ts';
 import { loadConfig } from '../config.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
+import { ORPHANED_ALIAS_COUNTS_SQL, SOFT_DELETED_ALIAS_COUNT_SQL } from '../repair/aliases.ts';
+import { repairPreviewCommand } from '../repair/registry.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 
 /** Shared shape returned by all four checks. */
 export interface OnboardCheckResult {
@@ -58,9 +63,35 @@ async function safeCount(engine: BrainEngine, sql: string, params: unknown[] = [
   }
 }
 
-const VISIBLE_ENTITY_PREDICATE = `p.type IN ('person', 'company', 'organization', 'entity')
-  AND p.deleted_at IS NULL
-  AND ${QUARANTINE_FILTER_FRAGMENT}`;
+/** #4772: a live, visible page whose type the active pack(s) declare as an entity, per source (the get_health predicate). */
+function visibleEntityPredicate(filter: EntityTypeFilter): SqlFragment {
+  return sqlFragment`${entityTypePredicateSql('p', filter)} AND p.deleted_at IS NULL AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}`;
+}
+
+/**
+ * A pack in scope did not load, so the entity population is unknown: a warn
+ * with `entity_types_unavailable`, never a coverage read over an empty or
+ * legacy list.
+ */
+function entityTypesUnavailableResult(name: string, resolution: Extract<EntityTypeResolution, { status: 'pack_unavailable' }>): OnboardCheckResult {
+  const where = resolution.unresolved.filter(Boolean);
+  return {
+    check: {
+      name, status: 'warn',
+      message: `Entity types unknown: could not resolve the active schema pack${where.length ? ` for source${where.length > 1 ? 's' : ''} ${where.map((id) => `'${id}'`).join(', ')}` : ''}, so ${name} cannot be graded. Run \`gbrain schema active --json\` to debug.`,
+      details: { code: 'entity_types_unavailable', entity_types_status: 'pack_unavailable', unresolved_sources: where },
+      fix: { argv: ['gbrain', 'schema', 'active', '--json', ...(where.length ? ['--source', where[0]!] : [])], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Read-only: shows which pack is active, the tier it comes from and why it did not load.', verify: { argv: ['gbrain', 'doctor', '--only', name, '--json'] } },
+    },
+    remediations: [],
+  };
+}
+
+/** Count the visible entity pages under `filter`. */
+async function countVisibleEntities(engine: BrainEngine, filter: EntityTypeFilter): Promise<number> {
+  const sql = renderFragment(sqlFragment`SELECT COUNT(*) AS count FROM pages p WHERE ${visibleEntityPredicate(filter)}`);
+  return safeCount(engine, sql.text, sql.params);
+}
 
 /**
  * Coverage is a ratio over the visible entity population, and below
@@ -91,22 +122,22 @@ export const TIMELINE_COVERAGE_FEATURE: CoverageFeature = { table: 'timeline_ent
  * remediation impact capture both read coverage through this query, so a
  * `gbrain onboard --history` row measures the population the check grades.
  */
-export function visibleEntityCoverageSql(feature: CoverageFeature, sampleClause = ''): string {
-  return `WITH sampled_entities AS (
+export function visibleEntityCoverageSql(feature: CoverageFeature, filter: EntityTypeFilter, sampleClause = ''): { text: string; params: unknown[] } {
+  return renderFragment(sqlFragment`WITH sampled_entities AS (
          SELECT p.id
-           FROM pages p ${sampleClause}
-          WHERE ${VISIBLE_ENTITY_PREDICATE}
+           FROM pages p ${trustedSql(sampleClause)}
+          WHERE ${visibleEntityPredicate(filter)}
        )
        SELECT
          COUNT(*)::int AS sample_size,
          COUNT(*) FILTER (
            WHERE EXISTS (
              SELECT 1
-               FROM ${feature.table} f
-              WHERE f.${feature.pageIdColumn} = s.id
+               FROM ${trustedSql(feature.table)} f
+              WHERE f.${trustedSql(feature.pageIdColumn)} = s.id
            )
          )::int AS matched
-         FROM sampled_entities s`;
+         FROM sampled_entities s`);
 }
 
 interface EntityCoverageSample {
@@ -130,9 +161,11 @@ async function sampleVisibleEntityCoverage(
   engine: BrainEngine,
   sampleClause: string,
   feature: CoverageFeature,
-): Promise<EntityCoverageSample> {
+  filter: EntityTypeFilter,
+): Promise<EntityCoverageSample | { error: string }> {
   try {
-    const result = await engine.executeRaw(visibleEntityCoverageSql(feature, sampleClause));
+    const sql = visibleEntityCoverageSql(feature, filter, sampleClause);
+    const result = await engine.executeRaw(sql.text, sql.params);
     const rows = (result as { rows?: Array<Record<string, unknown>> } | undefined)?.rows
       ?? (result as Array<Record<string, unknown>> | undefined)
       ?? [];
@@ -143,9 +176,15 @@ async function sampleVisibleEntityCoverage(
     // impossible percentages or feed a negative value into sqrt().
     const matched = Math.min(sampleSize, finiteCount(row.matched));
     return { matched, sampleSize };
-  } catch {
-    return { matched: 0, sampleSize: 0 };
+  } catch (error) {
+    return { error: redactConnectionInfo(error instanceof Error ? error.message : String(error)) };
   }
+}
+
+/** #7145: a coverage read that failed or sampled no row measured nothing, so it is not "0% coverage". */
+function unmeasuredCoverage(name: string, sample: EntityCoverageSample | { error: string }): OnboardCheckResult {
+  const why = 'error' in sample ? `the coverage read failed (${sample.error})` : 'the sampled read returned no entity page';
+  return { check: { name, status: 'warn', message: `Coverage unknown: ${why}; rerun doctor.`, details: { health: 'unknown', reason: 'error' in sample ? 'error' : 'empty_sample' } }, remediations: [] };
 }
 
 function coverageWithConfidence(sample: EntityCoverageSample): { coverage: number; ci: number } {
@@ -289,11 +328,9 @@ export async function checkEntityLinkCoverage(
 ): Promise<OnboardCheckResult> {
   // Total visible entity pages. Quarantined pages are hidden from the brain,
   // so they are outside both the coverage numerator and denominator.
-  const totalEntities = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM pages p
-       WHERE ${VISIBLE_ENTITY_PREDICATE}`,
-  );
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('entity_link_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
 
   const ungraded = ungradedCoverageResult('entity_link_coverage', totalEntities);
   if (ungraded) return ungraded;
@@ -309,7 +346,9 @@ export async function checkEntityLinkCoverage(
     engine,
     sampleClause,
     LINK_COVERAGE_FEATURE,
+    entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('entity_link_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
 
   const pct = Math.round(coverage * 100);
@@ -372,11 +411,9 @@ export async function checkEntityLinkCoverage(
 export async function checkTimelineCoverage(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  const totalEntities = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM pages p
-       WHERE ${VISIBLE_ENTITY_PREDICATE}`,
-  );
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('timeline_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
 
   const ungraded = ungradedCoverageResult('timeline_coverage', totalEntities);
   if (ungraded) return ungraded;
@@ -391,7 +428,9 @@ export async function checkTimelineCoverage(
     engine,
     sampleClause,
     TIMELINE_COVERAGE_FEATURE,
+    entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('timeline_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
   const pct = Math.round(coverage * 100);
   const ciPct = (ci * 100).toFixed(1);
@@ -695,59 +734,63 @@ export async function checkTypeProliferation(
 
 /**
  * dangling_aliases (F12): surfaces both slug_aliases redirects and
- * page_aliases free-text names whose target page no longer exists.
- * Source-scoped JOINs prevent cross-source false-positive deletion.
+ * page_aliases free-text names whose target page is gone or soft-deleted.
+ * Source-scoped JOINs prevent cross-source false positives.
  *
- * v0.42 ships surface-only (no auto-GC RemediationStep). v0.43+ may add
- * `cleanup-dangling-aliases` as an auto_apply handler once detection is
- * confirmed clean in production.
+ * #6619: the two cases are reported apart. Aliases whose target has no page
+ * row (purged or hard-deleted) are cleared by `gbrain repair aliases`, named
+ * per source; aliases of a soft-deleted page are kept for `gbrain restore`
+ * and removed when that page is purged, so nothing is offered for them. The
+ * alias tables carry the managed writer guard, so raw SQL is never offered.
  *
- * Defensive: pre-v105 brains don't have slug_aliases yet — returns ok
- * via the `isUndefinedTableError` fallthrough inherent in safeCount's
- * catch-all (returns 0 on any SQL error).
+ * Defensive: pre-v105 brains don't have slug_aliases yet; a failed read
+ * counts nothing (ok).
  */
 export async function checkDanglingAliases(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  const slugAliases = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM slug_aliases sa
-     LEFT JOIN pages p
-       ON p.slug = sa.canonical_slug
-      AND p.source_id = sa.source_id
-      AND p.deleted_at IS NULL
-     WHERE p.id IS NULL`,
-  );
-  const pageAliases = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM page_aliases pa
-     LEFT JOIN pages p
-       ON p.slug = pa.slug
-      AND p.source_id = pa.source_id
-      AND p.deleted_at IS NULL
-     WHERE p.id IS NULL`,
-  );
+  let orphaned: Array<{ source_id: string; slug_redirects: number; page_aliases: number }> = [];
+  let soft = { slug_redirects: 0, page_aliases: 0 };
+  try {
+    orphaned = await engine.executeRaw(ORPHANED_ALIAS_COUNTS_SQL);
+    const [row] = await engine.executeRaw<typeof soft>(SOFT_DELETED_ALIAS_COUNT_SQL);
+    if (row) soft = row;
+  } catch (error) {
+    // #7145: only a pre-v105 brain (no alias tables) has nothing to report; any other failure is unknown, not clear.
+    if (!isMissingSchemaObject(error, 'table', ['slug_aliases', 'page_aliases'])) {
+      return { check: { name: 'dangling_aliases', status: 'warn', details: { health: 'unknown' },
+        message: `Dangling aliases unknown: the alias read failed (${redactConnectionInfo(error instanceof Error ? error.message : String(error))}); rerun doctor.` }, remediations: [] };
+    }
+  }
+  const slugAliases = orphaned.reduce((sum, row) => sum + Number(row.slug_redirects), 0) + Number(soft.slug_redirects);
+  const pageAliases = orphaned.reduce((sum, row) => sum + Number(row.page_aliases), 0) + Number(soft.page_aliases);
   const n = slugAliases + pageAliases;
-  if (n > 0) {
+  if (n === 0) {
     return {
-      check: {
-        name: 'dangling_aliases',
-        status: 'warn',
-        message:
-          `${n} alias rows point at missing/deleted pages ` +
-          `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ` +
-          `Safe GC (source-scoped): ` +
-          `\`DELETE FROM slug_aliases sa WHERE NOT EXISTS (SELECT 1 FROM pages p ` +
-          `WHERE p.slug = sa.canonical_slug AND p.source_id = sa.source_id ` +
-          `AND p.deleted_at IS NULL); DELETE FROM page_aliases pa WHERE NOT EXISTS ` +
-          `(SELECT 1 FROM pages p WHERE p.slug = pa.slug ` +
-          `AND p.source_id = pa.source_id AND p.deleted_at IS NULL);\``,
-      },
-      remediations: [],  // v0.42: surface-only; auto-GC v0.43+
+      check: { name: 'dangling_aliases', status: 'ok', message: 'No dangling aliases' },
+      remediations: [],
     };
   }
+  const commands = orphaned.map(row => repairPreviewCommand('aliases', { source: row.source_id }));
+  const softTotal = Number(soft.slug_redirects) + Number(soft.page_aliases);
+  const orphanedText = orphaned.length
+    ? `${n - softTotal} point at pages that no longer exist (${orphaned.map(row => `${row.source_id}: ${Number(row.slug_redirects) + Number(row.page_aliases)}`).join(', ')}); `
+      + `preview their cleanup with ${commands.join('; ')}, then run the --apply command it prints. `
+    : '';
+  const softText = softTotal
+    ? `${softTotal} belong to soft-deleted pages and are kept for gbrain restore; purging the page removes them, so nothing needs running for those.`
+    : '';
   return {
-    check: { name: 'dangling_aliases', status: 'ok', message: 'No dangling aliases' },
+    check: {
+      name: 'dangling_aliases',
+      status: 'warn',
+      message:
+        `${n} alias rows point at missing/deleted pages ` +
+        `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ${orphanedText}${softText}`.trimEnd(),
+      details: { orphaned, soft_deleted: soft },
+      ...(orphaned.length ? { fix: { argv: commands[0]!.split(' '), consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lists the orphaned alias rows of that source without changing anything; its output prints the apply command.' } } : {}),
+    },
     remediations: [],
   };
 }

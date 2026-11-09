@@ -19,7 +19,7 @@
  * gbrain code.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -110,7 +110,8 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'remove` rewrites config.toml wholesale and drops comments, so the ' +
       'stdio lane (runHooks) must never manage a name the harness block ' +
       'owns, and vice versa. Codex 0.147.0 also ships a real hook system ' +
-      '(hooks.json; PreToolUse…SessionEnd) — gbrain wires SessionEnd only ' +
+      '(hooks.json; PreToolUse…SessionEnd) — bootstrap wires SessionEnd; ' +
+      '`gbrain setup codex` also wires SessionStart/UserPromptSubmit, hash-owned ' +
       '(CODEX_HAS_HOOKS=true; codex-hooks.ts owns the two-file write incl. ' +
       'the config.toml trust entry, see CODEX_HOOKS_SPEC_TARGET there). ' +
       'Some codex builds gate HTTP MCP servers behind ' +
@@ -283,6 +284,24 @@ export function claudeUserSettingsPath(): string {
   return join(claudeConfigBase(), 'settings.json');
 }
 
+function claudeManagedSettingsDir(): string {
+  if (process.platform === 'darwin') return '/Library/Application Support/ClaudeCode';
+  if (process.platform === 'win32') return 'C:\\Program Files\\ClaudeCode';
+  return '/etc/claude-code';
+}
+
+/**
+ * #8057: Claude Code's managed settings, which apply to every session on the
+ * machine: managed-settings.json, then its managed-settings.d/*.json drop-ins
+ * in name order. `dir` defaults to the platform's system directory.
+ */
+export function claudeManagedSettingsPaths(dir = claudeManagedSettingsDir()): string[] {
+  const dropIns = join(dir, 'managed-settings.d');
+  let names: string[] = [];
+  try { names = readdirSync(dropIns).filter((n) => n.endsWith('.json')).sort(); } catch { /* no drop-in directory */ }
+  return [join(dir, 'managed-settings.json'), ...names.map((n) => join(dropIns, n))];
+}
+
 /**
  * #4325: the config-dir base itself, exported for detection — a machine with
  * a `~/.claude` (or CLAUDE_CONFIG_DIR) directory has Claude Code configured
@@ -436,17 +455,20 @@ export function codexAgentsOverridePath(): string {
   return join(codexHome(), 'AGENTS.override.md');
 }
 
-/** Codex hook events gbrain wires (v1: session-end capture only — a
- * SessionStart greeting lane is a filed follow-up). */
+/** Codex hook events the BOOTSTRAP lane wires: SessionEnd capture only. The
+ * SessionStart and UserPromptSubmit context hooks belong to `gbrain setup
+ * codex`'s hash-owned writer (codex-hooks.ts `CODEX_SETUP_EVENTS`); they bake
+ * no source, and `gbrain hook` resolves it per session from the payload cwd
+ * (#5941). */
 export const CODEX_HOOK_EVENTS = ['SessionEnd'] as const;
 
 /**
  * Whether gbrain WIRES codex hooks. True as of the Memorable wave: bootstrap
  * writes a SessionEnd entry into hooks.json plus its config.toml trust-state
  * entry (codex-hooks.ts — the 0.147.0 trust gate makes an untrusted entry
- * silently inert). SESSION-END CAPTURE ONLY: per-turn context on codex
- * remains the pull-protocol AGENTS.md gates (plan D5); a SessionStart lane
- * is a filed follow-up.
+ * silently inert). The bootstrap lane wires SESSION-END CAPTURE ONLY;
+ * per-turn context comes from `gbrain setup codex`'s SessionStart and
+ * UserPromptSubmit hooks, or else the pull-protocol AGENTS.md gates (plan D5).
  */
 export const CODEX_HAS_HOOKS = true;
 

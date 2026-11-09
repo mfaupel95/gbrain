@@ -17,7 +17,8 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
     if (job.data.retryRequestId !== undefined) {
       if (typeof job.data.retryRequestId !== 'string' || typeof job.data.sourceId !== 'string') throw new Error('Atom retry requires sourceId and retryRequestId strings.');
       const { retryManagedAtomBatch } = await import('../../persistence/atom-retry.ts');
-      return retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`);
+      return retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`,
+        { signal: job.signal, deadlineAtMs: job.deadlineAtMs });
     }
     const { formatDrainProviderFailure, runExtractAtomsDrainForSource, structuralAtomRefusal } =
       await import('../../cycle/extract-atoms-drain.ts');
@@ -62,7 +63,9 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
       // over instead — matching the existing behavior for every other
       // handler failure. Partial success (>=1 item extracted) keeps
       // completing normally, unchanged.
-      if (result.status === 'provider_failure' && pastDeadline()) {
+      // #6817: an auth, billing, unknown-model or content-block outage repeats on every attempt; dead-letter it once.
+      const { drainOutcome } = await import('../../cycle/extract-atoms-drain-outcome.ts');
+      if (result.status === 'provider_failure' && (pastDeadline() || !drainOutcome(result).retryable)) {
         throw new UnrecoverableError(formatDrainProviderFailure(result, { final: true }));
       }
       if (result.status === 'provider_failure') {

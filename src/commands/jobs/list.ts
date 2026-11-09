@@ -3,6 +3,7 @@ import { formatJob, hasFlag, parseFlag, rehydrateJobDates, type JobsCommandConte
 import type { MinionJob, MinionJobStatus } from '../../core/minions/types.ts';
 import { isThinClient, loadConfig } from '../../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../../core/mcp-client.ts';
+import { describeJobs, insightCell, withInsight, type JobInsight } from '../../core/minions/job-insight.ts';
 
 export async function runJobsList({ args, queue, engine }: JobsCommandContext): Promise<void> {
   const groupId = parseFlag(args, '--group');
@@ -10,6 +11,8 @@ export async function runJobsList({ args, queue, engine }: JobsCommandContext): 
   const status = parseFlag(args, '--status') as MinionJobStatus | undefined;
   const queueName = parseFlag(args, '--queue');
   const limit = parseInt(parseFlag(args, '--limit') ?? '20', 10);
+  const finishedSince = parseFlag(args, '--finished-since');
+  if (finishedSince !== undefined) return listFinishedSince(engine, finishedSince, { queue: queueName, name: parseFlag(args, '--name'), limit }, hasFlag(args, '--json'));
 
   // v0.32: thin-client routing. The `list_jobs` MCP op is admin-scoped
   // but not localOnly, so a thin-client install with admin access can
@@ -19,14 +22,13 @@ export async function runJobsList({ args, queue, engine }: JobsCommandContext): 
   const cfg = loadConfig();
   let jobs: MinionJob[];
   if (isThinClient(cfg)) {
-    const raw = await callRemoteTool(cfg!, 'list_jobs', {
-      status, queue: queueName, limit,
-    }, { timeoutMs: 30_000 });
-    jobs = unpackToolResult<MinionJob[]>(raw).map((j) => rehydrateJobDates(j));
+    jobs = await listRemoteJobs(cfg!, { status, queue: queueName, limit });
   } else {
     try { await queue.ensureSchema(); }
     catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
     jobs = await queue.getJobs({ status, queue: queueName, limit });
+    const insight = await describeJobs(engine, jobs);
+    jobs = jobs.map(j => withInsight(j, insight.get(j.id)));
   }
 
   // #3685: --json emits the machine-readable array the CHANGELOG's
@@ -43,10 +45,53 @@ export async function runJobsList({ args, queue, engine }: JobsCommandContext): 
     return;
   }
 
-  console.log(`  ${'ID'.padEnd(6)} ${'Name'.padEnd(14)} ${'Status'.padEnd(20)} ${'Queue'.padEnd(10)} ${'Time'.padEnd(8)} Created`);
-  console.log('  ' + '─'.repeat(80));
-  for (const job of jobs) console.log(formatJob(job));
+  console.log(`  ${'ID'.padEnd(6)} ${'Name'.padEnd(14)} ${'Status'.padEnd(20)} ${'Queue'.padEnd(10)} ${'Time'.padEnd(8)} ${'Created'.padEnd(19)} Wait/Live`);
+  console.log('  ' + '─'.repeat(100));
+  for (const job of jobs) console.log(`${formatJob(job)} ${insightCell(job, job as MinionJob & JobInsight)}`.trimEnd());
   console.log(`\n  ${jobs.length} jobs shown`);
+}
+
+/**
+ * The host returns at most one page per call (500 jobs over MCP); follow next_cursor, carried on the last job of a
+ * cut page, until the requested limit is met. A host without paging returns one page and no cursor.
+ */
+async function listRemoteJobs(cfg: NonNullable<ReturnType<typeof loadConfig>>, opts: { status?: string; queue?: string; limit: number }): Promise<MinionJob[]> {
+  const jobs: MinionJob[] = [];
+  let cursor: string | undefined;
+  do {
+    const raw = await callRemoteTool(cfg, 'list_jobs', { ...opts, limit: opts.limit - jobs.length, ...(cursor ? { cursor } : {}) }, { timeoutMs: 30_000 });
+    const page = unpackToolResult<Array<MinionJob & { truncated?: boolean; next_cursor?: string }>>(raw);
+    cursor = page[page.length - 1]?.next_cursor;
+    for (const { truncated: _t, next_cursor: _c, ...job } of page) jobs.push(rehydrateJobDates(job as MinionJob));
+  } while (cursor && jobs.length < opts.limit);
+  return jobs;
+}
+
+/**
+ * `jobs list --finished-since <iso|cursor>` (#7242): every job that reached a terminal status after the cursor, oldest
+ * first, as one `{jobs, next_cursor}` document; pass next_cursor back to read the next events.
+ */
+async function listFinishedSince(engine: JobsCommandContext['engine'], since: string, opts: { queue?: string; name?: string; limit: number }, json: boolean): Promise<void> {
+  const cfg = loadConfig();
+  let page: { jobs: MinionJob[]; next_cursor: string };
+  if (isThinClient(cfg)) {
+    const raw = await callRemoteTool(cfg!, 'list_jobs', { finished_since: since, queue: opts.queue, name: opts.name, limit: opts.limit }, { timeoutMs: 30_000 });
+    const doc = unpackToolResult<{ jobs: MinionJob[]; next_cursor: string }>(raw);
+    page = { jobs: doc.jobs.map(j => rehydrateJobDates(j)), next_cursor: doc.next_cursor };
+  } else {
+    const { listFinishedSince: read, TerminalCursorError } = await import('../../core/minions/terminal-events.ts');
+    try { page = await read(engine, since, opts); }
+    catch (e) {
+      if (!(e instanceof TerminalCursorError)) throw e;
+      console.error(`Error: --finished-since: ${e.message}`);
+      process.exit(2);
+    }
+    const insight = await describeJobs(engine, page.jobs);
+    page = { ...page, jobs: page.jobs.map(j => withInsight(j, insight.get(j.id))) };
+  }
+  if (json) { console.log(JSON.stringify(page, null, 2)); return; }
+  for (const job of page.jobs) console.log(`${formatJob(job)} ${job.finished_at instanceof Date ? job.finished_at.toISOString() : ''}`);
+  console.log(`\n  ${page.jobs.length} finished jobs. Next: gbrain jobs list --finished-since ${page.next_cursor}`);
 }
 
 /** `jobs list --group <id>`: one spend group's record, amounts and member jobs. */

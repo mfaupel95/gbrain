@@ -22,9 +22,9 @@
  * the not-moving fixture; the default window never drops below one sync
  * preparation budget; every state's envelope follows the v1 contract.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -33,10 +33,13 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { syncLockId, tryAcquireDbLock, type DbLockHandle } from '../src/core/db-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { judgeMovement, readSourceMovement, startMovementWatch, formatSourceMovement, MOVEMENT_WATERMARK_SQL } from '../src/core/persistence/sync-movement.ts';
-import { movementReport, movementWindowMs, parseMovementArgs, runMovementCheck, MOVEMENT_SUPERVISOR_STEP } from '../src/commands/sources-writer-movement.ts';
+import { movementReport, movementWindowMs, parseMovementArgs, runMovementCheck, runWriterMovementCli, MOVEMENT_HELP, MOVEMENT_SUPERVISOR_STEP } from '../src/commands/sources-writer-movement.ts';
 import { managedSyncMovementEntry } from '../src/commands/doctor/checks/managed-sync-movement.ts';
 import { deriveNext, cliRenderContext } from '../src/core/agent-output.ts';
 import { CODES } from '../src/core/error-registry.ts';
+import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
+import { runSources } from '../src/commands/sources.ts';
+import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-movement-'));
 let engine: BrainEngine;
@@ -280,14 +283,14 @@ describe('gbrain sources writer movement (I2, T4)', () => {
     const sampledAt = ago(0), committedAt = ago(1_000);
     const base = (over: Record<string, unknown>) => ({ source_id: 's', sampled_at: sampledAt, movement_state: 'moving', data_moving: true, not_moving_since: null, last_commit_at: committedAt, last_progress_at: committedAt,
       cursor: { index: 1, total: 4, remaining: 3, held: 0, last_progress_at: null, resume_command: 'gbrain sync --source s --no-pull' }, head: null, holds: { count: 0, stalled: 0, fences: 0, concurrent: 0, last_hold_at: null },
-      admitted: 1, live: { drain: true, drain_pid: 1, consumer: null }, ceiling_ms: 600_000, owner_is_this_host: true, writer_status_command: 'gbrain sources writer status --source s --json', ...over }) as Parameters<typeof movementReport>[1];
+      admitted: 1, live: { drain: true, drain_pid: 1, drain_job_id: null, consumer: null }, ceiling_ms: 600_000, owner_is_this_host: true, writer_status_command: 'gbrain sources writer status --source s --json', ...over }) as Parameters<typeof movementReport>[1];
     const states: Array<[ReturnType<typeof judgeMovement>, Parameters<typeof movementReport>[0], Parameters<typeof movementReport>[1]]> = [
       ['nothing_pending', undefined, base({ movement_state: 'nothing_pending', cursor: null, data_moving: null })],
       ['moved', base({ last_commit_at: ago(100_000) }), base({})],
       ['within_allowance', base({ head: { request_id: 'r', state: 'running', phase: 'preparing', step: 'a', step_since: ago(50_000), step_age_ms: 50_000, waiting_on: 'db', owner: null, last_sql: null, lapsed: false } }),
         base({ last_commit_at: null, head: { request_id: 'r', state: 'running', phase: 'preparing', step: 'b', step_since: ago(1_000), step_age_ms: 1_000, waiting_on: 'db', owner: null, last_sql: null, lapsed: false } })],
       ['held', base({ holds: { count: 0, stalled: 0, fences: 0, concurrent: 0, last_hold_at: null } }), base({ holds: { count: 1, stalled: 0, fences: 1, concurrent: 0, last_hold_at: ago(0) } })],
-      ['parked', base({ movement_state: 'parked', live: { drain: false, drain_pid: null, consumer: null } }), base({ movement_state: 'parked', live: { drain: false, drain_pid: null, consumer: null } })],
+      ['parked', base({ movement_state: 'parked', live: { drain: false, drain_pid: null, drain_job_id: null, consumer: null } }), base({ movement_state: 'parked', live: { drain: false, drain_pid: null, drain_job_id: null, consumer: null } })],
       ['not_moving', base({}), base({})],
     ];
     for (const [expected, before, after] of states) {
@@ -335,4 +338,168 @@ describe('doctor managed_sync_not_moving and the serve notice', () => {
       expect(ok).toMatchObject({ status: 'ok' });
     } finally { watch.stop(); await lock!.release(); }
   }), 60_000);
+
+  test('#6552 §2: parked with admitted requests, no consumer and no progress past the ceiling fails with the resume sync as its fix; recent progress or an empty queue stays informational', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const ctx = { engine } as unknown as Parameters<typeof managedSyncMovementEntry.run>[0];
+    const f = await managedSource();
+    try {
+      await cursor(f, 2, 415, { progress: { startedAt: Date.now() - 900_000, startIndex: 0, lastAt: Date.now() - 600_000, lastIndex: 2 } });
+      await request(f, 'committed', { completedAt: ago(600_000) });
+      const [empty] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
+      expect(empty).toMatchObject({ name: 'managed_sync_not_moving', status: 'ok', details: { stranded: 0 } });
+      await request(f, 'queued');
+      const before = (await readSourceMovement(engine, { sourceIds: [f.id] }))[0]!;
+      expect(before).toMatchObject({ movement_state: 'parked', admitted: 1, live: { consumer: null } });
+      const [fail] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
+      expect(fail).toMatchObject({ name: 'managed_sync_not_moving', status: 'fail', readiness_state: 'degraded', details: { stranded: 1 } });
+      expect(String(fail!.message)).toContain('non-empty write queue and no consumer');
+      expect(fail!.fix).toMatchObject({ argv: ['gbrain', 'sync', '--source', f.id, '--no-pull'], actor: 'agent', consent: [] });
+      // The same queue with progress inside the ceiling is a cursor between runs: informational.
+      await cursor(f, 3, 415, { progress: { startedAt: Date.now() - 60_000, startIndex: 0, lastAt: Date.now() - 1_000, lastIndex: 3 } });
+      const [recent] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
+      expect(recent).toMatchObject({ status: 'ok', details: { stranded: 0 } });
+    } finally {
+      await finish(f);
+      await engine.executeRaw("UPDATE persistence_requests SET state='cancelled', completed_at=now() WHERE source_id=$1 AND state IN ('queued','running')", [f.id]);
+    }
+  }), 60_000);
+
+  test('#6552 §2: a queue stranded before its first commit (fresh cursor, no progress stamp) ages from its oldest admitted request', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const ctx = { engine } as unknown as Parameters<typeof managedSyncMovementEntry.run>[0];
+    const f = await managedSource();
+    try {
+      await cursor(f, 0, 415);
+      const queued = await request(f, 'queued');
+      const [fresh] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
+      expect(fresh).toMatchObject({ status: 'ok', details: { stranded: 0 } });
+      await engine.executeRaw("UPDATE persistence_requests SET created_at=now()-interval '2 days' WHERE request_id=$1::uuid", [queued]);
+      const movement = (await readSourceMovement(engine, { sourceIds: [f.id] }))[0]!;
+      expect(movement).toMatchObject({ movement_state: 'parked', admitted: 1, last_progress_at: null });
+      expect(Date.now() - Date.parse(movement.admitted_since!)).toBeGreaterThan(86_400_000);
+      const [fail] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
+      expect(fail).toMatchObject({ status: 'fail', details: { stranded: 1 } });
+    } finally {
+      await finish(f);
+      await engine.executeRaw("UPDATE persistence_requests SET state='cancelled', completed_at=now() WHERE source_id=$1 AND state IN ('queued','running')", [f.id]);
+    }
+  }), 60_000);
 });
+
+describe('#6781: a failed backlog read is unknown, never nothing_pending', () => {
+  /** The reporter's two arms: the same engine, except that the backlog SELECT alone rejects in the second. */
+  const BACKLOG_SQL = /FROM op_checkpoints WHERE op='managed-sync' AND COALESCE\(completed_keys->0->>'done','false'\)<>'true'/;
+  const failingBacklog = (target: BrainEngine): BrainEngine => new Proxy(target, {
+    get(t, prop) {
+      if (prop === 'executeRaw') {
+        return (sql: string, params?: unknown[]) => BACKLOG_SQL.test(sql) ? Promise.reject(new Error('OFFLINE_SENTINEL backlog read failed')) : t.executeRaw(sql, params);
+      }
+      const value = Reflect.get(t, prop, t);
+      return typeof value === 'function' ? value.bind(t) : value;
+    },
+  });
+  beforeEach(() => _resetCliExitVerdictForTests());
+
+  test('reader, window verdict and human line: control arm not_moving, injected arm unknown', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await managedSource();
+    await cursor(f, 2, 7, { progress: { startedAt: Date.now() - 400_000, startIndex: 0, lastAt: Date.now() - 300_000, lastIndex: 2 } });
+    await request(f, 'committed', { completedAt: ago(300_000) });
+    const lock = await tryAcquireDbLock(engine, syncLockId(f.id));
+    try {
+      const control = (await readSourceMovement(engine, { sourceIds: [f.id] }))[0]!;
+      expect(control).toMatchObject({ movement_state: 'not_moving', data_moving: false, cursor: { remaining: 5 } });
+      const injected = (await readSourceMovement(failingBacklog(engine), { sourceIds: [f.id] }))[0]!;
+      expect(injected).toMatchObject({ source_id: f.id, movement_state: 'unknown', data_moving: null, not_moving_since: null, cursor: null,
+        unknown: { reason: 'backlog_read_failed' }, live: { drain: true } });
+      expect(injected.unknown!.error).toContain('OFFLINE_SENTINEL');
+      expect(judgeMovement(undefined, injected)).toBe('unknown');
+      expect(judgeMovement(control, injected)).toBe('unknown');
+      const line = formatSourceMovement(injected);
+      expect(line).toContain('UNKNOWN');
+      expect(line).toContain('backlog_read_failed');
+    } finally { await lock!.release(); await finish(f); }
+  }), 60_000);
+
+  test('a failed read between two not_moving ticks: the window verdict is unknown and the serve watch holds its flip (no false recovery, no repeat notice)', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await managedSource();
+    await cursor(f, 2, 7, { progress: { startedAt: Date.now() - 400_000, startIndex: 0, lastAt: Date.now() - 300_000, lastIndex: 2 } });
+    await request(f, 'committed', { completedAt: ago(300_000) });
+    const flaky = { fail: false };
+    const broken = failingBacklog(engine);
+    const toggling = new Proxy(engine, { get: (t, prop) => { const src = flaky.fail ? broken : t; const value = Reflect.get(src, prop, src); return typeof value === 'function' ? value.bind(src) : value; } }) as typeof engine;
+    const lines: string[] = [];
+    const watch = startMovementWatch(toggling, { log: line => lines.push(line), everyMs: 3_600_000 });
+    const lock = await tryAcquireDbLock(engine, syncLockId(f.id));
+    try {
+      const control = (await readSourceMovement(engine, { sourceIds: [f.id] }))[0]!;
+      expect(control.movement_state).toBe('not_moving');
+      const injected = (await readSourceMovement(broken, { sourceIds: [f.id] }))[0]!;
+      expect(judgeMovement(injected, control)).toBe('unknown');
+      const mine = () => lines.filter(line => line.includes(f.id));
+      await watch.tick();
+      expect(mine().filter(line => line.includes('kind=degraded'))).toHaveLength(1);
+      flaky.fail = true;
+      await watch.tick();
+      flaky.fail = false;
+      await watch.tick();
+      expect(mine().filter(line => line.includes('moving again'))).toEqual([]);
+      expect(mine().filter(line => line.includes('kind=degraded'))).toHaveLength(1);
+    } finally { watch.stop(); await lock!.release(); await finish(f); }
+  }), 60_000);
+
+  test('writer movement exits 1 with movement_unknown (never managed_sync_not_moving); --warn-only exits 0', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await managedSource();
+    await cursor(f, 2, 7);
+    try {
+      const result = await runMovementCheck(failingBacklog(engine), { sourceId: f.id, waitMs: 1_000, pollMs: 1, sleep: async () => {} });
+      expect(result.exit_code).toBe(1);
+      expect(result.sources[0]).toMatchObject({ source_id: f.id, state: 'unknown', exit: 1, code: 'movement_unknown', reason: 'backlog_read_failed' });
+      expect(result.error).toMatchObject({ code: 'movement_unknown', reason: 'backlog_read_failed' });
+      expect(JSON.stringify(result)).not.toContain('managed_sync_not_moving');
+      expect(result.sources[0]!.fix).toMatchObject({ argv: ['gbrain', 'sources', 'writer', 'movement', f.id, '--json'], actor: 'agent', consent: [] });
+
+      // The command resolves the brain host config before it uses the connected engine.
+      mkdirSync(join(home, '.gbrain'), { recursive: true });
+      writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({ engine: 'pglite', database_path: join(home, '.gbrain', 'brain.pglite') }));
+      const out: string[] = [];
+      const logSpy = spyOn(console, 'log').mockImplementation((...args: unknown[]) => { out.push(args.map(String).join(' ')); });
+      const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await runWriterMovementCli([f.id, '--wait', '1s'], failingBacklog(engine));
+        expect(currentExitCode()).toBe(1);
+        expect(out.join('\n')).toContain(`✗ ${f.id}: unknown [movement_unknown/backlog_read_failed]`);
+        _resetCliExitVerdictForTests();
+        out.length = 0;
+        await runWriterMovementCli([f.id, '--wait', '1s', '--warn-only'], failingBacklog(engine));
+        expect(currentExitCode()).toBe(0);
+        expect(out.join('\n')).toContain('--warn-only: exiting 0 despite the verdict above.');
+      } finally { logSpy.mockRestore(); errSpy.mockRestore(); }
+      expect(MOVEMENT_HELP).toContain('unknown');
+      expect(MOVEMENT_HELP).toContain('movement_unknown');
+    } finally { await finish(f); }
+  }), 60_000);
+
+  test('doctor warns with health unknown; sources status and the writer_status admin op show unknown instead of blanking', () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await managedSource();
+    await cursor(f, 2, 7);
+    try {
+      const broken = failingBacklog(engine);
+      const [check] = await managedSyncMovementEntry.run({ engine: broken } as unknown as Parameters<typeof managedSyncMovementEntry.run>[0]) as unknown as Array<Record<string, unknown>>;
+      expect(check).toMatchObject({ name: 'managed_sync_not_moving', status: 'warn', details: { health: 'unknown' } });
+      const details = check!.details as { unknown: number; sources: Array<{ source_id: string; movement_state: string }> };
+      expect(details.unknown).toBeGreaterThanOrEqual(1);
+      expect(details.sources).toContainEqual(expect.objectContaining({ source_id: f.id, movement_state: 'unknown' }));
+      expect(String(check!.message)).toContain(f.id);
+      expect(String(check!.message)).toContain('could not be read');
+
+      const logs: string[] = [];
+      const spy = spyOn(console, 'log').mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
+      try { await runSources(broken, ['status', f.id, '--json']); } finally { spy.mockRestore(); }
+      const status = JSON.parse(logs.join('\n')) as { sources: Array<{ source_id: string; movement_state?: string; data_moving?: unknown }> };
+      expect(status.sources.find(s => s.source_id === f.id)).toMatchObject({ movement_state: 'unknown', data_moving: null });
+
+      const admin = await runPersistenceAdministration(broken, 'writer_status', { source_id: f.id }) as { movement: Array<{ source_id: string; movement_state: string }> };
+      expect(admin.movement).toEqual([expect.objectContaining({ source_id: f.id, movement_state: 'unknown' })]);
+    } finally { await finish(f); }
+  }), 60_000);
+});
+

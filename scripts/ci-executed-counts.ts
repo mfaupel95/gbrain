@@ -5,7 +5,11 @@
  * Reads the receipts every CI lane writes (scripts/lib/test-env.sh
  * `receipts_init`: one `<id>.receipt` + `<id>.files` + Bun JUnit report per bun
  * invocation; verify writes one testcase per check) and accounts for every
- * executed test by identity: (lane, file, test name, backend arm).
+ * executed test by identity: (lane, file, test name, backend arm). Each
+ * identity also carries the database backend its name pins (`testBackend`):
+ * a test registered per backend (`testBackends()`) names it, and a move of
+ * such a test may change arm, because the backend, not the lane's arm, is
+ * what it exercises.
  *
  * One side (head only) prints the per-lane executed/skipped/failed table and
  * every completeness problem. Two sides (base and head) also list each base
@@ -224,7 +228,7 @@ export function loadReceiptDir(dir: string): Receipt[] {
   return receipts;
 }
 
-export interface Identity { lane: string; file: string; test: string; arm: string; status: Status; artifact: string; kind: string }
+export interface Identity { lane: string; file: string; test: string; arm: string; backend: TestBackend; status: Status; artifact: string; kind: string }
 export interface Issue { kind: string; lane?: string; artifact?: string; file?: string; detail: string }
 export interface LaneStats { lane: string; files: number; executed: number; passed: number; failed: number; skipped: number; superseded: number; declaredEmpty: boolean }
 export interface Side {
@@ -239,6 +243,24 @@ export interface Side {
 }
 
 export const identityKey = (lane: string, file: string, test: string, arm: string) => [lane, file, test, arm].join('\u001f');
+
+/**
+ * The database backend a test name pins: `pglite` or `postgres` when its
+ * top-level describe names exactly one of them as a word (testBackends()
+ * suites prefix or suffix it, e.g. "postgres: semantic writes …" or "…
+ * (pglite)"), else when the whole name does; otherwise '' (the name does not
+ * say, or names both). A hyphenated compound such as postgres-unit-arms is
+ * not a backend.
+ */
+export type TestBackend = 'pglite' | 'postgres' | '';
+export function testBackend(test: string): TestBackend {
+  const pins = (text: string): TestBackend => {
+    const pglite = /(?<![\w-])pglite(?![\w-])/i.test(text);
+    const postgres = /(?<![\w-])postgres(?:ql)?(?![\w-])/i.test(text);
+    return pglite === postgres ? '' : pglite ? 'pglite' : 'postgres';
+  };
+  return pins(test.split(' > ')[0]!) || pins(test);
+}
 const executed = (status: Status | undefined) => status === 'pass' || status === 'fail';
 
 function describeAttempt(r: Receipt): string {
@@ -246,14 +268,20 @@ function describeAttempt(r: Receipt): string {
   return `${r.artifact}/${r.id} [${r.kind}${r.exit === undefined ? ', interrupted' : `, exit ${r.exit}`}]: ${state}`;
 }
 
-export function buildSide(label: string, all: Receipt[], expectedAttempts = new Map<string, number>()): Side {
+/**
+ * `latestBy` 'run' (the comparison) keeps only receipts from the run's latest attempt. 'job' keeps each artifact's
+ * newest attempt: a re-run of failed jobs overwrites only their artifacts, so the others still hold the receipts of
+ * the attempt in which their job last ran, and the side counts the whole suite (#8001).
+ */
+export function buildSide(label: string, all: Receipt[], expectedAttempts = new Map<string, number>(), latestBy: 'run' | 'job' = 'run'): Side {
   const side: Side = { label, artifacts: new Set(all.map(r => r.artifact)), identities: new Map(), issues: [], duplicates: [], overlaps: [], lanes: new Map(), shas: new Set() };
-  const latest = new Map(expectedAttempts);
+  const scope = (r: Receipt) => (latestBy === 'run' ? r.runId : `${r.runId}\u001f${r.artifact}`);
+  const latest = new Map(latestBy === 'run' ? expectedAttempts : []);
   for (const r of all) {
-    if (r.runId && r.runAttempt !== undefined && r.runAttempt > (latest.get(r.runId) ?? 0)) latest.set(r.runId, r.runAttempt);
+    if (r.runId && r.runAttempt !== undefined && r.runAttempt > (latest.get(scope(r)) ?? 0)) latest.set(scope(r), r.runAttempt);
   }
   const receipts = all.filter(r => {
-    const want = r.runId ? latest.get(r.runId) : undefined;
+    const want = r.runId ? latest.get(scope(r)) : undefined;
     if (want !== undefined && r.runAttempt !== undefined && r.runAttempt < want) {
       side.issues.push({ kind: 'prior-attempt', lane: r.lane, artifact: r.artifact, detail: `${r.artifact}/${r.id} comes from attempt ${r.runAttempt} of run ${r.runId}; the run's latest attempt is ${want}. Re-run all jobs, not only failed ones, so every lane reports from one attempt.` });
       return false;
@@ -312,7 +340,7 @@ export function buildSide(label: string, all: Receipt[], expectedAttempts = new 
         seen.set(c.test, n);
         const test = n === 1 ? c.test : `${c.test} [#${n}]`;
         if (n > 1) duplicateCounts.set(identityKey(lane, file, c.test, winner.arm), n);
-        side.identities.set(identityKey(lane, file, test, winner.arm), { lane, file, test, arm: winner.arm, status: c.status, artifact: winner.artifact, kind: winner.kind });
+        side.identities.set(identityKey(lane, file, test, winner.arm), { lane, file, test, arm: winner.arm, backend: testBackend(c.test), status: c.status, artifact: winner.artifact, kind: winner.kind });
       }
     }
   }
@@ -412,6 +440,11 @@ export function deltaRow(kind: DeltaKind, id: Pick<Identity, 'lane' | 'file' | '
 export function compare(head: Side, base: Side | undefined, deltas: { rows: DeltaRow[]; errors: string[] }, opts: { failOnAdditions?: boolean } = {}): Comparison {
   const result: Comparison = { ok: true, base, head, drops: [], additions: [], issues: [...(base?.issues.map(i => ({ ...i, detail: `base: ${i.detail}` })) ?? []), ...head.issues.map(i => ({ ...i, detail: base ? `head: ${i.detail}` : i.detail }))], deltaErrors: deltas.errors, unusedRows: [], suggestions: [] };
   const used = new Set<DeltaRow>();
+  const headAt = new Map<string, Identity[]>();
+  for (const h of head.identities.values()) {
+    const at = identityKey(h.lane, h.file, h.test, '');
+    headAt.set(at, [...(headAt.get(at) ?? []), h]);
+  }
   const sideOf = (detail: string) => (base && detail.startsWith('base: ') ? base : head);
   result.issues = result.issues.filter(issue => {
     if (issue.kind !== 'empty-lane') return true;
@@ -440,9 +473,9 @@ export function compare(head: Side, base: Side | undefined, deltas: { rows: Delt
         if (row.kind === 'retire') drop.verdict = 'retired';
         else if (row.kind === 'skip') drop.verdict = now && !executed(now.status) ? 'skipped' : 'skip-mismatch';
         else {
-          const target = identityKey(row.newLane || id.lane, row.newFile || id.file, row.test === '*' ? id.test : row.newTest || id.test, id.arm);
-          drop.verdict = executed(head.identities.get(target)?.status) ? 'moved' : 'move-target-missing';
-          if (drop.verdict === 'move-target-missing') drop.detail = `declared move target ${target.split('\u001f').join(' | ')} did not execute in head`;
+          const [lane, file, test] = [row.newLane || id.lane, row.newFile || id.file, row.test === '*' ? id.test : row.newTest || id.test];
+          drop.verdict = (headAt.get(identityKey(lane, file, test, '')) ?? []).some(h => movedTo(id, h)) ? 'moved' : 'move-target-missing';
+          if (drop.verdict === 'move-target-missing') drop.detail = `declared move target ${[lane, file, test, id.arm].join(' | ')} did not execute in head${id.backend ? ` under any arm on the ${id.backend} backend` : ''}`;
         }
       } else if (head.lanes.get(id.lane)?.declaredEmpty) {
         drop.verdict = 'lane-declared-empty';
@@ -459,6 +492,18 @@ export function compare(head: Side, base: Side | undefined, deltas: { rows: Delt
   return result;
 }
 
+/**
+ * Whether head identity `to` executes what base identity `from` did: the same
+ * arm, or another arm when the test's name pins its backend. A PostgreSQL-arm
+ * cell run with --postgres-only runs only the PostgreSQL side of testBackends()
+ * suites, so their PGLite tests leave that lane (arm postgres) for the unit and serial
+ * lanes (no arm) and still run on PGLite there. A PostgreSQL test may change
+ * arm only to another database arm: a lane with no arm has no database.
+ */
+const movedTo = (from: Identity, to: Identity) =>
+  executed(to.status) && (to.arm === from.arm
+    || (from.backend !== '' && to.backend === from.backend && (from.backend === 'pglite' || to.arm !== '')));
+
 /** The exact TSV rows that would declare each undeclared drop: a move when the test runs elsewhere in head, else a retirement. */
 export function suggestRows(drops: Drop[], base: Side, head: Side): string[] {
   const rows: string[] = [];
@@ -473,7 +518,15 @@ export function suggestRows(drops: Drop[], base: Side, head: Side): string[] {
     const { lane, file, arm } = group[0].identity;
     const baseExecuted = [...base.identities.values()].filter(id => id.lane === lane && id.file === file && id.arm === arm && executed(id.status)).length;
     const headFileRuns = [...head.identities.values()].some(id => id.lane === lane && id.file === file && id.arm === arm && executed(id.status));
-    const elsewhere = (d: Drop) => (headByTest.get(d.identity.test) ?? []).find(h => h.lane !== lane || h.file !== file);
+    const elsewhere = (d: Drop) => (headByTest.get(d.identity.test) ?? []).find(h => (h.lane !== lane || h.file !== file) && movedTo(d.identity, h));
+    const backend = group[0].identity.backend;
+    const backendBase = [...base.identities.values()].filter(id => id.lane === lane && id.file === file && id.arm === arm && id.backend === backend && executed(id.status)).length;
+    const targets = new Set(group.map(d => { const h = elsewhere(d); return h ? `${h.lane}\u001f${h.file}` : ''; }));
+    if (backend && group.length > 1 && group.length === backendBase && group.every(d => d.identity.backend === backend) && targets.size === 1 && !targets.has('')) {
+      const [newLane, newFile] = [...targets][0]!.split('\u001f');
+      rows.push(deltaRow('move', { lane, file, test: '*', arm }, { lane: newLane === lane ? '' : newLane, file: newFile === file ? '' : newFile }));
+      continue;
+    }
     if (group.length === baseExecuted && !headFileRuns && group.length > 1) {
       const votes = new Map<string, number>();
       for (const d of group) {
@@ -545,6 +598,15 @@ export function render(result: Comparison, extra: string[] = []): string {
     }
   }
   out.push('');
+  const byBackend = lanes.map(lane => {
+    const ids = [...head.identities.values()].filter(id => id.lane === lane && executed(id.status));
+    return { lane, pglite: ids.filter(id => id.backend === 'pglite').length, postgres: ids.filter(id => id.backend === 'postgres').length, unnamed: ids.filter(id => !id.backend).length };
+  }).filter(b => b.pglite || b.postgres);
+  if (byBackend.length) {
+    out.push('Head executed by backend (the backend a test name pins; testBackends() suites name it):', '', '| Lane | PGLite | PostgreSQL | Name pins none |', '|---|---:|---:|---:|');
+    for (const b of byBackend) out.push(`| ${md(b.lane)} | ${b.pglite} | ${b.postgres} | ${b.unnamed} |`);
+    out.push('');
+  }
   out.push(...extra);
   if (result.issues.length) {
     out.push(`### Incomplete (${result.issues.length})`, '', 'Why: a lane without a complete receipt cannot prove which tests ran, so the comparison fails closed.', 'Fix: rerun every job of the run (not only failed jobs) so each lane uploads a receipt from one attempt; a killed shard needs its rescue or a rerun.', DOCS, '');
@@ -654,7 +716,7 @@ export function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function loadSide(runs: string[], dirs: string[], args: Args, into: string): Side | undefined {
+function loadSide(runs: string[], dirs: string[], args: Args, into: string): { side: Side; receipts: Receipt[] } | undefined {
   if (!runs.length && !dirs.length) return undefined;
   const receipts: Receipt[] = [];
   const expect = new Map(args.expect);
@@ -677,7 +739,7 @@ function loadSide(runs: string[], dirs: string[], args: Args, into: string): Sid
     if (seen.has(key) && seen.get(key) !== source) throw new UsageError(`artifact ${r.artifact} appears in two runs of one side; pass one test.yml run and one e2e.yml run per side`);
     seen.set(key, source);
   }
-  return buildSide(labels.join(' + '), receipts, expect);
+  return { side: buildSide(labels.join(' + '), receipts, expect), receipts };
 }
 
 export function main(argv: string[]): number {
@@ -692,8 +754,9 @@ export function main(argv: string[]): number {
   }
   try {
     const scratch = mkdtempSync(join(tmpdir(), 'gbrain-receipts-'));
-    const head = loadSide(args.headRuns, args.headDirs, args, scratch)!;
-    const base = loadSide(args.baseRuns, args.baseDirs, args, scratch);
+    const loaded = loadSide(args.headRuns, args.headDirs, args, scratch)!;
+    const head = loaded.side;
+    const base = loadSide(args.baseRuns, args.baseDirs, args, scratch)?.side;
     const deltasPath = args.deltas ?? (existsSync(DEFAULT_DELTAS) ? DEFAULT_DELTAS : undefined);
     const deltas = deltasPath ? parseDeltas(readFileSync(deltasPath, 'utf8')) : { rows: [], errors: [] };
     const result = compare(head, base, deltas, { failOnAdditions: args.failOnAdditions });
@@ -711,7 +774,18 @@ export function main(argv: string[]): number {
     const text = render(result, extra);
     process.stdout.write(text);
     if (args.summary) appendFileSync(args.summary, text);
-    if (args.json) writeFileSync(args.json, `${JSON.stringify(toJSON(result), null, 2)}\n`);
+    if (args.json) {
+      // The run this ledger was written for, and the head's executed counts with each job at its newest attempt
+      // (scripts/ci-reuse.ts --gate reads both, #8001).
+      const [run] = args.expect.size === 1 ? [...args.expect] : [];
+      const jobs = [...buildSide(head.label, loaded.receipts, new Map(), 'job').lanes.values()];
+      const attempts = [...new Set(loaded.receipts.flatMap(r => (r.runAttempt === undefined ? [] : [r.runAttempt])))].sort((a, b) => a - b);
+      writeFileSync(args.json, `${JSON.stringify({
+        ...(toJSON(result) as object),
+        run: run ? { id: Number(run[0]), attempt: run[1] } : null,
+        job_latest: { executed: jobs.reduce((n, l) => n + l.executed, 0), failed: jobs.reduce((n, l) => n + l.failed, 0), attempts },
+      }, null, 2)}\n`);
+    }
     return result.ok || args.reportOnly ? 0 : 1;
   } catch (error) {
     console.error(`ci-executed-counts: ${error instanceof Error ? error.message : String(error)}`);

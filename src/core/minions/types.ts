@@ -220,6 +220,8 @@ export interface MinionQueueOpts {
 
 export interface MinionWorkerOpts {
   queue?: string;
+  /** #7242: called (never awaited, errors swallowed) after each job this worker ran settles; terminal-hook.ts re-reads the row. */
+  onJobSettled?: (job: MinionJob) => void;
   concurrency?: number; // default 1
   lockDuration?: number; // ms, default 30000
   stalledInterval?: number; // ms, default 30000
@@ -264,6 +266,10 @@ export interface MinionWorkerOpts {
   childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
   /** tini path for wrapping job children ('' = absent, direct spawn). */
   childTiniPath?: string;
+  /** #7242: job names that count against the long-job lane. Default: lanes.ts DEFAULT_LONG_JOB_NAMES. */
+  longJobNames?: readonly string[];
+  /** #7242: slots kept free of long jobs when concurrency >= 2 (at least one slot still takes long jobs). Default 1; 0 disables. */
+  shortJobReservedSlots?: number;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -277,6 +283,8 @@ export interface MinionJobContext {
   /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
   spend?: JobSpendContext;
   attempts_made: number;
+  /** The job row's idempotency key (null when it was queued without one); ingest_capture records an applied capture under it (GST-1856). */
+  idempotency_key: string | null;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
   /** Absolute wall-clock deadline (epoch ms) from the claim-time `timeout_at` stamp,
@@ -506,6 +514,20 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
  * tool registry and provider config resolve via handler-side defaults + env,
  * not per-job data, so restart/replay uses the same behavior.
  */
+/** GBRA-60: the transcript a dream synthesis child's pages are verified against, and the stamp they carry. */
+export interface DreamOutputSpec {
+  /** The transcript path (or conversation-page URI) the cycle discovered; stamped as `raw_source`. */
+  raw_source: string;
+  /** sha256 of the transcript content the cycle discovered; a child that reads other bytes does not verify. */
+  transcript_hash: string;
+  /** The cycle date the prompt gave as today (`dream_cycle_date`, the verify `checkedAt`). */
+  cycle_date: string;
+  /** `dream.synthesize.quote_verify`; false stamps without verifying. */
+  quote_verify: boolean;
+  /** #4618: the capturing seat. */
+  seat?: string;
+}
+
 export interface SubagentHandlerData {
   /** Top-level user turn kicking off the loop. */
   prompt: string;
@@ -590,6 +612,14 @@ export interface SubagentHandlerData {
    */
   allow_clean_zero_writes?: boolean;
   /**
+   * #6297 — byte budget on this job's `get_page` results (the dream patterns
+   * child, `dream.patterns.child_read_budget_kb`). Past it a read returns a
+   * short summary instead of the page, so the replayed transcript stays
+   * bounded. Counted from the job's own tool-execution ledger, so a crash
+   * replay keeps the budget. Trusted field (PROTECTED_JOB_NAMES); unset = no budget.
+   */
+  read_budget_bytes?: number;
+  /**
    * #4216 — synthesis execution mode. 'oneshot' = single structured
    * completion + programmatic validated writes, falling back to the agentic
    * loop in the SAME job when the output fails validation. Unset/'agentic'
@@ -613,6 +643,30 @@ export interface SubagentHandlerData {
    * queued by older builds, which keep the allow-list derivation.
    */
   oneshot_task_prefixes?: string[];
+  /**
+   * GBRA-60: a managed dream synthesis child verifies and stamps each oneshot page against this transcript before it
+   * writes it (cycle/synthesize-child-verify.ts), so a strict source commits each output once. Trusted field
+   * (PROTECTED_JOB_NAMES); a delegated (remote-owned) job ignores it. Absent on jobs queued by older builds, whose
+   * outputs postprocessing verifies and republishes.
+   */
+  dream_output?: DreamOutputSpec;
+  /**
+   * #7850: the session-corpus file a dream synthesis child writes for, the corpus dir and the source incarnation discovery
+   * resolved it to. The child resolves the file again (read-only) before any model call and refuses
+   * (`session_source_changed: <reason>`) when the session no longer resolves to `source_id` or the incarnation changed; a
+   * child without it is re-checked from `dream_output.raw_source` and the configured corpus dir. Trusted field
+   * (PROTECTED_JOB_NAMES); a delegated (remote-owned) job ignores it.
+   */
+  corpus_source?: { raw_source: string; corpus_dir: string; incarnation: string };
+  /**
+   * GBRA-60: the agent loop's put_page stages each page instead of writing it (minions/tools/staged-put-page.ts): every
+   * check put_page runs before journaling still refuses, but the page lives only in this job's tool-execution ledger
+   * until the submitting phase publishes it (a managed patterns run grounds, stamps and publishes the staged pages as
+   * one maintenance batch, so a strict source commits each page once). Staged writes count for require_writes. Trusted
+   * field: 'subagent' is a PROTECTED_JOB_NAMES job, submit_agent never copies it, and a delegated (remote-owned) job
+   * ignores it. A replacement tool registry (SubagentDeps.toolRegistry) does not stage.
+   */
+  stage_writes?: boolean;
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
@@ -786,4 +840,20 @@ export interface SubagentResult {
    * completion that `require_writes` must not dead-letter.
    */
   oneshot_skipped?: boolean;
+}
+
+/**
+ * GST-359 C2: the attested actor an agent job belongs to. submit_agent stores it in the accepted grant
+ * (`submission_authority.grant.actor`); every owner-fenced job read and cancel also matches it, so behind one attest
+ * client a job is visible only to the person it was submitted for, and a job without one only to unattested calls.
+ */
+export type JobActor = readonly [string, string, string];
+
+/** The actor of a caller without an attested one. */
+export const NO_JOB_ACTOR: JobActor = ['', '', ''];
+
+/** SQL: the job's accepted actor equals the three parameters starting at `$first`. `alias` is a code-provided table alias. */
+export function jobActorSql(first: number, alias?: string): string {
+  const actor = `${alias ? alias + '.' : ''}submission_authority->'grant'->'actor'`;
+  return ['system', 'external_id', 'member'].map((key, i) => `COALESCE(${actor}->>'${key}', '') = $${first + i}::text`).join(' AND ');
 }

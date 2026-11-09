@@ -30,6 +30,7 @@
 import { describe, it, expect, beforeAll } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { resolve } from 'path';
+import { UNIT_SHARDS } from '../../scripts/sharding.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const SHARD_SH = resolve(REPO_ROOT, 'scripts/test-shard.sh');
@@ -172,17 +173,18 @@ describe('test-shard.sh — LPT balance contract', () => {
 
   // CI runs THIS many shards (test.yml matrix). The old version of this
   // test asserted 4- and 6-shard splits — configurations nothing runs.
-  const CI_SHARDS = 8;
+  const CI_SHARDS = UNIT_SHARDS;
 
   it('CI_SHARDS matches the test.yml matrix (parsed, not regexed)', () => {
     const fs = require('fs');
     const yaml = require('js-yaml');
     const wf = yaml.load(
       fs.readFileSync(resolve(REPO_ROOT, '.github/workflows/test.yml'), 'utf8'),
-    ) as { jobs: { test: { strategy: { matrix: { shard: unknown[] } } } } };
-    const matrix = wf.jobs.test.strategy.matrix.shard;
-    expect(Array.isArray(matrix)).toBe(true);
-    expect(matrix.length).toBe(CI_SHARDS);
+    ) as { jobs: { test: { strategy: { matrix: { shards: number[][] } } } } };
+    // Each job runs a pack of shards (scripts/test-shard-pack.sh); together they are 1..CI_SHARDS.
+    const packs = wf.jobs.test.strategy.matrix.shards;
+    expect(Array.isArray(packs)).toBe(true);
+    expect(packs.flat()).toEqual(Array.from({ length: CI_SHARDS }, (_, i) => i + 1));
   });
 
   it(`${CI_SHARDS}-shard wallclock imbalance ratio ≤ 1.5 (the configuration CI actually runs)`, () => {

@@ -59,10 +59,14 @@ passed, 1 a failure, 2 a usage or setup error, 130/143 cancelled.
 
 Paid-provider files (`*.live.test.ts`, `test/live/`,
 `scripts/e2e-live-key-only.txt`) are listed as not stressed. A file whose
-every test skips on this platform, skips without an unavailable secret, or
+every test skips on this platform, skips without an unavailable secret
+(including a credentialed external-service URL no CI job holds, such as
+`GBRAIN_SUPAVISOR_URL`), or
 skips without a prerequisite its owning job in `heavy-tests.yml`,
-`native-locks.yml` or `macos-validation.yml` installs, is listed as not
-stressed with that reason; any other run with zero executed tests fails.
+`native-locks.yml` or `macos-validation.yml` installs, or skips without the
+PgBouncer fixture (`GBRAIN_PGBOUNCER_URL`) that a workflow step setting
+`GBRAIN_CI_REQUIRE_PGBOUNCER` runs it with, is listed as not stressed with that
+reason; any other run with zero executed tests fails.
 
 ## Isolation and receipts
 
@@ -98,7 +102,12 @@ shards.
   never sampled or skipped.
 - **Shards.** Work items (a file's iterations, split when ten exceed the
   budget) pack into the fewest shards whose measured estimates stay under 25
-  minutes. There is no shard-count cap; `max-parallel: 12` keeps a large PR
+  minutes. A file's estimate is its measured stress iteration
+  (`scripts/stress/iteration-weights.json`, mined from stress shard job logs
+  with `bun scripts/stress/gate.ts mine-iterations <log>…`, which merges into
+  the map), else its lane weight, else the lane's p75: a fresh database per
+  iteration can make a stress iteration slower than the file's lane run.
+  There is no shard-count cap; `max-parallel: 12` keeps a large PR
   from starving other jobs. Shard jobs record results and exit 0 on test
   failures; the result job decides, so a planned iteration without a receipt
   fails the check as incomplete.
@@ -136,7 +145,10 @@ Postgres, plus the Postgres-arm and E2E importers of helpers changed on master
 since the previous night that the gate sampled out. Budget: at most 55-minute
 shards, 6 by default, growing to 12; past that every file runs at least 3
 iterations nightly and the spare capacity rotates by day, so each file still
-reaches 10 iterations within the week. Files are never dropped: what does not
+reaches 10 iterations within the week. When 3 iterations of every file do not
+fit 12 shards, every file runs 3 in up to 24 shards; the second 12 queue behind
+the first (`max-parallel: 12`), so the night runs longer on the same number of
+concurrent runners. Files are never dropped: what does not
 fit fails the job with "race hunt over budget" and the unrun files. A red
 prints one `::error` line per failing file with its reproduce command, which
 the Test nightly-red issue carries; the response is a repair PR, never a

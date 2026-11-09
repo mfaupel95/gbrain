@@ -33,11 +33,13 @@
  * safe).
  */
 
+import type { Action } from '../agent-output.ts';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { contentHash } from '../utils.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import type { Page } from '../types.ts';
 import {
   resolvePhantomCanonical,
@@ -58,10 +60,13 @@ import { tryAcquireDbLock, syncLockId, type DbLockHandle } from '../db-lock.ts';
 import { isAborted } from '../abort-check.ts';
 import { logPhantomEvent, type PhantomOutcome } from '../facts/phantom-audit.ts';
 import { MOVE_WITHDRAWAL_SUBJECT_SQL } from '../facts/withdrawal-schema.ts';
-import { resolvePageWriteTarget } from '../write-through.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { fileBodyMatchesStored, fileDatabaseDriftToken, mirrorFileBody, readStoredBody, replaceStoredBody, replaceableFile } from '../facts/file-body-guard.ts';
 import { recordRenameAlias } from '../page-state/rename-alias.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { ItemRun } from '../item-failure.ts';
+import { rotationAfter, saveRotation } from '../repair/rotation.ts';
 
 /** Tagged-union outcome of a single phantom-redirect attempt. */
 export type RedirectOutcome =
@@ -76,6 +81,8 @@ export interface RedirectResult {
   outcome: RedirectOutcome;
   /** Canonical slug, populated only on outcome === 'redirected' (incl. dry-run preview). */
   canonical?: string;
+  /** #6982: the `file_database_drift` entry when a file or database body was left in place (with outcome drift, or a kept phantom file). */
+  held?: string;
 }
 
 export interface PhantomPassResult {
@@ -85,10 +92,22 @@ export interface PhantomPassResult {
   skipped_drift: number;
   no_canonical: number;
   not_phantom: number;
+  /**
+   * #6650: top-level pages held this pass because they own legacy (unfenced)
+   * fact rows: the redirect moves rows by fence position and would strand
+   * them on the deleted phantom. Every other phantom of the source proceeds.
+   */
+  held_legacy_rows: number;
+  /** #6982: `<slug> (file_database_drift: …)` entries for pages whose file or database body the pass left in place, each with its fix. */
+  held: string[];
   /** True iff the pass was skipped wholesale because the writer lock was busy. */
   lock_busy: boolean;
-  /** True iff more phantoms exist than the per-cycle cap — caller surfaces to operator. */
+  /** True iff live root pages remain after this pass's window; the next pass resumes after the last slug examined. */
   more_pending: boolean;
+  /** Root pages whose redirect threw an item-scoped error this pass; each is retried when the cursor next reaches it. */
+  failures: Array<{ key: string; code: string; message: string; fix: Action }>;
+  /** Set when most examined pages failed (item_failures_systemic): the pass stopped and its cursor did not move. */
+  stopped?: { code: string; message: string };
   /**
    * Canonical slugs whose disk fence was merged with phantom rows this pass.
    * `extract_facts`'s main reconcile loop UNIONs these into its slug set so
@@ -106,6 +125,8 @@ export interface PhantomPassResult {
 }
 
 const DEFAULT_PHANTOM_LIMIT = 50;
+/** op_checkpoints op (fingerprint: source id) holding the last root slug a pass examined; '' after a pass reaches the end. */
+export const PHANTOM_REDIRECT_CURSOR_OP = 'phantom-redirect-cursor';
 const LOCK_TTL_MINUTES = 5;
 const LOCK_RETRY_INTERVAL_MS = 1000;
 const LOCK_TOTAL_TIMEOUT_MS = 30_000;
@@ -119,8 +140,11 @@ export function emptyPhantomPassResult(): PhantomPassResult {
     skipped_drift: 0,
     no_canonical: 0,
     not_phantom: 0,
+    held_legacy_rows: 0,
+    held: [],
     lock_busy: false,
     more_pending: false,
+    failures: [],
     touched_canonicals: [],
   };
 }
@@ -203,8 +227,9 @@ async function acquireLockWithRetry(
 }
 
 /**
- * Append the phantom's fact rows to the canonical's disk fence, dedup-
- * guarded by (claim, valid_from). Atomic via `.tmp` + rename.
+ * Append the phantom's fact rows to the canonical's file of record, dedup-
+ * guarded by (claim, valid_from), and mirror the file into the canonical's
+ * database body. Atomic via `.tmp` + rename.
  *
  * New rows number from past both the file's and the DB's highest row number
  * (the DB may hold numbers the file lost), and `superseded by #N` references
@@ -213,20 +238,34 @@ async function acquireLockWithRetry(
  * canonical fence row (a retry after a crash between the disk write and the
  * DB move finds every row already on disk).
  *
- * The disk write happens BEFORE the DB migration in the redirect handler,
- * so if this throws (rename fails, disk full, parse-validation rejects)
- * the DB migration won't run and the cycle can retry next run.
+ * #6982: the rows are planned on the file only when its body and timeline
+ * equal the canonical's database body, so the mirror can only add them. The
+ * canonical row is then locked and re-read in a maintenance transaction: when
+ * the database body moved since the comparison, nothing is written and the
+ * phantom is held (`file_database_drift`). Otherwise the prior body is kept in
+ * page_versions, the body is mirrored and stamped with the hash the importer
+ * computes for the new file, and the file is re-read immediately before the
+ * `.tmp` is renamed last: a file that moved rolls the transaction back and
+ * holds the phantom the same way.
+ * A parse-validation failure throws before any DB state has moved.
  */
-function appendPhantomFenceRowsToCanonical(
+async function mergeIntoCanonicalFile(
+  engine: BrainEngine,
+  phantomSlug: string,
+  canonical: string,
+  sourceId: string,
   canonicalPath: string,
   phantomFacts: ParsedFact[],
   dbMaxRowNum: number,
-): Map<number, number> {
-  if (phantomFacts.length === 0) return new Map<number, number>();
-  const { body: newBody, renumber } = mergePhantomFenceRows(fs.readFileSync(canonicalPath, 'utf-8'), phantomFacts, dbMaxRowNum);
-  if (newBody === null) return renumber;
+): Promise<{ renumber: Map<number, number> } | { held: string }> {
+  if (phantomFacts.length === 0) return { renumber: new Map<number, number>() };
+  await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
+  const bytes = fs.readFileSync(canonicalPath, 'utf-8');
+  const { body: newBody, renumber } = mergePhantomFenceRows(bytes, phantomFacts, dbMaxRowNum);
+  const stored = await readStoredBody(engine, sourceId, canonical);
+  if (stored && !fileBodyMatchesStored(bytes, canonical, stored)) return { held: canonicalDriftToken(canonical, phantomSlug, sourceId, 'before') };
+  if (newBody === null) return { renumber };
 
-  // Atomic write: .tmp first, parse-validate, rename.
   const tmpPath = `${canonicalPath}.tmp`;
   fs.writeFileSync(tmpPath, newBody, 'utf-8');
   const reparsed = parseFactsFence(newBody);
@@ -236,8 +275,62 @@ function appendPhantomFenceRowsToCanonical(
       `phantom-redirect: rendered fence failed re-parse: ${reparsed.warnings.join('; ')}`,
     );
   }
-  fs.renameSync(tmpPath, canonicalPath);
-  return renumber;
+  if (!stored) {
+    fs.renameSync(tmpPath, canonicalPath);
+    return { renumber };
+  }
+  const parsed = parseMarkdown(newBody, `${canonical}.md`);
+  const hash = contentHash({ title: parsed.title, type: parsed.type, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline,
+    frontmatter: parsed.frontmatter, tags: await engine.getTags(canonical, { sourceId }) });
+  const fileMoved = new Error('canonical file changed during the phantom redirect');
+  const written = await maintenanceTransaction(engine, async tx => {
+    if (!await mirrorFileBody(tx, sourceId, canonical, newBody, stored, hash)) return false;
+    if (fs.readFileSync(canonicalPath, 'utf-8') !== bytes) throw fileMoved;
+    fs.renameSync(tmpPath, canonicalPath);
+    return true;
+  }).catch(err => { if (err === fileMoved) return false; throw err; });
+  if (written) return { renumber };
+  fs.rmSync(tmpPath, { force: true });
+  return { held: canonicalDriftToken(canonical, phantomSlug, sourceId, 'during') };
+}
+
+/**
+ * #6982, write-through off: the database is the copy of record, so the
+ * phantom's rows merge into the canonical's database body under a row lock,
+ * keeping the prior body in page_versions; no file is read or written. A body
+ * that moved since it was read holds the phantom.
+ */
+async function mergeIntoCanonicalBody(
+  engine: BrainEngine,
+  canonical: Page | null,
+  sourceId: string,
+  phantomFacts: ParsedFact[],
+  dbMaxRowNum: number,
+): Promise<{ renumber: Map<number, number> } | { held: string }> {
+  const expected = canonical && await readStoredBody(engine, sourceId, canonical.slug);
+  if (!canonical || !expected) throw new Error('canonical page is gone');
+  const { body, renumber } = mergePhantomFenceRows(expected.compiled_truth ?? '', phantomFacts, dbMaxRowNum);
+  if (body === null) return { renumber };
+  const written = await maintenanceTransaction(engine, tx =>
+    replaceStoredBody(tx, sourceId, canonical.slug, { compiled_truth: body, timeline: expected.timeline ?? '' }, expected));
+  return written ? { renumber } : { held: fileDatabaseDriftToken(canonical.slug, sourceId, 'during', 'the phantom was not redirected; the next cycle retries', 'the phantom redirect') };
+}
+
+/** #6982: the hold entry for a phantom whose canonical file and database body differ (or moved during the redirect). */
+function canonicalDriftToken(canonical: string, phantomSlug: string, sourceId: string, when: 'before' | 'during'): string {
+  return fileDatabaseDriftToken(canonical, sourceId, when, `the phantom ${phantomSlug} was not redirected`, 'the phantom redirect');
+}
+
+/** #6982: the hold entry for a phantom whose own file holds content its database row lacks (or changed before the unlink). */
+function phantomFileDriftToken(phantomSlug: string, sourceId: string, when: 'before' | 'during'): string {
+  return fileDatabaseDriftToken(phantomSlug, sourceId, when, when === 'before' ? 'the phantom was not redirected'
+    : 'the redirect moved its rows to the canonical page but kept the file, which sync imports again as a page until the user deletes it', 'the phantom redirect');
+}
+
+/** A phantom left in place by a `file_database_drift` hold: audited as drift and reported by the pass. */
+function driftHold(phantomSlug: string, sourceId: string, canonical: string, held: string): RedirectResult {
+  logPhantomEvent({ phantom_slug: phantomSlug, outcome: 'drift', source_id: sourceId, reason: held.slice(0, 200) });
+  return { outcome: 'drift', canonical, held };
 }
 
 /**
@@ -554,56 +647,44 @@ export async function tryRedirectPhantom(
   }
 
   // ─── Commit phase (codex #3/#4/#6/#7) ─────────────────────────────
-  // The canonical file is the page's file of record (recorded source_path,
-  // own-local_path roots), resolved like every other fence writer. Only a
-  // brain with no configured root falls back to the pass's brainDir.
-  const writeTarget = await resolvePageWriteTarget(engine, canonical, sourceId);
-  if (!writeTarget.ok && writeTarget.skipped !== 'no_repo_configured') {
-    logPhantomEvent({
-      phantom_slug: page.slug,
-      outcome: 'drift',
-      source_id: sourceId,
-      reason: `canonical write target unavailable: ${writeTarget.skipped}`,
-    });
-    return { outcome: 'drift', canonical };
-  }
-  const canonicalPath = writeTarget.ok ? writeTarget.filePath : path.join(brainDir, `${canonical}.md`);
-  await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
+  // #6982: with write-through off the database is the copy of record, so the
+  // rows merge into the canonical's database body and no file is written or
+  // removed. Otherwise the phantom's file goes only when it holds nothing its
+  // row lacks, and the canonical file takes the rows only when it agrees with
+  // the canonical's database body.
+  const writeThroughOff = await isWriteThroughDisabled(engine);
+  const phantomPath = path.join(brainDir, `${page.slug}.md`);
+  const phantomFile = writeThroughOff ? null : await replaceableFile(engine, sourceId, page.slug, phantomPath);
+  if (phantomFile && !phantomFile.ok) return driftHold(page.slug, sourceId, canonical, phantomFileDriftToken(page.slug, sourceId, 'before'));
 
-  // Disk-side first: parse phantom's fence and append to canonical's
-  // disk fence (dedup-guarded). If this throws, no DB state has moved
-  // and the cycle can retry next run.
+  const target = await engine.getPage(canonical, { sourceId });
+  if (target) assertInlineBody(target, 'phantom redirect');
   const phantomFence = parseFactsFence(page.compiled_truth ?? '');
   const [dbMax] = await engine.executeRaw<{ n: number | string | null }>(
     'SELECT MAX(row_num) AS n FROM facts WHERE source_id = $1 AND source_markdown_slug = $2',
     [sourceId, canonical],
   );
-  const rowMap = appendPhantomFenceRowsToCanonical(canonicalPath, phantomFence.facts, Number(dbMax?.n ?? 0));
-
-  // Codex #7: refresh canonical's compiled_truth + content_hash so the
-  // next `gbrain sync` sees the canonical as unchanged. We re-parse the
-  // disk body and recompute the hash with the SHARED canonical helper
-  // (`utils.ts:contentHash` — the #3694 single formula: ephemeral
-  // frontmatter keys stripped, tags-key deleted, timeline||''), so the
-  // idempotency check round-trips byte-for-byte.
-  const newCanonicalBody = fs.readFileSync(canonicalPath, 'utf-8');
-  const reparsed = parseMarkdown(newCanonicalBody, `${canonical}.md`);
-  const canonicalTags = await engine.getTags(canonical, { sourceId });
-  const newContentHash = contentHash({
-    title: reparsed.title,
-    type: reparsed.type,
-    compiled_truth: reparsed.compiled_truth,
-    timeline: reparsed.timeline,
-    frontmatter: reparsed.frontmatter,
-    tags: canonicalTags,
-  });
-  await maintenanceTransaction(engine, tx => tx.refreshPageBody(
-    canonical,
-    sourceId,
-    reparsed.compiled_truth,
-    reparsed.timeline,
-    newContentHash,
-  ));
+  let merged: Awaited<ReturnType<typeof mergeIntoCanonicalFile>>;
+  if (writeThroughOff) merged = await mergeIntoCanonicalBody(engine, target, sourceId, phantomFence.facts, Number(dbMax?.n ?? 0));
+  else {
+    // The canonical file is the page's file of record (recorded source_path,
+    // own-local_path roots), resolved like every other fence writer. Only a
+    // brain with no configured root falls back to the pass's brainDir.
+    const writeTarget = await resolvePageWriteTarget(engine, canonical, sourceId);
+    if (!writeTarget.ok && writeTarget.skipped !== 'no_repo_configured') {
+      logPhantomEvent({
+        phantom_slug: page.slug,
+        outcome: 'drift',
+        source_id: sourceId,
+        reason: `canonical write target unavailable: ${writeTarget.skipped}`,
+      });
+      return { outcome: 'drift', canonical };
+    }
+    const canonicalPath = writeTarget.ok ? writeTarget.filePath : path.join(brainDir, `${canonical}.md`);
+    merged = await mergeIntoCanonicalFile(engine, page.slug, canonical, sourceId, canonicalPath, phantomFence.facts, Number(dbMax?.n ?? 0));
+  }
+  if ('held' in merged) return driftHold(page.slug, sourceId, canonical, merged.held);
+  const rowMap = merged.renumber;
 
   // Withdrawals are scoped to the entity; the phantom was the canonical
   // entity. Moved first, so the withdrawal trigger honors them as the
@@ -617,22 +698,28 @@ export async function tryRedirectPhantom(
 
   // Round 19/20: soft-delete + unlink. Order matters — softDelete first
   // so a concurrent sync that observes the phantom .md gone treats it as
-  // a normal deletion (not a regression).
+  // a normal deletion (not a regression). The file is re-read right before
+  // the unlink: one that changed since it was compared is kept and reported.
   await maintenanceTransaction(engine, tx => tx.softDeletePage(page.slug, { sourceId }));
-  const phantomPath = path.join(brainDir, `${page.slug}.md`);
-  if (fs.existsSync(phantomPath)) {
-    try {
-      fs.unlinkSync(phantomPath);
-    } catch (err) {
-      // ENOENT is fine (someone else got there first). Anything else
-      // is logged but doesn't unwind the redirect — the next sync will
-      // notice the dangling .md and soft-delete-on-disk-miss it.
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT') {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(
-          `[gbrain] phantom-redirect: unlink ${phantomPath} failed (${msg}); cycle continues\n`,
-        );
+  let held: string | undefined;
+  if (phantomFile && fs.existsSync(phantomPath)) {
+    let current: string | null = null;
+    try { current = fs.readFileSync(phantomPath, 'utf-8'); } catch { /* vanished: nothing to remove */ }
+    if (current !== null && current !== phantomFile.expectedFileBytes) held = phantomFileDriftToken(page.slug, sourceId, 'during');
+    else if (current !== null) {
+      try {
+        fs.unlinkSync(phantomPath);
+      } catch (err) {
+        // ENOENT is fine (someone else got there first). Anything else
+        // is logged but doesn't unwind the redirect — the next sync will
+        // notice the dangling .md and soft-delete-on-disk-miss it.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `[gbrain] phantom-redirect: unlink ${phantomPath} failed (${msg}); cycle continues\n`,
+          );
+        }
       }
     }
   }
@@ -644,7 +731,7 @@ export async function tryRedirectPhantom(
     fact_count: migrated,
     source_id: sourceId,
   });
-  return { outcome: 'redirected', canonical };
+  return { outcome: 'redirected', canonical, ...(held ? { held } : {}) };
 }
 
 /**
@@ -659,6 +746,7 @@ export async function runPhantomRedirectPass(
   sourceId: string,
   dryRun: boolean,
   signal?: AbortSignal,
+  holdSlugs: ReadonlySet<string> = new Set(),
 ): Promise<PhantomPassResult> {
   const result = emptyPhantomPassResult();
   const limitRaw = process.env.GBRAIN_PHANTOM_REDIRECT_LIMIT;
@@ -682,41 +770,63 @@ export async function runPhantomRedirectPass(
   try {
     // Find unprefixed phantoms in this source. We over-fetch by 1 so
     // `more_pending` reflects whether the cap actually clipped work.
+    // #6650: held phantoms are excluded before the cap, so they never use up
+    // the pass's candidate positions. GBRA-130 A-24: a root page that is not a
+    // phantom stays live, so the pass resumes after the last slug the previous
+    // pass examined and wraps at the end; otherwise 50+ root notes would fill
+    // the window every run and a phantom sorting after them would never be seen.
+    const held = [...holdSlugs].filter(slug => !slug.includes('/'));
+    result.held_legacy_rows = held.length;
+    const after = await rotationAfter(engine, PHANTOM_REDIRECT_CURSOR_OP, sourceId) ?? '';
     const rows = await engine.executeRaw<{ slug: string }>(
       `SELECT slug FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
          AND slug NOT LIKE '%/%'
+         AND slug <> ALL($3::text[])
+         AND slug > $4
        ORDER BY slug ASC
        LIMIT $2`,
-      [sourceId, limit + 1],
+      [sourceId, limit + 1, held, after],
     );
     result.more_pending = rows.length > limit;
 
     const touchedSet = new Set<string>();
+    const run = new ItemRun('extract_facts.phantom_redirect');
+    let examined: string | null = null;
     for (let i = 0; i < Math.min(rows.length, limit); i++) {
       // #1972: bail between phantoms on abort (each is independently committed).
       if (isAborted(signal)) break;
       const slug = rows[i].slug;
       const page = await engine.getPage(slug, { sourceId });
+      examined = slug;
       if (!page) continue;
       result.scanned += 1;
 
       let redirectResult: RedirectResult;
       try {
         redirectResult = await tryRedirectPhantom(engine, page, sourceId, brainDir, dryRun);
+        run.succeed();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[gbrain] phantom-redirect: ${slug} failed (${msg}); skipping\n`);
+        const { failure, systemic } = run.record(slug, err);
+        process.stderr.write(`[gbrain] phantom-redirect: ${slug} failed (${failure.code}: ${failure.message}); skipping\n`);
         logPhantomEvent({
           phantom_slug: slug,
           outcome: 'drift',
           source_id: sourceId,
-          reason: `exception: ${msg.slice(0, 200)}`,
+          reason: `exception: ${failure.message.slice(0, 200)}`,
         });
+        result.failures.push({ key: slug, code: failure.code, message: failure.message,
+          fix: { argv: ['gbrain', 'dream', '--phase', 'extract_facts', '--source', sourceId], consent: [], actor: 'agent', requires_exclusive: false,
+            why: `Reruns the facts phase for ${sourceId}; the phantom pass retries ${slug} after its cursor wraps.` } });
+        if (systemic) {
+          result.stopped = { code: 'item_failures_systemic', message: systemic.message };
+          break;
+        }
         redirectResult = { outcome: 'drift' };
       }
 
+      if (redirectResult.held) result.held.push(redirectResult.held);
       switch (redirectResult.outcome) {
         case 'redirected':
           result.redirected += 1;
@@ -734,6 +844,8 @@ export async function runPhantomRedirectPass(
       }
     }
     result.touched_canonicals = Array.from(touchedSet).sort();
+    const next = !isAborted(signal) && rows.length <= limit ? '' : examined;
+    if (!dryRun && !result.stopped && next !== null && next !== after) await saveRotation(engine, PHANTOM_REDIRECT_CURSOR_OP, sourceId, next);
   } finally {
     try {
       await lock.release();

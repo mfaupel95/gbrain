@@ -12,9 +12,9 @@ import { installFixtureChunks } from './helpers/page-projection.ts';
  *
  * Two layers tested here:
  *   1. The detection primitive itself (`countChunklessPagesWithContent` /
- *      `listChunklessPagesWithContent`) — including that quarantined and
- *      `embed_skip` pages are excluded, since BOTH are intentionally
- *      chunkless by design (content-quality gate), not drift to repair.
+ *      `listChunklessPagesWithContent`) — including that quarantined pages
+ *      are excluded (chunkless by design) while a chunkless `embed_skip` page
+ *      with a body is included (#7174: writes keep its chunks since #6722).
  *   2. The end-to-end `embed --stale` wiring — a chunkless page gets
  *      chunked AND embedded in the SAME pass, while pre-existing stale
  *      chunks and intentionally-chunkless pages are unaffected.
@@ -123,7 +123,7 @@ describe('countChunklessPagesWithContent / listChunklessPagesWithContent', () =>
     expect(await engine.countChunklessPagesWithContent()).toBe(0);
   });
 
-  test('excludes embed_skip pages (intentionally chunkless by design)', async () => {
+  test('includes a chunkless embed_skip page with a body (#7174: keyword search cannot see it)', async () => {
     await engine.putPage('oversized/page', {
       type: 'note',
       title: 'Oversized',
@@ -131,7 +131,8 @@ describe('countChunklessPagesWithContent / listChunklessPagesWithContent', () =>
       frontmatter: { [EMBED_SKIP_KEY]: buildEmbedSkipMarker(1000) },
     });
 
-    expect(await engine.countChunklessPagesWithContent()).toBe(0);
+    expect(await engine.countChunklessPagesWithContent()).toBe(1);
+    expect((await engine.listChunklessPagesWithContent()).map(page => page.slug)).toEqual(['oversized/page']);
   });
 
 });
@@ -213,7 +214,7 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
     expect(after.page.text_projection_revision).toBe(after.revision);
   });
 
-  test('quarantined and embed_skip pages stay chunkless — the safety net does not touch them', async () => {
+  test('a quarantined page stays chunkless; a chunkless embed_skip page is chunked for keyword search and gets no vector (#7174)', async () => {
     await engine.putPage('junk/quarantined', {
       type: 'note',
       title: 'Junk',
@@ -229,9 +230,12 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
 
     const result = await runEmbedCore(engine, { stale: true, quiet: true });
 
-    expect(result.chunkless_pages_healed).toBe(0);
+    expect(result.chunkless_pages_healed).toBe(1);
     expect(await engine.getChunks('junk/quarantined')).toEqual([]);
-    expect(await engine.getChunks('oversized/skipped')).toEqual([]);
+    const [skipped] = await engine.executeRaw<{ chunks: number; vectors: number }>(`SELECT count(*)::int AS chunks, count(cc.embedding)::int AS vectors
+      FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = 'oversized/skipped'`);
+    expect(skipped).toEqual({ chunks: 1, vectors: 0 });
+    expect((await engine.searchKeyword('x'.repeat(1000), { limit: 5 })).map(hit => hit.slug)).toContain('oversized/skipped');
   });
 
   test('dry-run reports the would-be-healed count without writing any chunks', async () => {
@@ -323,9 +327,9 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
             })));
             const newer = (await readProjectionSnapshot(engine, slug, 'default'))!;
             const vector = new Float32Array(DIMS); vector[0] = 0.75;
-            expect(await installPageEmbeddings(engine, newer, newer.chunks.map(c => ({
+            expect((await installPageEmbeddings(engine, newer, newer.chunks.map(c => ({
               chunk_index: c.chunk_index, chunk_source: c.chunk_source, chunk_text: c.chunk_text, embedding: vector,
-            })))).toBe(true);
+            })))).complete).toBe(true);
             current = await engine.getChunks(slug, { includeEmbedding: true });
           }
           return result;

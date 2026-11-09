@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.60.160.0 -->
+<!-- gbrain-runbook-stamp: 0.60.625.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -43,7 +43,7 @@ read it and relay it to the human in plain language. Never work around a refusal
 ⛔ **VERIFY BEFORE CLAIMING DONE.** The install is done when `gbrain bootstrap
 verify` exits 0 — not when the transcript looks good. Paste its report to the human.
 
-⛔ **RESPECT THE TOOLCHAIN TRUST RULES.** GBrain needs Bun 1.4.0 or newer (`bun upgrade`
+⛔ **RESPECT THE TOOLCHAIN TRUST RULES.** GBrain needs Bun 1.4.4 or newer (`bun upgrade`
 updates an older Bun). Install bun via a platform package manager
 when available (`brew install oven-sh/bun/bun`); the only permitted fallback is the
 checksum-verified variant: download the pinned release to a file, verify it against
@@ -51,7 +51,7 @@ that release's SHASUMS256.txt, and only then execute. Install gh the same way �
 platform package manager first (`brew install gh`, `apt install gh`, `dnf install gh`,
 `winget install GitHub.cli` per the official instructions); never a piped
 curl-to-shell one-liner. Install gbrain ONLY as
-`bun install -g github:garrytan/gbrain#latest-stable` — the npm package named
+`bun install -g github:garrytan/gbrain#stable` — the npm package named
 "gbrain" is an unrelated project. (Cloud-sandbox exception: bun's package fetching
 is proxy-incompatible there — use the `gbrain bootstrap cloud-setup-script` recipe,
 which installs from the same pinned GitHub source through npm.)
@@ -190,6 +190,35 @@ registration only with `--mcp-even-if-plugin`.
    block below it — the ownership line and the cold-start offer are the two
    things the human must actually understand, not fine print.
 
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
+
 ## Machine two
 
 If this workspace was cloned from an existing agent repo (agent.json says
@@ -213,7 +242,7 @@ placeholder). Trust the CLI's detection over your own guesses.
   only repos attached to the session** — a repo created mid-session is NOT
   attached, so `gbrain bootstrap repo` refuses fast in cloud with the flow
   that works. Privacy verification falls back to pure git protocol on its own.
-- **`git push` works only against the session's working branch.** A user PAT
+- **`git push` works only against the session's working branch.** A user PAT <!-- gbrain-allow-shared-tree-git: describes the cloud sandbox's push limit, not a command to run -->
   does not bypass any of this.
 - **Only repo-committed files carry into the next session.** `~/.gbrain`,
   `~/.claude`, and the gitignored `.claude/settings.local.json` evaporate.
@@ -248,6 +277,7 @@ placeholder). Trust the CLI's detection over your own guesses.
 | Hook reports "brain context unavailable" | serve not running or degraded | `gbrain doctor` names it; hooks fail open by design. | agent | none | `gbrain doctor --only bootstrap_hooks_heartbeat --json` |
 | gh answers 403 "not enabled for this session" | Cloud proxy scoping — the repo is not attached to the session | Expected in cloud; the visibility ladder falls back to git protocol. NEVER shim gh. | agent (nothing to fix) | none | none needed |
 | "crontab: command not found" / cron skipped | Containers and cloud sandboxes ship without a scheduler | Expected; event-driven pushes cover it — the skip message says exactly this. | agent (nothing to fix) | none | none needed |
+| A scheduled job, workspace script or hook finds nothing in the brain, or refuses `refresh_not_owner`, while the same command works in the session | The job runs with another `HOME`, so it reads another gbrain home (no database, or a second host identity) | Call gbrain from every job through one wrapper that sets `GBRAIN_HOME` (never `HOME`) and keeps stderr ([the wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended)). | agent | none | the job's log shows results and no refusal |
 | A turn shows "workspace push is FAILING" | The background push is refusing (visibility, secret-scan, or network reasons) | Run `gbrain doctor`; the banner repeats every 30 min until fixed. | agent | none | `gbrain doctor --only bootstrap_push_health --json` |
 
 ## Hand off

@@ -5,8 +5,12 @@
  * Agent operator contract v1 table (docs/guides/exit-codes.md):
  *   0 ok · 1 failed (class/retryable in JSON) · 2 usage / invalid input ·
  *   3 confirmation_required (its ONLY meaning) · 10 write pending ·
- *   11 resumable budget stop · 75 migration lock held · 124 timeout ·
- *   130 interrupted. `test/exit-codes.test.ts` enumerates every literal
+ *   11 resumable budget stop · 13 harness wired, verification pending ·
+ *   12 no results (a lookup matched nothing; opt-in, GBRAIN_FAIL_ON_EMPTY=1) ·
+ *   14 harness wired, shared-skills/token cleanup pending ·
+ *   15 no edition in force on the as_of date · 16 host upgrade required ·
+ *   69 serve exited unhealthy · 75 migration
+ *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
  *   exit 3 in src/ so a new one cannot reuse it.
  */
 
@@ -43,3 +47,52 @@ export const PENDING_WRITE_EXIT_CODE = 10;
  * from 3, which agent-facing commands reserve for "ask the user first".
  */
 export const BUDGET_STOP_EXIT_CODE = 11;
+
+/**
+ * #7177, opt-in with GBRAIN_FAIL_ON_EMPTY=1: a lookup ran and matched nothing
+ * (`gbrain recall <entity|text>`, `--grep`, `--question`, `--query`;
+ * `gbrain entity <name>` with no page and no text mention). Distinct from 0 so
+ * a script that filters stdout can still tell a miss from a hit, and from 1,
+ * which means the command failed. A feed read (`--since-last-run`, `--watch`,
+ * no filter) that finds nothing new is not a miss. Off by default: a miss
+ * exits 0 and --json carries the status.
+ */
+export const NO_RESULTS_EXIT_CODE = 12;
+
+/**
+ * #6661: `gbrain bootstrap harness --token` on a PGLite brain wired every
+ * target while no serve answered (`pending_verify`): nothing failed, nothing
+ * verified yet. The JSON `fix` names the re-run that completes it once
+ * `gbrain serve --http` runs; `--status` stays partial until then.
+ */
+export const HARNESS_PENDING_VERIFY_EXIT_CODE = 13;
+
+/**
+ * #6743: `gbrain bootstrap harness` wired and verified the harness, but the
+ * cleanup of earlier shared-skills enrollments or carried token ids is still
+ * pending (`bootstrap_cleanup_pending`). The JSON lists each id's state; its
+ * `fix` re-runs the command when every id can converge, or names the owner's
+ * revoke or leave step when one cannot.
+ */
+export const HARNESS_CLEANUP_PENDING_EXIT_CODE = 14;
+
+/**
+ * #6543: `gbrain serve` exited on its own because its persistence consumer
+ * reported `restart_required` continuously for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS`
+ * (`serve_unhealthy_exit`). EX_UNAVAILABLE: a supervisor restarts it.
+ */
+export const SERVE_UNHEALTHY_EXIT_CODE = 69;
+
+/**
+ * GBRA-217: `gbrain get --as-of <date>` answered, but no edition was in force on that date (`valid_time.status` is
+ * `not_in_force`, `not_yet_in_force` or `before_recorded_history`). stdout carries the status and why, never a document,
+ * so a script cannot mistake expired or future text for the page in force. Distinct from 0 (an edition is in force) and
+ * from 1, which means the read failed.
+ */
+export const VALID_TIME_NOT_IN_FORCE_EXIT_CODE = 15;
+
+/**
+ * GBRA-217 (`host_upgrade_required`): the brain host is older than this client and answered a different question (an
+ * `as_of` read came back as the current page). Nothing was printed; upgrade the host.
+ */
+export const HOST_UPGRADE_REQUIRED_EXIT_CODE = 16;

@@ -17,9 +17,11 @@
  * Exit: `not_moving` → 1 with code `managed_sync_not_moving` (`reason:
  * movement_check`) and the writer summary; `parked` → 1 with the same code
  * and `state: parked` (after a restart nothing picked the catch-up up);
- * `held`/`within_allowance`/`moved`/`nothing_pending` → 0; `--warn-only`
- * prints the same envelopes and exits 0. A read failure keeps its own code
- * (`fix.next: report`), never `managed_sync_not_moving`. `gbrain upgrade`
+ * `held`/`within_allowance`/`moved`/`nothing_pending` → 0; `unknown` (#6781:
+ * the backlog read failed) → 1 with its own code `movement_unknown` (`reason:
+ * backlog_read_failed`); `--warn-only` prints the same envelopes and exits 0.
+ * A read failure keeps its own code (`fix.next: report`), never
+ * `managed_sync_not_moving`. `gbrain upgrade`
  * never runs this (it owns no relaunch); it prints the bare command for the
  * supervisor's step.
  */
@@ -51,12 +53,13 @@ waits the window, and judges each one from committed pages and the head's step
   --warn-only    Print the same verdicts and envelopes but exit 0 (pipelines that cannot fail).
 States: moved, within_allowance (a step or cursor advanced; a multi-wave group preparing
 normally), held (advanced only by holds; the hold kind's repair route is printed), parked
-(pending work and nothing live to move it), not_moving, nothing_pending.
-Exit 1 with code managed_sync_not_moving for not_moving and parked; 0 otherwise.
+(pending work and nothing live to move it), not_moving, nothing_pending, unknown (the
+sync backlog could not be read, so pending work is not known; never nothing_pending).
+Exit 1 with code managed_sync_not_moving for not_moving and parked, 1 with code
+movement_unknown for unknown; 0 otherwise.
 Run it after restarting serve and the workers: gbrain sources writer movement`;
 
-/** The bare command `gbrain upgrade` and `gbrain post-upgrade` print for the supervisor's step (no flags, so it inherits the default window). */
-export const MOVEMENT_SUPERVISOR_STEP = 'after restarting serve and the workers, run: gbrain sources writer movement';
+export { MOVEMENT_SUPERVISOR_STEP } from './movement-step.ts';
 
 export const MOVEMENT_DEFAULT_MIN_MS = 300_000;
 export const MOVEMENT_BUDGET_GRACE_MS = 60_000;
@@ -73,6 +76,7 @@ export function parseMovementArgs(args: string[]): MovementArgs {
     const flag = token.startsWith('-') && equal > 0 ? token.slice(0, equal) : token;
     const value = () => { const v = equal > 0 && token.startsWith('-') ? token.slice(equal + 1) : args[++i]; if (v === undefined || v.startsWith('--')) throw usage(`${flag} requires a value.`, `Give ${flag} its value right after it, as ${flag} <value>.`); return v; };
     if (!token.startsWith('-')) { if (out.sourceId !== undefined) throw usage('Specify the source once.', `Name the source either as the argument or with --source, not both (here ${out.sourceId} and ${token}).`); out.sourceId = token; }
+    else if ((flag === '--json' || flag === '--warn-only') && flag !== token && token !== '--json=true') throw usage(`${flag} is a switch and takes no value.`, `Write ${flag} on its own.`);
     else if (flag === '--json') out.json = true;
     else if (flag === '--warn-only') out.warnOnly = true;
     else if (flag === '--source') { if (out.sourceId !== undefined) throw usage('Specify the source once.', 'Name the source either as the argument or with --source, not both.'); out.sourceId = value(); }
@@ -97,8 +101,8 @@ export interface MovementReport {
   source_id: string;
   state: MovementVerdict;
   exit: 0 | 1;
-  code: 'managed_sync_not_moving' | null;
-  reason?: 'movement_check';
+  code: 'managed_sync_not_moving' | 'movement_unknown' | null;
+  reason?: 'movement_check' | 'backlog_read_failed';
   why: string;
   fix: RenderedAction | null;
   retry_after_ms?: number;
@@ -116,10 +120,15 @@ export function movementReport(before: SourceMovement | undefined, after: Source
   const verify = { argv: ['gbrain', 'sources', 'writer', 'movement', id, '--json'] };
   const head = after.head?.step ? ` The head is at step ${after.head.step}${after.head.waiting_on && after.head.waiting_on !== 'unknown' ? ` (waiting on ${after.head.waiting_on})` : ''}${after.head.owner ? `, held by ${after.head.owner.kind} pid ${after.head.owner.pid}` : ''}.` : '';
   switch (state) {
+    case 'unknown':
+      return { source_id: id, state, exit: 1, code: 'movement_unknown', reason: 'backlog_read_failed',
+        why: `${id}: the managed sync backlog could not be read (${after.unknown?.error ?? 'no detail'}), so whether sync work is pending is not known; this is not a nothing-pending verdict.`,
+        fix: renderAction({ argv: ['gbrain', 'sources', 'writer', 'movement', id, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+          why: 'Read-only: reads the backlog again. If it keeps failing, gbrain doctor --json checks the database connection.', verify }, ctx), before, after };
     case 'nothing_pending':
       return { source_id: id, state, exit: 0, code: null, why: `${id}: no managed sync is pending${after.holds.count ? ` (${after.holds.count} held file(s) await their repair)` : ''}.`, fix: null, before, after };
     case 'moved':
-      return { source_id: id, state, exit: 0, code: null, why: `${id}: a page committed at ${after.last_commit_at} inside the ${Math.round(windowMs / 1000)}s window; ${after.cursor ? `${after.cursor.remaining} remaining` : 'the cursor is done'}.`, fix: null, before, after };
+      return { source_id: id, state, exit: 0, code: null, why: `${id}: a page committed at ${after.last_commit_at} inside the ${Math.round(windowMs / 1000)}s window; ${after.cursor ? `${after.cursor.remaining} remaining` : after.pass ? `${after.pass.remaining} path(s) unsettled in the pass` : 'the cursor is done'}.`, fix: null, before, after };
     case 'within_allowance':
       return { source_id: id, state, exit: 0, code: null, retry_after_ms: windowMs,
         why: `${id}: no page committed yet, but the head's step or the cursor advanced inside the window (a multi-wave group commits nothing until its last wave).${head} Check again after one more window.`,
@@ -134,20 +143,25 @@ export function movementReport(before: SourceMovement | undefined, after: Source
         fix: renderAction({ argv: route, consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/repair.md#held-files',
           why: kinds.stalled > 0 ? `Read-only: shows the owner the stalled preparations name;${then} once the cause is fixed.` : 'Read-only preview of the repair; it prints the apply command for the user to approve.', verify }, ctx), before, after };
     }
-    case 'parked':
+    case 'parked': {
+      const work = after.cursor ?? after.pass;
       return { source_id: id, state, exit: 1, code: 'managed_sync_not_moving', reason: 'movement_check',
-        why: `${id}: the managed sync cursor is pending at ${after.cursor?.index ?? '?'}/${after.cursor?.total ?? '?'} and nothing live is moving it (no sync run holds the lock; ${after.admitted} admitted request(s), no live consumer on the owner host). After a restart this means the catch-up was not started again.`,
-        fix: renderAction({ argv: (after.cursor?.resume_command ?? `gbrain sync --source ${id} --no-pull`).split(' '), consent: [], actor: 'agent', requires_exclusive: false,
-          why: 'Resumes the managed catch-up where its cursor stopped; the same command is safe to rerun in a loop.', verify }, ctx), before, after };
+        why: `${id}: the managed sync ${after.cursor ? 'cursor' : 'pass'} is pending at ${work?.index ?? '?'}/${work?.total ?? '?'} and nothing live is moving it (no sync run holds the lock; ${after.admitted} admitted request(s), no live consumer on the owner host). After a restart this means the catch-up was not started again.`,
+        fix: renderAction({ argv: ['gbrain', 'sync', ...(work?.resume_args ?? ['--source', id, '--no-pull'])], consent: [], actor: 'agent', requires_exclusive: false,
+          why: `Resumes the managed catch-up ${after.cursor ? 'where its cursor stopped' : 'with a plain sync that reconciles the checkout'}; the same command is safe to rerun in a loop.`, verify }, ctx), before, after };
+    }
     case 'not_moving':
+      if (after.pass?.stuck) return { source_id: id, state, exit: 1, code: 'managed_sync_not_moving', reason: 'movement_check',
+        why: `${id}: every managed sync pass since ${after.pass.stuck_since} stopped ${after.pass.stuck}${after.pass.stop_reason ? ` (${after.pass.stop_reason})` : ''} with ${after.pass.remaining} path(s) unsettled, so the source does not converge even when pages commit.`,
+        fix: renderAction({ ...readFix('Read-only: the convergence of the source, the reason its passes stop and the next step.', { argv: ['gbrain', 'sync', 'status', '--source', id, '--json'] }), verify }, ctx), before, after };
       return { source_id: id, state, exit: 1, code: 'managed_sync_not_moving', reason: 'movement_check',
-        why: `${id}: ${after.cursor ? `${after.cursor.remaining} entries pending, ` : ''}no page committed and no step advance inside the ${Math.round(windowMs / 1000)}s window while ${after.live.drain ? `a sync (pid ${after.live.drain_pid}) holds the lock` : 'a consumer is live'}; last progress ${after.last_progress_at ?? 'unknown'}.${head}`,
+        why: `${id}: ${after.cursor ? `${after.cursor.remaining} entries pending, ` : ''}no page committed and no step advance inside the ${Math.round(windowMs / 1000)}s window while ${after.live.drain ? after.live.drain_job_id !== null && after.live.drain_pid === null ? `sync job #${after.live.drain_job_id} is draining it` : `a sync (pid ${after.live.drain_pid}) holds the lock` : 'a consumer is live'}; last progress ${after.last_progress_at ?? 'unknown'}.${head}`,
         fix: renderAction({ ...status, verify }, ctx), before, after };
   }
 }
 
 export function formatMovementReport(r: MovementReport): string[] {
-  const lines = [`${r.state === 'not_moving' || r.state === 'parked' ? '✗' : '✓'} ${r.source_id}: ${r.state}${r.code ? ` [${r.code}${r.reason ? `/${r.reason}` : ''}]` : ''}`, `  ${r.why}`];
+  const lines = [`${r.exit !== 0 ? '✗' : '✓'} ${r.source_id}: ${r.state}${r.code ? ` [${r.code}${r.reason ? `/${r.reason}` : ''}]` : ''}`, `  ${r.why}`];
   if (r.fix?.command) lines.push(`  Next: ${r.fix.command}${r.retry_after_ms ? ` (after ${Math.round(r.retry_after_ms / 1000)}s)` : ''}${r.fix.next === 'tell_user_to_run' ? ' (the host operator runs it)' : ''}`);
   return lines;
 }
@@ -220,8 +234,11 @@ export async function runMovementCheck(engine: BrainEngine, opts: { sourceId?: s
   }
   const sources = after.map(m => movementReport(byId.get(m.source_id), m, window.window_ms));
   const failing = sources.find(r => r.exit !== 0);
-  const error = failing ? toAgentError(opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next step; verify with gbrain sources writer movement ${failing.source_id}.`,
-    { reason: failing.reason, fix: readFix('Read-only: the request at the head, its step, wait cause, owner and next action.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', failing.source_id, '--json'] }) }),
-  { transport: 'cli', command: 'sources writer movement', render: cliRenderContext() }) : undefined;
+  const error = !failing ? undefined : toAgentError(failing.code === 'movement_unknown'
+    ? opError('movement_unknown', failing.why, `Rerun gbrain sources writer movement ${failing.source_id}; if the backlog read keeps failing, run gbrain doctor --json.`,
+      { reason: failing.reason, fix: readFix('Read-only: reads the managed sync backlog again.', { argv: ['gbrain', 'sources', 'writer', 'movement', failing.source_id, '--json'] }) })
+    : opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next step; verify with gbrain sources writer movement ${failing.source_id}.`,
+      { reason: failing.reason, fix: readFix('Read-only: the request at the head, its step, wait cause, owner and next action.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', failing.source_id, '--json'] }) }),
+  { transport: 'cli', command: 'sources writer movement', render: cliRenderContext() });
   return { schema_version: 1, window_ms: window.window_ms, budget_ms: window.budget_ms, window_source: window.source, waited_ms: waited, sources, exit_code: failing ? 1 : 0, ...(error ? { error } : {}) };
 }

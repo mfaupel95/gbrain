@@ -24,6 +24,7 @@
     "reindex",
     "repair-jsonb",
     "orphans",
+    "doctor-refresh",
     "integrity",
     "purge",
     "synthesize",

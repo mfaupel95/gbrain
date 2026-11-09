@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from '../spawn.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { hostOnlyError, readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
@@ -23,6 +23,7 @@ import type { Page } from '../types.ts';
 import { slugifyPath } from '../sync.ts';
 import { assertPackagedSkillSource } from './setup-source-policy.ts';
 import { approvedSchemaIdentity, loadActivePackForEngine, type ApprovedSchemaIdentity } from '../schema-pack/engine-resolution.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 export interface DatabaseContentExportOptions {
   root: string;
@@ -184,7 +185,7 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
   if (!options.dryRun && options.confirmQuiesced && ((await ctx.engine.executeRaw(
     'SELECT id FROM gbrain_cycle_locks WHERE $1::uuid IS NULL OR acquisition_token IS DISTINCT FROM $1::uuid LIMIT 1',
     [options.ownLeaseToken ?? null])).length ||
-    (await ctx.engine.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length)) {
+    (await ctx.engine.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length)) {
     throw opError('writer_not_quiesced', 'Active maintenance locks or durable writes remain; finish or recover them before exporting.',
       `Stop memory and file writers and old skill servers, let queued or recovering writes settle (the command in fix shows them for source ${options.sourceId}), then run the export again with --confirm-quiesced. Nothing was exported.`,
       { fix: readFix(`Shows source ${options.sourceId}'s writer, queued requests and pending recovery.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', options.sourceId, '--json'] }) });
@@ -257,7 +258,7 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
         privateWrite(target, content);
       }
       verifyFiles(receipt.staging_root, hashes, true);
-      const enclosing = spawnSync('git', ['-C', receipt.staging_root, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 15_000 });
+      const enclosing = spawnSync('git', ['-C', receipt.staging_root, 'rev-parse', '--show-toplevel'], { env: gitChildEnv(), encoding: 'utf8', timeout: 15_000 });
       if (enclosing.status === 0) {
         throw opError('local_conflict', 'The export would claim an enclosing Git worktree. Choose a destination outside existing repositories.',
           `${root} lies inside an existing Git worktree; pass --content-root a path outside any repository.`);

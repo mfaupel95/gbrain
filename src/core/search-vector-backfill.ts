@@ -83,7 +83,8 @@ export async function backfillChunkVectors(engine: BrainEngine, opts: VectorBack
 
 /**
  * #6374: page vectors rebuilt with the seal's own expression. The pages
- * trigger fires only on `UPDATE OF title,timeline` and indexes the RAW
+ * trigger fires only on `UPDATE OF title,timeline` (and a segmented page's
+ * timeline_lead) and indexes the RAW
  * timeline, so neither an UPDATE-to-self nor re-firing it is right. Each batch
  * reads its rows through an UPDATE-to-self (row locks held for that statement
  * only, never across the TypeScript sanitize), sanitizes the timeline exactly

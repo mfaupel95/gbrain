@@ -63,7 +63,7 @@ function Postgres(a, b) {
       , full = Queue()
       , queues = { connecting, reserved, closed, ended, open, busy, full }
 
-  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
 
   const sql = Sql(handler)
 
@@ -86,6 +86,8 @@ function Postgres(a, b) {
         ended: ended.length,
         queued: queries.length,
         inflight_oldest_ms: connections.reduce((age, c) => c.inflightSince ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
+        // GBrain (#6543 A4): the oldest head statement past its own budget (the cap the driver retires it at), 0 when none is.
+        inflight_over_budget_ms: connections.reduce((age, c) => c.inflightSince && c.inflightCap && now - c.inflightSince > c.inflightCap ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
         completed: options.shared.completed
       }
     }
@@ -227,7 +229,7 @@ function Postgres(a, b) {
 
   function own(c) {
     const queue = Queue()
-    let busy = false, fence = null, holding = null, releasing = false
+    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
     const reservation = c.reserved = (ended = false) => {
       if (c.reserved !== reservation)
         return
@@ -251,7 +253,7 @@ function Postgres(a, b) {
       }
     }
     reservation.enqueue = q => {
-      if (c.reserved !== reservation || releasing)
+      if (c.reserved !== reservation || releasing || discarding)
         return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
       queue.push(q)
       pump()
@@ -267,6 +269,52 @@ function Postgres(a, b) {
       reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
       c.terminate()
     }
+    // A Terminate message on the busy socket cannot interrupt its current
+    // statement. Preserve the fenced Query/canceller until CancelRequest and
+    // the query's backend response settle; never let a later query use it.
+    // The bounded fallback still discards, but rejects as unconfirmed.
+    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
+      if (discardPromise)
+        return discardPromise
+      if (c.reserved !== reservation)
+        return Promise.resolve()
+      discarding = true
+      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
+      const q = fence || holding
+      if (!q) {
+        // A busy, unfenced query has no retained canceller/settlement proof.
+        // Retire the socket but never report that as confirmed server stop.
+        const unconfirmed = busy
+        reservation.discard()
+        return discardPromise = unconfirmed
+          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
+          : Promise.resolve()
+      }
+      let timer
+      let cancelling
+      try {
+        cancelling = q.cancel()
+      } catch (error) {
+        reservation.discard()
+        return discardPromise = Promise.reject(error)
+      }
+      discardPromise = Promise.race([
+        Promise.all([
+          cancelling,
+          Promise.prototype.then.call(q, () => {}, error => {
+            if (!error || error.code !== '57014')
+              throw error
+          })
+        ]),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
+        })
+      ]).then(() => {}).finally(() => {
+        clearTimeout(timer)
+        reservation.discard()
+      })
+      return discardPromise
+    }
     reservation.releaseConnection = () => {
       if (c.reserved !== reservation)
         return
@@ -276,7 +324,7 @@ function Postgres(a, b) {
     return reservation
 
     function pump() {
-      if (c.reserved !== reservation || holding || fence)
+      if (c.reserved !== reservation || discarding || holding || fence)
         return
       while (queue.length) {
         const q = queue.peek()
@@ -347,24 +395,69 @@ function Postgres(a, b) {
       const sql = Sql(reservation.enqueue)
       sql.release = reservation.releaseConnection
       sql.discard = reservation.discard
+      sql.cancelAndDiscard = reservation.cancelAndDiscard
       return sql
     }
   }
 
   async function begin(options, fn) {
     !fn && (fn = options, options = '')
+    // GBrain (#6930): `{ first }` opts one transaction in to sending its first statement right behind BEGIN, before
+    // BEGIN's answer, on a pool that pipelines inside transactions (transaction_pipeline). Only that one statement, and
+    // only when `first(text)` accepts its text: if BEGIN fails it runs in autocommit, so the caller's test must accept
+    // nothing but a read or a transaction-local set_config (a no-op outside a transaction), never a write. Every
+    // other statement, the first one too when the test refuses it, waits for BEGIN's answer as before, and a failed
+    // BEGIN rejects them unsent. The transaction still settles only after `fn` does.
+    const first = typeof options === 'object' && options.first && sql.options.transaction_pipeline > sql.options.max_pipeline
+      ? options.first
+      : null
+    // GBrain (GBRA-156): `{ early }` sends every statement it accepts, in order, behind BEGIN before BEGIN's answer,
+    // on any pool that pipelines inside a transaction (a pipelining pool, or transaction_pipeline behind a pooler that
+    // does not). The first statement it refuses, and every later one, waits for the answer. If BEGIN fails the accepted
+    // statements run in autocommit, so `early` must accept only reads and transaction-local set_config, never a write.
+    const early = typeof options === 'object' && options.early
+      && (sql.options.transaction_pipeline > sql.options.max_pipeline || sql.options.max_pipeline > 0)
+      ? options.early
+      : null
+    typeof options === 'object' && (options = options.mode || '')
     let savepoints = 0
       , connection
       , prepare = null
+      , opening = null
+      , firstSeen = false
+      , held = false
+      , written
 
     try {
-      await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
-      return await Promise.race([
-        scope(connection, fn),
-        new Promise((_, reject) => connection.onclose = reject)
-      ])
+      const begun = sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+      if (!first && !early) {
+        await begun
+        return await raceClose(scope(connection, fn))
+      }
+      await Promise.race([new Promise(resolve => written = resolve), begun])
+      opening = begun.then(() => { opening = null })
+      opening.catch(() => { /* each held statement rejects with BEGIN's error */ })
+      const ran = raceClose(scope(connection, fn))
+      const [opened, result] = await Promise.allSettled([begun, ran])
+      if (opened.status === 'rejected')
+        throw opened.reason
+      if (result.status === 'rejected')
+        throw result.reason
+      return result.value
     } catch (error) {
       throw error
+    }
+
+    // GBrain (#7358): the close handler leaves the connection when the transaction settles; left in place, it kept the
+    // transaction's result reachable from the pooled connection until its next transaction.
+    async function raceClose(ran) {
+      const c = connection
+      let onclose
+      try {
+        return await Promise.race([ran, new Promise((_, reject) => c.onclose = onclose = reject)])
+      } finally {
+        c.onclose === onclose && (c.onclose = null)
+      }
     }
 
     async function scope(c, fn, name) {
@@ -375,6 +468,7 @@ function Postgres(a, b) {
       sql.savepoint = savepoint
       sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
       sql.discard = reservation.discard
+      sql.cancelAndDiscard = reservation.cancelAndDiscard
       let uncaughtError
         , result
 
@@ -417,6 +511,22 @@ function Postgres(a, b) {
         q.catch(e => uncaughtError || (uncaughtError = e))
         if (!reservation || c.reserved !== reservation)
           return q.reject(Errors.generic('CONNECTION_CLOSED', 'Transaction connection is no longer owned'))
+        // GBrain (#6930, GBRA-156): while BEGIN is unanswered only accepted statements are sent (the first one for
+        // `first`; each one until one is refused for `early`); the rest wait, in order. A statement is accepted on its
+        // text (`$n` for each argument, as statementText builds it) only when every argument is a parameter value: a
+        // fragment (a query, a helper, an identifier) would carry SQL the test never saw.
+        if (opening) {
+          const strings = Array.isArray(q.strings) ? q.strings : [String(q.strings)]
+          const test = early || !firstSeen && first
+          const sent = !held && test
+            && q.args.every(x => !(x instanceof Query || x instanceof Builder || x instanceof Identifier || Array.isArray(x) && x.some(y => y instanceof Query)))
+            && test(strings.reduce((a, s, i) => a + '$' + i + s))
+          firstSeen = true
+          if (!sent) {
+            held = true
+            return opening.then(() => handler(q), q.reject)
+          }
+        }
         reservation.enqueue(q)
       }
     }
@@ -425,6 +535,7 @@ function Postgres(a, b) {
       connection = c
       move(c, reserved)
       own(c)
+      written && written()
     }
   }
 
@@ -576,6 +687,15 @@ function Postgres(a, b) {
     } catch (_) {}
   }
 
+  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
+  function ondesync(c, info) {
+    c.queue !== ended && move(c, ended)
+    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
+    try {
+      options.ondesync && options.ondesync(info)
+    } catch (_) {}
+  }
+
   function poisoned(c) {
     if (c.queue === ended)
       return
@@ -622,7 +742,7 @@ function parseOptions(a, b) {
   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
 
-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'inflight_timeout']
+  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'transaction_pipeline', 'backoff', 'keep_alive', 'inflight_timeout', 'inflight_max', 'inflight_grace']
   const defaults = {
     max             : globalThis.Cloudflare ? 3 : 10,
     ssl             : false,
@@ -631,7 +751,10 @@ function parseOptions(a, b) {
     connect_timeout : 30,
     max_lifetime    : max_lifetime,
     max_pipeline    : 100,
+    transaction_pipeline: 0,
     inflight_timeout: null,
+    inflight_max    : null,
+    inflight_grace  : null,
     backoff         : backoff,
     keep_alive      : 60,
     prepare         : true,
@@ -673,7 +796,11 @@ function parseOptions(a, b) {
     onpoisoned      : o.onpoisoned,
     onstuck         : o.onstuck,
     onbuilderror    : o.onbuilderror,
+    ondesync        : o.ondesync,
+    onrecovered     : o.onrecovered,
+    onrecoveryfailed: o.onrecoveryfailed,
     shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
+    array_types     : o.array_types || null,
     onparameter     : o.onparameter,
     socket          : o.socket,
     transform       : parseTransform(o.transform || { undefined: undefined }),

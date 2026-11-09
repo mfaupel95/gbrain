@@ -6,6 +6,7 @@ import { assertManagedFilesystemWrite } from './filesystem-guard.ts';
 import { opError } from '../ops/contract.ts';
 import type { Action } from '../agent-output.ts';
 import type { SqlEngine } from './model.ts';
+import { readManagedMode } from './ownership.ts';
 import { DEFAULT_TARGET_URL_ENV, planArgv } from './graduation-errors.ts';
 
 // Every facts-family bulk writer now publishes through the coordinator on a
@@ -52,9 +53,11 @@ function engineMigrationFix(m: EngineMigrationSide, why: string): Action {
 }
 
 /** Refuse unsupported multi-stage writers before providers, files or git change. */
-export async function assertUnmanagedCanonicalWriter(engine: SqlEngine, operation: string, opts: { migration?: EngineMigrationSide } = {}): Promise<void> {
-  const rows = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (!rows?.[0]?.enabled) return;
+export async function assertUnmanagedCanonicalWriter(engine: SqlEngine, operation: string, opts: { migration?: EngineMigrationSide; sourceId?: string } = {}): Promise<void> {
+  if (!await readManagedMode(engine)) {
+    if (opts.sourceId !== undefined) await assertNotStrictSource(engine, opts.sourceId, operation);
+    return;
+  }
   const message = `${operation} cannot mutate a managed brain through the legacy writer.`;
   const why = 'This brain is managed: every write goes through its writer coordinator, which the legacy writer bypasses.';
   if (opts.migration) {
@@ -69,24 +72,59 @@ export async function assertUnmanagedCanonicalWriter(engine: SqlEngine, operatio
       user_message: `gbrain stopped ${operation} because your brain switched to managed writes while it ran. Nothing was written; running the same command again uses the managed path.` } });
 }
 
-/** The legacy engine copier cannot transfer permanent IDs, withdrawals or ownership. */
+/**
+ * G6 (git-canonical memory): a strict source (`config.canonical = "git"`) is written only through the door, which
+ * commits each file before its row and runs in managed persistence. The legacy writer of an unmanaged brain writes the
+ * row first, so it refuses such a source instead of putting content in the database that git does not have.
+ */
+async function assertNotStrictSource(engine: SqlEngine, sourceId: string, operation: string): Promise<void> {
+  const [row] = await engine.executeRaw<{ strict: boolean }>(`SELECT COALESCE(config->>'canonical','')='git' AS strict FROM sources WHERE id=$1`, [sourceId]);
+  if (row?.strict !== true) return;
+  const why = `Source ${sourceId} is git-canonical: its pages are committed to Git before the database indexes them, and only managed persistence (the writer coordinator) does that. This brain is not managed, so ${operation} would write the database first.`;
+  throw opError('strict_requires_managed', `${operation} cannot write git-canonical source ${sourceId} on an unmanaged brain.`,
+    `Nothing was written. Ask the user whether to turn on managed persistence for this brain (the supported way to make a source git-canonical), or to remove canonical: git from source ${sourceId}.`,
+    { why, docs: 'docs/designs/GIT_CANONICAL_MEMORY.md', fix: { consent: [], actor: 'user', requires_exclusive: false, verify: DOCTOR_VERIFY, why,
+      user_message: `Source ${sourceId} is set to git-canonical, which only a managed brain can serve, so gbrain wrote nothing. Should this brain move to managed writes, or should ${sourceId} stop being git-canonical?` } });
+}
+
+/** The legacy engine copier cannot transfer permanent IDs, withdrawals, ownership or the belief ledger. */
 export async function assertLegacyEngineMigration(engine: SqlEngine, migration: EngineMigrationSide = { side: 'source', from: 'pglite', to: 'postgres' }): Promise<void> {
-  const tables = ['persistence_requests', 'fact_withdrawals', 'persistence_worktrees'] as const;
+  const tables = ['belief_events', 'persistence_requests', 'fact_withdrawals', 'persistence_worktrees'] as const;
   // Older migration sources can predate these tables. Do not interpret any
   // other database failure as an empty history.
   const present = await engine.executeRaw<{ name: string }>(
     'SELECT name FROM unnest($1::text[]) AS t(name) WHERE to_regclass(name) IS NOT NULL', [tables]);
+  const held: string[] = [];
   for (const table of tables) {
     if (!present.some(row => row.name === table)) continue;
     const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT EXISTS(SELECT 1 FROM ${table}) AS present`);
-    if (!row?.present) continue;
-    const why = `The ${migration.side === 'source' ? 'brain' : 'target datastore'} has rows in ${table}, and the engine copier cannot carry request IDs, withdrawals or canonical ownership.`;
-    throw opError('writer_coordinator_required',
-      'Engine migration cannot discard durable write history, withdrawal protection, or canonical ownership.',
-      migration.side === 'target' ? 'Choose an empty target database; the source brain is unchanged.'
-        : 'Keep this datastore; nothing changed. Ask the user how to proceed.',
-      { why, reason: 'persistence_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
+    if (row?.present) held.push(table);
   }
+  if (!held.length && migration.side === 'source') await assertNoPageHistory(engine, migration);
+  if (!held.length) return;
+  const ledger = held.includes('belief_events') ? ' The belief ledger (belief_events) is recorded history no Markdown rebuild can recover.' : '';
+  const why = `The ${migration.side === 'source' ? 'brain' : 'target datastore'} has rows in ${held.join(', ')}, and the engine copier cannot carry request IDs, withdrawals, canonical ownership or the belief ledger.${ledger}`;
+  throw opError('writer_coordinator_required',
+    'Engine migration cannot discard durable write history, withdrawal protection, canonical ownership, or the belief ledger.',
+    migration.side === 'target' ? 'Choose an empty target database; the source brain is unchanged.'
+      : 'Keep this datastore; nothing changed. Ask the user how to proceed.',
+    { why, reason: 'persistence_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
+}
+
+/**
+ * The legacy copier re-creates pages with new ids and copies no page versions, so a brain with versions would arrive
+ * without its page history. It refuses instead and names how many versions it would discard; graduation carries them.
+ */
+async function assertNoPageHistory(engine: SqlEngine, migration: EngineMigrationSide): Promise<void> {
+  const [row] = await engine.executeRaw<{ n: number | null }>(
+    "SELECT CASE WHEN to_regclass('page_versions') IS NULL THEN 0 ELSE (SELECT count(*)::int FROM page_versions) END AS n");
+  const versions = Number(row?.n ?? 0);
+  if (!versions) return;
+  const why = `The brain has ${versions} page version${versions === 1 ? '' : 's'} (the history get_versions and page-at-time reads), and the engine copier re-creates pages without them, so the copy would discard all ${versions}.`;
+  throw opError('writer_coordinator_required',
+    `Engine migration would discard ${versions} page version${versions === 1 ? '' : 's'}.`,
+    'Keep this datastore; nothing changed. Ask the user how to proceed.',
+    { why, reason: 'page_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
 }
 
 /** Legacy reinit may rename only after acquiring the stable sibling kernel lock. */

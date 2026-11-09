@@ -35,6 +35,7 @@ import { chat, type ChatOpts, type ChatResult } from './ai/gateway.ts';
 import { logSynopsisFailure, type SynopsisFailureKind } from './audit-synopsis.ts';
 import { sanitizeSynopsis } from './embedding-context.ts';
 import { resolveTierDefault } from './model-config.ts';
+import { reservationCostUsd } from './budget/reservation-cost.ts';
 import { safeSplitIndex } from './text-safe.ts';
 
 /**
@@ -92,7 +93,7 @@ export const SYNOPSIS_DOC_MAX_CHARS = (() => {
  */
 export const SYNOPSIS_PROMPT_VERSION = 1;
 
-const SYSTEM_PROMPT = [
+export const SYNOPSIS_SYSTEM_PROMPT = [
   'You generate one-sentence chunk synopses for a personal knowledge brain.',
   '',
   'Given a document (the FULL_DOCUMENT block) and a chunk from it (the CHUNK',
@@ -162,15 +163,26 @@ export type GeneratePerChunkSynopsisResult =
 export async function generatePerChunkSynopsis(
   args: GeneratePerChunkSynopsisArgs,
 ): Promise<GeneratePerChunkSynopsisResult> {
-  const userPrompt = buildUserPrompt(args.pageTitle, args.documentText, args.chunkText);
   const maxTokens = args.maxTokens ?? SYNOPSIS_MAX_TOKENS;
 
   const chatOpts: ChatOpts = {
     // #3813: key-aware tier default, not the hardcoded hash anchor above —
     // an OPENAI_API_KEY-only install must not route to Anthropic.
     model: args.model ?? resolveTierDefault('utility'),
-    system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: userPrompt }],
+    system: SYNOPSIS_SYSTEM_PROMPT,
+    // PR #6341: the title + document block is the only prefix every chunk of
+    // a page shares (the ~190-token system prompt is below every published
+    // minimum cacheable length), so it rides on its own `cache: true` block
+    // and the chunk follows in a second block. Joined with '\n' the two are
+    // byte-identical to the former single string (that is how the claude-cli
+    // adapter renders them), so SYNOPSIS_PROMPT_VERSION is unchanged.
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: buildPagePrompt(args.pageTitle, args.documentText), cache: true },
+        { type: 'text', text: buildChunkPrompt(args.chunkText) },
+      ],
+    }],
     maxTokens,
     thinking: 'off',
     abortSignal: args.abortSignal,
@@ -251,11 +263,7 @@ export async function generatePerChunkSynopsis(
   return { kind: 'success', synopsis, usage: result.usage };
 }
 
-function buildUserPrompt(
-  pageTitle: string,
-  documentText: string,
-  chunkText: string,
-): string {
+export function buildPagePrompt(pageTitle: string, documentText: string): string {
   // Tail-truncate `documentText` to `SYNOPSIS_DOC_MAX_CHARS` so small local
   // chat models don't stall on >100KB pages. Head preserved (title block,
   // frontmatter, intro paragraphs carry the document-level anchor).
@@ -271,6 +279,60 @@ function buildUserPrompt(
     '<full_document>',
     trimmedDoc,
     '</full_document>',
+  ].join('\n');
+}
+
+/** Wave B spec 8.6: the share of the page lead (the projected `truth_lead`) a segmented page's synopsis document opens with. */
+export const SEGMENT_SYNOPSIS_LEAD_BYTES = 8 * 1024;
+/** Wave B spec 8.6: the most text of one segment a segmented page's synopsis document carries around a chunk. */
+export const SEGMENT_SYNOPSIS_WINDOW_BYTES = 32 * 1024;
+const SEGMENT_SYNOPSIS_GAP = '\n\n[...]\n\n';
+
+export interface SegmentSynopsisWindow<C> { document: string; chunks: C[] }
+
+/**
+ * The synopsis documents of one segment of a segmented page (wave-b spec 8.6): the segment's chunks, in order, packed
+ * greedily into windows of at most SEGMENT_SYNOPSIS_WINDOW_BYTES (and, with the lead, at most SYNOPSIS_DOC_MAX_CHARS,
+ * so buildPagePrompt never cuts a window), each document the lead, a gap marker and the window. Every chunk sits in the
+ * one window that holds it; a chunk larger than a window is a window alone. A document depends only on the lead and
+ * this segment's chunks, so an append or edit elsewhere on the page leaves it, and the vectors built from it, as they
+ * are; the chunks of one window share one document, so the prompt cache serves all but the first call.
+ */
+export function segmentSynopsisWindows<C extends { chunk_text: string; chunk_source?: string | null }>(chunks: readonly C[], lead: string): SegmentSynopsisWindow<C>[] {
+  const prefix = lead ? lead + SEGMENT_SYNOPSIS_GAP : '';
+  const maxChars = Math.min(SEGMENT_SYNOPSIS_WINDOW_BYTES, SYNOPSIS_DOC_MAX_CHARS - prefix.length);
+  const windows: SegmentSynopsisWindow<C>[] = [];
+  let open: { chunks: C[]; texts: string[]; chars: number; bytes: number } | null = null;
+  const close = () => { if (open) windows.push({ document: prefix + open.texts.join('\n\n'), chunks: open.chunks }); };
+  for (const chunk of chunks) {
+    if (chunk.chunk_source === 'image_asset') continue;
+    const chars = chunk.chunk_text.length + 2;
+    const bytes = Buffer.byteLength(chunk.chunk_text, 'utf8') + 2;
+    if (open && open.chars + chars <= maxChars && open.bytes + bytes <= SEGMENT_SYNOPSIS_WINDOW_BYTES) {
+      open.chunks.push(chunk); open.texts.push(chunk.chunk_text); open.chars += chars; open.bytes += bytes;
+      continue;
+    }
+    close();
+    open = { chunks: [chunk], texts: [chunk.chunk_text], chars, bytes };
+  }
+  close();
+  return windows;
+}
+
+/** Input chars of a synopsis call outside its document and chunk: the system prompt and the prompt's tags. */
+const SYNOPSIS_PROMPT_OVERHEAD_CHARS = SYNOPSIS_SYSTEM_PROMPT.length + 256;
+/** The rate (USD per million tokens) an unpriced synopsis model reserves at. */
+const UNPRICED_SYNOPSIS_RATE = { input: 15, output: 75 };
+
+/** What one synopsis call over `documentText` and `chunkText` may cost at most: the uncached prompt plus the full output ceiling. */
+export function estimateSynopsisCallUsd(model: string, documentText: string, chunkText: string, maxTokens: number = SYNOPSIS_MAX_TOKENS): number {
+  const input = Math.ceil((Math.min(documentText.length, SYNOPSIS_DOC_MAX_CHARS) + chunkText.length + SYNOPSIS_PROMPT_OVERHEAD_CHARS) / 4);
+  return reservationCostUsd(model, 'chat', input, maxTokens)
+    ?? (input * UNPRICED_SYNOPSIS_RATE.input + maxTokens * UNPRICED_SYNOPSIS_RATE.output) / 1_000_000;
+}
+
+export function buildChunkPrompt(chunkText: string): string {
+  return [
     '',
     '<chunk>',
     chunkText,

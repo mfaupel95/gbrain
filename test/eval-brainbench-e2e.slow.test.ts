@@ -22,6 +22,7 @@ import { beforeAll, describe, expect, test } from 'bun:test';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 const REPO = process.cwd();
 const CLI = join(REPO, 'src', 'cli.ts');
@@ -159,7 +160,7 @@ beforeAll(async () => {
   mkdirSync(join(dupRoot, 'fixtures'));
   mkdirSync(join(dupRoot, 'gold'));
   // A page whose content exceeds importFromContent's size cap → status 'skipped' → SeedError.
-  const huge = 'x'.repeat(5_000_001);
+  const huge = 'x'.repeat(PAGE_MAX_BYTES + 1);
   writeFileSync(
     join(dupRoot, 'fixtures', 'seedfail-001.fixture.json'),
     JSON.stringify({

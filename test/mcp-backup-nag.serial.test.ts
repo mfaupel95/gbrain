@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os';
 import * as realHybrid from '../src/core/search/hybrid.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { encodeDeepResearchId } from '../src/core/deep-research-id.ts';
+import { fenceTranscriptText } from '../src/core/search/transcript-quote.ts';
 
 let nextResults: unknown[] = [{ id: encodeDeepResearchId('default', 'a'), page_id: 1, source_id: 'default', slug: 'a', chunk_text: 'x' }];
 
@@ -111,10 +112,18 @@ type CallOpts = { remote?: boolean; transport?: 'stdio' | 'http' };
 
 // Default transport is 'stdio' — the ONLY transport the notice fires on.
 // Trust-pin tests pass 'http' / undefined explicitly.
-/** Remote callers get lean rows (C1): the fixture row minus its page_id diagnostic. */
-function leanResults(): unknown[] {
+/**
+ * Remote callers get lean rows (C1): the fixture row minus its page_id diagnostic.
+ * `fetchCallable: false` (an HTTP or unmarked caller with no read grant) also drops `id`, the fetch key.
+ */
+function leanResults({ fetchCallable = true } = {}): unknown[] {
   // The search op labels every hit with its trust tier and origin (#5575 A6); the stub rows carry neither, so unknown/unrecorded.
-  return nextResults.map(r => { const { page_id: _p, ...lean } = r as Record<string, unknown>; return { ...lean, trust_tier: 'unknown', origin: 'unrecorded' }; });
+  // An unknown-tier row reaches a remote reader quoted (GST-687).
+  return nextResults.map(r => {
+    const { page_id: _p, id, ...lean } = r as Record<string, unknown>;
+    return { ...lean, chunk_text: fenceTranscriptText(lean.chunk_text as string, lean.slug as string), quoted: 'transcript',
+      ...(fetchCallable && id !== undefined ? { id } : {}), trust_tier: 'unknown', origin: 'unrecorded' };
+  });
 }
 
 async function callSearch(opts: CallOpts = {}) {
@@ -126,8 +135,9 @@ async function callSearch(opts: CallOpts = {}) {
   });
   // F3's degraded_recall notice (this keyless stub searches keyword-only) is
   // orthogonal to the backup block under test; it is pinned in
-  // test/mcp-notice-channels.test.ts.
-  return { ...out, content: out.content.filter(c => !c.text.startsWith('[gbrain notice degraded_recall ')) };
+  // test/mcp-notice-channels.test.ts. So is F2's keyword count line (test/search-keyword-paging.test.ts),
+  // and the GBRA-200 degraded stamp (test/degraded-stamp-paths.serial.test.ts).
+  return { ...out, content: out.content.filter(c => !c.text.startsWith('[gbrain notice degraded_recall ') && !c.text.startsWith('[gbrain search] ') && !c.text.startsWith('[gbrain degraded: ')) };
 }
 
 async function waitFor(pred: () => boolean, ms = 2000): Promise<boolean> {
@@ -200,7 +210,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
 
     const http = await callSearch({ remote: true, transport: 'http' });
     expect(http.content.length).toBe(1);
-    expect(JSON.parse(http.content[0].text)).toEqual(leanResults());
+    expect(JSON.parse(http.content[0].text)).toEqual(leanResults({ fetchCallable: false }));
 
     // The http call must not burn the once-per-process flag or arm the
     // hourly latch — the first stdio call still attaches the block.
@@ -213,7 +223,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
     saveBackupStatus(warnStatus());
     const out = await callSearch({ remote: true, transport: undefined });
     expect(out.content.length).toBe(1);
-    expect(JSON.parse(out.content[0].text)).toEqual(leanResults());
+    expect(JSON.parse(out.content[0].text)).toEqual(leanResults({ fetchCallable: false }));
   });
 
   test('aggregate block never leaks local paths or source ids', async () => {

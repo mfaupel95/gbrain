@@ -49,8 +49,17 @@ export interface RerankerOpts {
 /** The two skip classes (no HTTP call, no per-query audit row). */
 export type RerankSkipReason = 'no_key';
 
-/** A reranker call that threw (anything but a missing key), as stamped on the wire. */
-export type RerankFailedReason = 'timeout' | 'budget' | 'provider_error';
+/**
+ * A reranker call that threw (anything but a missing key), as stamped on the
+ * wire: no answer within the timeout, a spend cap, HTTP 429 (provider rate or
+ * concurrency limit), no HTTP response at all (connection refused, DNS — a
+ * wrong base URL looks like this), HTTP 401/403, or any other provider error.
+ */
+export type RerankFailedReason = 'timeout' | 'budget' | 'rate_limited' | 'unreachable' | 'auth' | 'provider_error';
+
+const FAILED_REASON: Partial<Record<RerankFailureReason, RerankFailedReason>> = {
+  timeout: 'timeout', budget: 'budget', rate_limit: 'rate_limited', unreachable: 'unreachable', auth: 'auth',
+};
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
@@ -59,6 +68,10 @@ function hashQuery(query: string): string {
 
 function classifyRerankFailure(err: unknown): RerankFailureReason {
   if (err instanceof RerankError) return err.reason;
+  // An embedded engine given no provider for this reranker, or a call that entered no scope while one is open
+  // (engine-gateway.ts): nothing was sent, so a skip.
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === 'engine_scope_missing' || code === 'engine_scope_required') return 'no_key';
   if (
     err instanceof BudgetExhausted ||
     (err && typeof err === 'object' && (err as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED')
@@ -162,7 +175,7 @@ export async function applyReranker(
     } catch {
       // Audit logging must never break search.
     }
-    const failed: RerankFailedReason = reason === 'timeout' || reason === 'budget' ? reason : 'provider_error';
+    const failed = FAILED_REASON[reason] ?? 'provider_error';
     try { opts.onFailure?.(failed); } catch { /* caller hook must never break search */ }
     return results;
   }

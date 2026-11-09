@@ -151,8 +151,8 @@
               "number",
               "array<string>"
             ],
-            "sql": "WITH cur AS ( SELECT entity_slug, dimension, value, source_markdown_slug AS source, confidence, id AS fact_id FROM facts WHERE dimension IS NOT NULL AND expired_at IS NULL AND valid_until IS NULL AND (dim_status IS NULL OR dim_status = 'active') AND confidence >= $1 AND source_id = ANY($2) AND NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = facts.source_id AND pp.slug = facts.source_markdown_slug AND NOT ((COALESCE(pp.frontmatter->>'visibility', CASE WHEN (pp.type = 'atom' OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT (CASE WHEN pp.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = pp.source_id AND derived_origin.slug = pp.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (pp.type = 'atom' OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = pp.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN pp.type = 'event' AND pp.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = pp.source_id AND chronicle_origin.slug = pp.frontmatter->'event'->>'depth' AND COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type = 'atom' OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = pp.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') = 'array' THEN pp.frontmatter->'derived_from' ELSE jsonb_build_array(pp.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)))) ) SELECT entity_slug, dimension, json_agg(json_build_object('value', value, 'source', source, 'confidence', confidence, 'fact_id', fact_id)) AS values FROM cur GROUP BY entity_slug, dimension HAVING count(DISTINCT value) >= 2 AND count(DISTINCT source) >= 2 ORDER BY entity_slug, dimension",
-            "textSha256": "fab0d36cb7fdda1a0a96243e7e5f0752dfee4a1e0150665c2cf829577ea5f388"
+            "sql": "WITH cur AS ( SELECT entity_slug, dimension, value, source_markdown_slug AS source, confidence, id AS fact_id FROM facts WHERE dimension IS NOT NULL AND expired_at IS NULL AND valid_until IS NULL AND (dim_status IS NULL OR dim_status = 'active') AND confidence >= $1 AND source_id = ANY($2) AND NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = facts.source_id AND pp.slug = facts.source_markdown_slug AND NOT (((((pp.page_readers IS NULL AND NOT (pp.frontmatter ? 'readable_by'))) AND (pp.folder_rule_ids IS NULL) AND NOT EXISTS (SELECT 1 FROM access_pending_coverage pc WHERE pc.source_id = pp.source_id AND starts_with(pp.slug, pc.prefix)) AND NOT (SELECT gbrain_access_state_unreadable()) AND ((pp.type NOT IN ('atom', 'question', 'concept', 'event') AND NOT (pp.frontmatter ? 'derived_from')) OR NOT gbrain_access_origin_restricted(pp.id, pp.source_id, pp.type, pp.frontmatter))) AND ((COALESCE(pp.frontmatter->>'visibility', CASE WHEN (pp.type IN ('atom', 'question') OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(pp.frontmatter ? 'pinned_question', false) AND NOT (pp.frontmatter->>'visibility' IS NULL AND (COALESCE(lower(btrim(pp.frontmatter->>'access')) IN ('private','restricted','confidential'), false) OR COALESCE(lower(btrim(pp.frontmatter->>'confidentiality')) IN ('confidential','secret','private','restricted'), false)))) AND NOT (CASE WHEN pp.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = pp.source_id AND derived_origin.slug = pp.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (pp.type IN ('atom', 'question') OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = pp.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN pp.type = 'event' AND pp.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = pp.source_id AND chronicle_origin.slug = pp.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false) AND NOT (chronicle_origin.frontmatter->>'visibility' IS NULL AND (COALESCE(lower(btrim(chronicle_origin.frontmatter->>'access')) IN ('private','restricted','confidential'), false) OR COALESCE(lower(btrim(chronicle_origin.frontmatter->>'confidentiality')) IN ('confidential','secret','private','restricted'), false)))) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = pp.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') = 'array' THEN pp.frontmatter->'derived_from' ELSE jsonb_build_array(pp.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END))))) ) SELECT entity_slug, dimension, json_agg(json_build_object('value', value, 'source', source, 'confidence', confidence, 'fact_id', fact_id)) AS values FROM cur GROUP BY entity_slug, dimension HAVING count(DISTINCT value) >= 2 AND count(DISTINCT source) >= 2 ORDER BY entity_slug, dimension",
+            "textSha256": "a10af4b2320b26394f426f2cb2e550adf182e264904aabd14855fbb4831cf865"
           }
         ]
       },
@@ -165,8 +165,8 @@
               "string",
               "number"
             ],
-            "sql": "SELECT id, valid_from, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = $1 AND entity_slug = $2 AND expired_at IS NULL AND visibility = 'world' ORDER BY valid_from DESC, id DESC LIMIT $3",
-            "textSha256": "55ca2eb5d74f4f7566b4dd3dfd3d79654c944663074682b5784cae2231c78f8b"
+            "sql": "SELECT id, valid_from, valid_until, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = $1 AND entity_slug = $2 AND expired_at IS NULL AND facts.visibility IN ('world') AND NOT EXISTS (SELECT 1 FROM pages elig_qp WHERE elig_qp.source_id = facts.source_id AND elig_qp.slug = facts.source_markdown_slug AND elig_qp.deleted_at IS NULL AND (COALESCE(elig_qp.frontmatter, '{}'::jsonb) ? 'quarantine')) AND NOT EXISTS (SELECT 1 FROM needs_rederive elig_nr WHERE elig_nr.derived_table = 'facts' AND elig_nr.derived_id = facts.id::text) ORDER BY valid_from DESC, id DESC LIMIT $3",
+            "textSha256": "598971bc8cfe655cce331bcd51ac1b44758cb8e4d0992010fd065d4fb5ff2355"
           }
         ],
         "event": [
@@ -177,8 +177,8 @@
               "string",
               "number"
             ],
-            "sql": "SELECT id, valid_from, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = $1 AND entity_slug = $2 AND expired_at IS NULL AND visibility = 'world' AND event_type IS NOT NULL ORDER BY valid_from DESC, id DESC LIMIT $3",
-            "textSha256": "2d81a91a6a2c7cf11e8bdfdad66d5d64d567f3bed17f5fab1fbd70a12e3bb3d0"
+            "sql": "SELECT id, valid_from, valid_until, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = $1 AND entity_slug = $2 AND expired_at IS NULL AND facts.visibility IN ('world') AND NOT EXISTS (SELECT 1 FROM pages elig_qp WHERE elig_qp.source_id = facts.source_id AND elig_qp.slug = facts.source_markdown_slug AND elig_qp.deleted_at IS NULL AND (COALESCE(elig_qp.frontmatter, '{}'::jsonb) ? 'quarantine')) AND NOT EXISTS (SELECT 1 FROM needs_rederive elig_nr WHERE elig_nr.derived_table = 'facts' AND elig_nr.derived_id = facts.id::text) AND event_type IS NOT NULL ORDER BY valid_from DESC, id DESC LIMIT $3",
+            "textSha256": "1e39ab85e99c2f8efcbad49d4727466603f3bae38c76a8a28ed5b7b9aa50c966"
           }
         ],
         "sourceIds+metric+since+until": [
@@ -192,8 +192,8 @@
               "Date",
               "number"
             ],
-            "sql": "SELECT id, valid_from, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = ANY($1::text[]) AND entity_slug = $2 AND expired_at IS NULL AND claim_metric = $3 AND claim_metric IS NOT NULL AND valid_from >= $4 AND valid_from <= $5 ORDER BY valid_from DESC, id DESC LIMIT $6",
-            "textSha256": "86bc8fa6941f7648a62d9d76aba8559ea7ab445f4f521f94c154ba915455f83f"
+            "sql": "SELECT id, valid_from, valid_until, claim_metric, claim_value, claim_unit, claim_period, event_type, fact, source_session, source_markdown_slug, CASE WHEN embedding_model=(SELECT value FROM config WHERE key='embedding_model') AND embedded_text_hash=md5(fact) THEN embedding::text END AS embedding FROM facts WHERE source_id = ANY($1::text[]) AND entity_slug = $2 AND expired_at IS NULL AND NOT EXISTS (SELECT 1 FROM pages elig_qp WHERE elig_qp.source_id = facts.source_id AND elig_qp.slug = facts.source_markdown_slug AND elig_qp.deleted_at IS NULL AND (COALESCE(elig_qp.frontmatter, '{}'::jsonb) ? 'quarantine')) AND NOT EXISTS (SELECT 1 FROM needs_rederive elig_nr WHERE elig_nr.derived_table = 'facts' AND elig_nr.derived_id = facts.id::text) AND claim_metric = $3 AND claim_metric IS NOT NULL AND valid_from >= $4 AND valid_from <= $5 ORDER BY valid_from DESC, id DESC LIMIT $6",
+            "textSha256": "a869e55cc6e4149eb86cdd875ea7bb90fedff0361a3eeefb3bf8b683a1b609e6"
           }
         ]
       },
@@ -245,8 +245,8 @@
               "number",
               "boolean"
             ],
-            "sql": "SELECT DISTINCT ON (dimension) dimension, value, confidence, source_markdown_slug AS source, valid_from, valid_until AS valid_to, COALESCE(dim_status, 'active') AS status, id AS fact_id FROM facts WHERE entity_slug = $1 AND dimension IS NOT NULL AND expired_at IS NULL AND source_id = ANY($2) AND NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = facts.source_id AND pp.slug = facts.source_markdown_slug AND NOT ((COALESCE(pp.frontmatter->>'visibility', CASE WHEN (pp.type = 'atom' OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT (CASE WHEN pp.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = pp.source_id AND derived_origin.slug = pp.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (pp.type = 'atom' OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = pp.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN pp.type = 'event' AND pp.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = pp.source_id AND chronicle_origin.slug = pp.frontmatter->'event'->>'depth' AND COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type = 'atom' OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = pp.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') = 'array' THEN pp.frontmatter->'derived_from' ELSE jsonb_build_array(pp.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)))) AND COALESCE(valid_from, '-infinity'::timestamptz) <= COALESCE($3::timestamptz, now()) AND COALESCE(valid_until, 'infinity'::timestamptz) > COALESCE($4::timestamptz, now()) AND confidence >= $5 AND ($6::boolean OR dim_status IS NULL OR dim_status = 'active') ORDER BY dimension, valid_from DESC NULLS LAST, confidence DESC, id DESC",
-            "textSha256": "1966dacafbab85ac8f6ee3cc7dc6d082f413238118444e09dccc5bebcf238213"
+            "sql": "SELECT DISTINCT ON (dimension) dimension, value, confidence, source_markdown_slug AS source, valid_from, valid_until AS valid_to, COALESCE(dim_status, 'active') AS status, id AS fact_id FROM facts WHERE entity_slug = $1 AND dimension IS NOT NULL AND expired_at IS NULL AND source_id = ANY($2) AND NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = facts.source_id AND pp.slug = facts.source_markdown_slug AND NOT (((((pp.page_readers IS NULL AND NOT (pp.frontmatter ? 'readable_by'))) AND (pp.folder_rule_ids IS NULL) AND NOT EXISTS (SELECT 1 FROM access_pending_coverage pc WHERE pc.source_id = pp.source_id AND starts_with(pp.slug, pc.prefix)) AND NOT (SELECT gbrain_access_state_unreadable()) AND ((pp.type NOT IN ('atom', 'question', 'concept', 'event') AND NOT (pp.frontmatter ? 'derived_from')) OR NOT gbrain_access_origin_restricted(pp.id, pp.source_id, pp.type, pp.frontmatter))) AND ((COALESCE(pp.frontmatter->>'visibility', CASE WHEN (pp.type IN ('atom', 'question') OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(pp.frontmatter ? 'pinned_question', false) AND NOT (pp.frontmatter->>'visibility' IS NULL AND (COALESCE(lower(btrim(pp.frontmatter->>'access')) IN ('private','restricted','confidential'), false) OR COALESCE(lower(btrim(pp.frontmatter->>'confidentiality')) IN ('confidential','secret','private','restricted'), false)))) AND NOT (CASE WHEN pp.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = pp.source_id AND derived_origin.slug = pp.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (pp.type IN ('atom', 'question') OR (pp.type = 'concept' AND pp.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = pp.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN pp.type = 'event' AND pp.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = pp.source_id AND chronicle_origin.slug = pp.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false) AND NOT (chronicle_origin.frontmatter->>'visibility' IS NULL AND (COALESCE(lower(btrim(chronicle_origin.frontmatter->>'access')) IN ('private','restricted','confidential'), false) OR COALESCE(lower(btrim(chronicle_origin.frontmatter->>'confidentiality')) IN ('confidential','secret','private','restricted'), false)))) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = pp.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(pp.frontmatter->'derived_from') = 'array' THEN pp.frontmatter->'derived_from' ELSE jsonb_build_array(pp.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END))))) AND COALESCE(valid_from, '-infinity'::timestamptz) <= COALESCE($3::timestamptz, now()) AND COALESCE(valid_until, 'infinity'::timestamptz) > COALESCE($4::timestamptz, now()) AND confidence >= $5 AND ($6::boolean OR dim_status IS NULL OR dim_status = 'active') ORDER BY dimension, valid_from DESC NULLS LAST, confidence DESC, id DESC",
+            "textSha256": "8c762c00c5f7b35b5d6d9e4e78f808aef170e1ea18f73a6d00363b5f3c35487e"
           }
         ]
       },
@@ -399,10 +399,13 @@
             "lane": "tx",
             "params": [
               "number",
+              "Date",
+              "Date",
+              "Date",
               "number"
             ],
-            "sql": "UPDATE facts SET expired_at = now(), superseded_by = $1 WHERE id = $2 AND expired_at IS NULL",
-            "textSha256": "fc363c8ea84c55f67cf320921cec09fd141e9392b5c8dcad59afaec778dc5b1f"
+            "sql": "UPDATE facts SET expired_at = now(), superseded_by = $1, valid_until = CASE WHEN valid_from < $2::timestamptz AND (valid_until IS NULL OR valid_until > $3::timestamptz) THEN $4::timestamptz ELSE valid_until END WHERE id = $5 AND expired_at IS NULL",
+            "textSha256": "aa8e803c695469877ce7546bddfbd038658079b3d7dba01bdbc3acd2f5cfdeaa"
           },
           {
             "event": "commit",
@@ -425,34 +428,27 @@
           {
             "lane": "tx",
             "params": [
-              "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "null",
-              "Date",
-              "null",
-              "null",
-              "string",
-              "null",
-              "number",
-              "null",
-              "null",
-              "null",
-              "null",
-              "number",
-              "string",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null"
+              "string"
             ],
-            "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25 ) ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id",
-            "textSha256": "ea2d66315f5edb9eaa1132fc036a326e5ba4973f89d477ff29c53dd22a980690"
+            "sql": "SELECT set_config($1, 'on', true)",
+            "textSha256": "aceeddeac0f7c41d75529fb2a4e442f6451b1adf15c5fba1f0570c240b91f705"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "string"
+            ],
+            "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) SELECT $1, r.entity_slug, r.fact, r.kind, r.visibility, r.notability, r.context, r.valid_from::timestamptz, r.valid_until::timestamptz, r.expired_at::timestamptz, r.source, r.source_session, r.confidence, r.embedding::vector, r.embedded_at::timestamptz, r.embedding_model, md5(r.hash_text), r.row_num, r.source_markdown_slug, r.claim_metric, r.claim_value, r.claim_unit, r.claim_period, r.event_type, r.attributed_to FROM jsonb_to_recordset($2::text::jsonb) AS r( entity_slug text, fact text, kind text, visibility text, notability text, context text, valid_from text, valid_until text, expired_at text, source text, source_session text, confidence real, embedding text, embedded_at text, embedding_model text, hash_text text, row_num integer, source_markdown_slug text, claim_metric text, claim_value double precision, claim_unit text, claim_period text, event_type text, attributed_to text, ord integer) ORDER BY r.ord ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id, source_markdown_slug, row_num",
+            "textSha256": "2601865e0cfed0d3ffb1da93396ad860ffe7981e0808c4f22ef99a11bcf88442"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config($1, '', true)",
+            "textSha256": "ec8307c16510c3e9113b6cbbd6d70c39ddd38f43b35b52b31eebde8a13853cc9"
           },
           {
             "event": "commit",
@@ -483,75 +479,27 @@
           {
             "lane": "tx",
             "params": [
-              "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "null",
-              "Date",
-              "null",
-              "null",
-              "string",
-              "null",
-              "number",
-              "null",
-              "null",
-              "null",
-              "null",
-              "number",
-              "string",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null"
+              "string"
             ],
-            "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25 ) ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id",
-            "textSha256": "ea2d66315f5edb9eaa1132fc036a326e5ba4973f89d477ff29c53dd22a980690"
+            "sql": "SELECT set_config($1, 'on', true)",
+            "textSha256": "aceeddeac0f7c41d75529fb2a4e442f6451b1adf15c5fba1f0570c240b91f705"
           },
           {
             "lane": "tx",
             "params": [
               "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "string",
-              "null",
-              "Date",
-              "null",
-              "null",
-              "string",
-              "null",
-              "number",
-              "Date",
-              "string",
-              "string",
-              "number",
-              "string",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null",
-              "null"
+              "string"
             ],
-            "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, '[0.10000000149011612,0.20000000298023224,0.30000001192092896]'::vector, $14, $15, md5($16), $17, $18, $19, $20, $21, $22, $23, $24 ) ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id",
-            "textSha256": "55ec99676fc259d94b5e8723d9629d422832e92b2ef019444e55a2de7989556d"
+            "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) SELECT $1, r.entity_slug, r.fact, r.kind, r.visibility, r.notability, r.context, r.valid_from::timestamptz, r.valid_until::timestamptz, r.expired_at::timestamptz, r.source, r.source_session, r.confidence, r.embedding::vector, r.embedded_at::timestamptz, r.embedding_model, md5(r.hash_text), r.row_num, r.source_markdown_slug, r.claim_metric, r.claim_value, r.claim_unit, r.claim_period, r.event_type, r.attributed_to FROM jsonb_to_recordset($2::text::jsonb) AS r( entity_slug text, fact text, kind text, visibility text, notability text, context text, valid_from text, valid_until text, expired_at text, source text, source_session text, confidence real, embedding text, embedded_at text, embedding_model text, hash_text text, row_num integer, source_markdown_slug text, claim_metric text, claim_value double precision, claim_unit text, claim_period text, event_type text, attributed_to text, ord integer) ORDER BY r.ord ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id, source_markdown_slug, row_num",
+            "textSha256": "2601865e0cfed0d3ffb1da93396ad860ffe7981e0808c4f22ef99a11bcf88442"
           },
           {
             "lane": "tx",
             "params": [
-              "string",
-              "string",
-              "number"
+              "string"
             ],
-            "sql": "SELECT f.id, f.expired_at, n.row_num AS next_row FROM facts f LEFT JOIN facts n ON n.id = f.superseded_by WHERE f.source_id = $1 AND f.source_markdown_slug = $2 AND f.row_num = $3 LIMIT 1",
-            "textSha256": "0d0262b3ffb96f1eee1b39fe4146f4bebddcd648d82fc082fe593ca9bd950d94"
+            "sql": "SELECT set_config($1, '', true)",
+            "textSha256": "ec8307c16510c3e9113b6cbbd6d70c39ddd38f43b35b52b31eebde8a13853cc9"
           },
           {
             "event": "commit",
@@ -568,13 +516,12 @@
               "string",
               "array<string>",
               "array<string>",
-              "array<string>",
               "string",
               "number",
               "number"
             ],
-            "sql": "SELECT * FROM facts WHERE source_id = $1 AND entity_slug = $2 AND consolidated_at IS NULL AND kind = ANY($3::text[]) AND visibility = ANY($4::text[]) AND source != ALL($5::text[]) AND fact ILIKE $6 ESCAPE '\\' ORDER BY valid_from DESC, id DESC LIMIT $7 OFFSET $8",
-            "textSha256": "be494a6935e25722d68ceaee7a2d67aa12a45b886a5154165e73c8be1f06e461"
+            "sql": "SELECT * FROM facts WHERE source_id = $1 AND entity_slug = $2 AND consolidated_at IS NULL AND kind = ANY($3::text[]) AND facts.visibility IN ('world') AND source != ALL($4::text[]) AND fact ILIKE $5 ESCAPE '\\' ORDER BY valid_from DESC, id DESC LIMIT $6 OFFSET $7",
+            "textSha256": "58c970e9c7c1ca7b38e5dc67dd6d0507ac9c63a37a4c45f52a775a1517fb51eb"
           }
         ],
         "default": [
@@ -600,13 +547,12 @@
               "string",
               "array<string>",
               "array<string>",
-              "array<string>",
               "string",
               "number",
               "number"
             ],
-            "sql": "SELECT * FROM facts WHERE source_id = $1 AND source_session = $2 AND consolidated_at IS NULL AND kind = ANY($3::text[]) AND visibility = ANY($4::text[]) AND source != ALL($5::text[]) AND fact ILIKE $6 ESCAPE '\\' ORDER BY created_at DESC, id DESC LIMIT $7 OFFSET $8",
-            "textSha256": "869e7e5ad9aeab19b81e704f439f4043c269defe2fbcb30e57b23c37cea8fded"
+            "sql": "SELECT * FROM facts WHERE source_id = $1 AND source_session = $2 AND consolidated_at IS NULL AND kind = ANY($3::text[]) AND facts.visibility IN ('world') AND source != ALL($4::text[]) AND fact ILIKE $5 ESCAPE '\\' ORDER BY created_at DESC, id DESC LIMIT $6 OFFSET $7",
+            "textSha256": "4303ab045786dbf0844e317c08c07529b3ee46488b3330077d46c0f4e5ec6f28"
           }
         ],
         "default": [
@@ -655,11 +601,10 @@
             "params": [
               "string",
               "string",
-              "array<string>",
               "number"
             ],
-            "sql": "SELECT *, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at_iso FROM facts WHERE source_id = $1 AND created_at > $2::text::timestamptz AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND visibility = ANY($3::text[]) ORDER BY created_at ASC, id ASC LIMIT $4",
-            "textSha256": "8918057b510da33d9b032fdefda14dfd7c9f5e67dd28b763ee8823cfa87b42f5"
+            "sql": "SELECT *, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at_iso FROM facts WHERE source_id = $1 AND created_at > $2::text::timestamptz AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND facts.visibility IN ('world') ORDER BY created_at ASC, id ASC LIMIT $3",
+            "textSha256": "5224220754538ac8d17fd002c25dcd00c4ad3ad5634f77b111c0ffebd2ed7b31"
           }
         ]
       },
@@ -673,14 +618,13 @@
               "string",
               "string",
               "array<string>",
-              "array<string>",
-              "array<string>",
               "string",
+              "array<string>",
               "number",
               "number"
             ],
-            "sql": "SELECT * FROM facts WHERE source_id = $1 AND COALESCE(valid_from, created_at) >= $2 AND entity_slug = $3 AND source_session = $4 AND consolidated_at IS NULL AND kind = ANY($5::text[]) AND visibility = ANY($6::text[]) AND source != ALL($7::text[]) AND fact ILIKE $8 ESCAPE '\\' ORDER BY COALESCE(valid_from, created_at) DESC, id DESC LIMIT $9 OFFSET $10",
-            "textSha256": "a635199e1e8bc1742eaa0209a8bc5b296098640ab38aa287635fe9195fa696ae"
+            "sql": "SELECT * FROM facts WHERE source_id = $1 AND COALESCE(valid_from, created_at) >= $2 AND entity_slug = $3 AND source_session = $4 AND source != ALL($5::text[]) AND fact ILIKE $6 ESCAPE '\\' AND consolidated_at IS NULL AND kind = ANY($7::text[]) AND facts.visibility IN ('world') ORDER BY COALESCE(valid_from, created_at) DESC, id DESC LIMIT $8 OFFSET $9",
+            "textSha256": "08ec05ff5a0d3ab9d0e87cc53c862b889f562e2af8c6959238905f2e48a80cbe"
           }
         ],
         "default": [
@@ -693,7 +637,7 @@
               "number"
             ],
             "sql": "SELECT * FROM facts WHERE source_id = $1 AND created_at >= $2 AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
-            "textSha256": "3f0a5fa0e5e1a4338c4d9a10f70015aef0d1d34504c0161ce43eae3a104f6beb"
+            "textSha256": "b91c27c57a63ae4eeed4b01a43c5b9c43bc16d06e7960e87a68898d91577d0ac"
           }
         ]
       },
@@ -715,11 +659,10 @@
             "params": [
               "string",
               "Date",
-              "array<string>",
               "number"
             ],
-            "sql": "SELECT * FROM facts WHERE source_id = $1 AND superseded_by IS NOT NULL AND COALESCE(expired_at, valid_until) >= $2 AND visibility = ANY($3::text[]) ORDER BY COALESCE(expired_at, valid_until) DESC, id DESC LIMIT $4",
-            "textSha256": "5df970c375dc85b29e4d5fca79616dc18bbd6090717d96be62472c7fa38177ed"
+            "sql": "SELECT * FROM facts WHERE source_id = $1 AND superseded_by IS NOT NULL AND COALESCE(expired_at, valid_until) >= $2 AND facts.visibility IN ('world') ORDER BY COALESCE(expired_at, valid_until) DESC, id DESC LIMIT $3",
+            "textSha256": "8b156f6248ef869384a1f72a2f97a3578dca517f9ad8da801f01252d26f43b9e"
           }
         ]
       },
@@ -847,6 +790,18 @@
       },
       "migrateFactsToCanonical": {
         "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH m AS ( SELECT f.id, f.expired_at, $1::text AS e, $2::text AS s, f.dimension, f.value_hash, f.valid_from FROM facts f WHERE f.source_id = $3 AND f.dimension IS NOT NULL AND f.source_markdown_slug = $4 AND f.expired_at IS NULL), cand AS ( SELECT m.id, m.expired_at, m.e, m.s, m.dimension, m.value_hash, m.valid_from, 1 AS moving FROM m UNION ALL SELECT t.id, t.expired_at, t.entity_slug, t.source_markdown_slug, t.dimension, t.value_hash, t.valid_from, 0 FROM facts t WHERE t.source_id = $5 AND t.dimension IS NOT NULL AND NOT EXISTS (SELECT 1 FROM m WHERE m.id = t.id) AND EXISTS (SELECT 1 FROM m WHERE m.e = t.entity_slug AND m.s = t.source_markdown_slug AND m.dimension = t.dimension AND m.value_hash = t.value_hash AND m.valid_from = t.valid_from)), ranked AS ( SELECT id, row_number() OVER w AS rn, first_value(id) OVER w AS keep FROM cand WHERE e IS NOT NULL AND s IS NOT NULL AND value_hash IS NOT NULL AND valid_from IS NOT NULL WINDOW w AS (PARTITION BY e, s, dimension, value_hash, valid_from ORDER BY (expired_at IS NULL) DESC, moving, id)) SELECT id, keep FROM ranked WHERE rn > 1",
+            "textSha256": "03857c46ad04ed51ba3d619da17d5407884e857d4fa987b11ef870ca2f7b97a0"
+          },
           {
             "lane": "pool",
             "params": [

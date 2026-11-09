@@ -1,6 +1,7 @@
 /** CLI-only commands may parse/read input before lazily connecting to a local engine. */
 import type { BrainEngine } from '../core/engine.ts';
 import type { GBrainConfig } from '../core/config.ts';
+import type { EngineConnectOptions } from '../core/engine-connect.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { finishCliTeardown, noteRenderedErrorCode, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
@@ -8,7 +9,7 @@ import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { RemoteMcpError } from '../core/remote-mcp-error.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../core/exit-codes.ts';
-import { acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
+import { acceptPendingCovers, acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
 import { cliRenderContext, toAgentError } from '../core/agent-output.ts';
 import { cliCommandOf } from '../cli/cli-error.ts';
 
@@ -44,6 +45,7 @@ export async function reportPersistenceCliError(error: unknown, json = false,
   if (pending) {
     console.error(`Poll: ${poll}`);
     if (!acceptPending) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, not yet committed. Wait longer with --wait <seconds>, or pass --accept-pending to exit 0 (${WRITE_EXIT_DOCS}).`);
+    else if (!acceptPendingCovers(pending)) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, but queued for an owner host that runs no consumer and has been quiet past the stale window (the receipt's diagnostic.owner); --accept-pending does not cover it. Run gbrain doctor --only owner_host_stale --json (${WRITE_EXIT_DOCS}).`);
   }
   setCliExitVerdict(writeErrorExitCode(error, acceptPending));
   return true;
@@ -73,7 +75,7 @@ export async function runDelegatedCliOperation(
 export async function runDeferredPersistenceCommand(
   command: 'capture' | 'forget' | 'call' | 'sources' | 'takes',
   args: string[],
-  connect: () => Promise<BrainEngine>,
+  connect: (opts?: EngineConnectOptions) => Promise<BrainEngine>,
 ): Promise<void> {
   // A3: refusing to remove or archive the default source is invalid input (exit 2), as on
   // the unmanaged lane; the write lane's verdict would be 1.
@@ -84,7 +86,7 @@ export async function runDeferredPersistenceCommand(
       { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the named sources that can be removed or archived.' } }), 'sources');
   }
   let connected: BrainEngine | null = null;
-  const getEngine = async () => connected ??= await connect();
+  const getEngine = async (opts?: EngineConnectOptions) => connected ??= await connect(opts);
   try {
     if (command === 'takes') {
       const { runTakesMutation, runTakesRebuild } = await import('./takes-mutation.ts');

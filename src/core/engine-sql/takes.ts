@@ -23,7 +23,7 @@ import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
 import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterForCaller } from '../search/private-visibility.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
@@ -61,11 +61,14 @@ async function _addTakesBatchOnce(exec: SqlExecutor, rowsIn: TakeBatchInput[]): 
     // Weight clamp/round + NUL-stripping live in buildTakeRows (shared w/ PGLite).
     // NOTE: ON CONFLICT here is DO UPDATE (not DO NOTHING) — an intra-batch
     // duplicate (page_id, row_num) errors, identical to the pre-#1861 unnest path.
+    // A stored row that already holds the values is left unwritten (no trigger,
+    // no updated_at bump) and still counts: every row is inserted, updated or
+    // already current, else the statement throws.
     const { rows, weightClamped } = buildTakeRows(rowsIn);
     if (weightClamped > 0) {
       process.stderr.write(`[takes] TAKES_WEIGHT_CLAMPED: ${weightClamped} row(s) had weight outside [0,1]; clamped\n`);
     }
-    const result = await executeRawJsonb(
+    await executeRawJsonb(
       exec,
       `INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active)
        SELECT v.page_id, v.row_num, v.claim, v.kind, v.holder, v.weight,
@@ -89,11 +92,13 @@ async function _addTakesBatchOnce(exec: SqlExecutor, rowsIn: TakeBatchInput[]): 
          superseded_by = EXCLUDED.superseded_by,
          active        = EXCLUDED.active,
          updated_at    = now()
-       RETURNING 1`,
+       WHERE (takes.claim, takes.kind, takes.holder, takes.weight, takes.since_date, takes.until_date, takes.source, takes.superseded_by, takes.active)
+         IS DISTINCT FROM (EXCLUDED.claim, EXCLUDED.kind, EXCLUDED.holder, EXCLUDED.weight, EXCLUDED.since_date, EXCLUDED.until_date,
+           EXCLUDED.source, EXCLUDED.superseded_by, EXCLUDED.active)`,
       [],
       [{ rows }],
     );
-    return result.length;
+    return rows.length;
   }
 
   /**
@@ -303,7 +308,7 @@ export async function listTakes(exec: LegacyUnscopedRead, opts: TakesListOpts = 
       FROM takes t
       JOIN pages p ON p.id = t.page_id
       WHERE 1=1
-        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
+        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterForCaller('p')}`) : sqlFragment``}
         AND (${opts.page_id ?? null}::int   IS NULL OR t.page_id = ${opts.page_id ?? null}::int)
         AND (${opts.page_slug ?? null}::text IS NULL OR p.slug   = ${opts.page_slug ?? null}::text)
         AND (${opts.holder ?? null}::text   IS NULL OR t.holder  = ${opts.holder ?? null}::text)
@@ -318,10 +323,16 @@ export async function listTakes(exec: LegacyUnscopedRead, opts: TakesListOpts = 
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
         )
+        AND (${opts.sinceOnOrBefore ?? null}::text IS NULL OR (t.since_date IS NOT NULL AND NOT (
+          t.since_date ~ '^[0-9]{4}-[0-9]{2}(-[0-9]{2})?$'
+          AND (CASE WHEN length(t.since_date) = 7 THEN t.since_date || '-15' ELSE t.since_date END) > ${opts.sinceOnOrBefore ?? null}::text)))
         ${sourceFilter}${takeEligibility(opts.eligibility)}
       ORDER BY
+        ${opts.ungradedFirst ? sqlFragment`EXISTS (SELECT 1 FROM take_grade_cache g WHERE g.take_id = t.id
+          AND g.prompt_version = ${opts.ungradedFirst.promptVersion} AND g.judge_model_id = ${opts.ungradedFirst.judgeModelId}),` : sqlFragment``}
+        CASE WHEN ${opts.sortBy ?? 'created_at'} = 'since_date' AND ${opts.oldestFirst ?? false}::boolean THEN t.since_date END ASC NULLS LAST,
         CASE WHEN ${opts.sortBy ?? 'created_at'} = 'weight'      THEN t.weight     END DESC NULLS LAST,
-        CASE WHEN ${opts.sortBy ?? 'created_at'} = 'since_date'  THEN t.since_date END DESC NULLS LAST,
+        CASE WHEN ${opts.sortBy ?? 'created_at'} = 'since_date' AND NOT ${opts.oldestFirst ?? false}::boolean THEN t.since_date END DESC NULLS LAST,
         CASE WHEN ${opts.sortBy ?? 'created_at'} = 'created_at'  THEN t.created_at END DESC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `)).rows;
@@ -343,7 +354,7 @@ export async function searchTakes(exec: LegacyUnscopedRead, query: string, opts:
       JOIN pages p ON p.id = t.page_id
       WHERE t.active
         AND ${query} <% t.claim
-        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
+        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterForCaller('p')}`) : sqlFragment``}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -378,7 +389,7 @@ export async function searchTakesVector(
       JOIN pages p ON p.id = t.page_id
       WHERE t.active
         AND t.embedding IS NOT NULL
-        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
+        ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterForCaller('p')}`) : sqlFragment``}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -619,7 +630,7 @@ export async function getScorecard(exec: LegacyUnscopedRead, opts: TakesScorecar
         )::float                                                                               AS brier
       FROM takes
       WHERE 1=1 ${holderClause} ${domainClause} ${sinceClause} ${untilClause} ${allowed} ${sourceFilter}
-        ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sqlFragment``}
+        ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterForCaller('p')})`) : sqlFragment``}
     `)).rows;
     const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; unresolvable_count: number; brier: number | null };
     return finalizeScorecard(r);
@@ -660,7 +671,7 @@ export async function getCalibrationCurve(exec: LegacyUnscopedRead, opts: Calibr
         FROM takes
         WHERE resolved_quality IN ('correct','incorrect')
           ${holderClause} ${allowed} ${sourceFilter}
-          ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sqlFragment``}
+          ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterForCaller('p')})`) : sqlFragment``}
       )
       SELECT
         (bucket_idx::numeric * ${bucketSize}::numeric)::float       AS bucket_lo,

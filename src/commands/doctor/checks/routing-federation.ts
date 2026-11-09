@@ -8,7 +8,8 @@ import { existsSync, readFileSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import { gbrainPath } from '../../../core/config.ts';
 import { embedBackfillWorkerSurface } from '../../../core/minions/embed-backfill-admission.ts';
-import { isUndefinedTableError, isUndefinedColumnError } from '../../../core/utils.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
+import { adoptedSkillPackSourceIds } from '../../../core/shared-skills/adopted-packs.ts';
 import { ALLOWED_SCOPES_LIST, DCR_REGISTRABLE_SCOPES } from '../../../core/scope.ts';
 import type { Check } from '../../doctor.ts';
 
@@ -86,30 +87,6 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
 }
 
 /**
- * Non-default sources holding an adopted skill pack: a `shared_skill_packs`
- * row for the source's current incarnation with at least one live
- * (`NOT deleted`) `shared_skill_heads` row. A pack left behind by an earlier
- * incarnation does not count. A schema without the shared-skills tables (or
- * `sources.incarnation`) has no adopted packs.
- */
-async function adoptedSkillPackSourceIds(engine: BrainEngine): Promise<Set<string>> {
-  try {
-    const rows = await engine.executeRaw<{ id: string }>(
-      `SELECT s.id FROM sources s
-        WHERE s.id <> 'default' AND EXISTS (
-          SELECT 1 FROM shared_skill_packs p
-            JOIN shared_skill_heads h ON h.source_id = p.source_id AND h.source_incarnation = p.source_incarnation
-                                     AND h.pack_id = p.pack_id AND NOT h.deleted
-           WHERE p.source_id = s.id AND p.source_incarnation = s.incarnation)`,
-    );
-    return new Set(rows.map((r) => r.id));
-  } catch (e) {
-    if (isUndefinedTableError(e) || isUndefinedColumnError(e, 'incarnation')) return new Set();
-    throw e;
-  }
-}
-
-/**
  * v0.40 Federated Sync v2 (T12) — federation_health.
  *
  * Per-source dashboard surface for the autopilot/operator.
@@ -123,13 +100,22 @@ async function adoptedSkillPackSourceIds(engine: BrainEngine): Promise<Set<strin
  *
  * Single-source brain short-circuits to ok (no federation to check).
  * Each warning carries a paste-ready remediation hint.
+ *
+ * `opts.sourceIds` (the remote caller's grant) confines the dashboard to
+ * those sources: a source-bound token never reads another source's id, lag,
+ * coverage or failed-job count, and the single-source short-circuit is
+ * judged on brain-wide state only for unscoped callers.
  */
-export async function checkFederationHealth(engine: BrainEngine): Promise<Check> {
+export async function checkFederationHealth(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const { loadAllSources } = await import('../../../core/sources-load.ts');
     const { computeAllSourceMetrics } = await import('../../../core/source-health.ts');
-    const sources = await loadAllSources(engine, { includeArchived: false });
-    if (sources.length <= 1) {
+    const allSources = await loadAllSources(engine, { includeArchived: false });
+    const sources = opts.sourceIds ? allSources.filter((s) => opts.sourceIds!.includes(s.id)) : allSources;
+    if (opts.sourceIds && sources.length === 0) {
+      return { name: 'federation_health', status: 'ok', message: 'No sources in scope to check' };
+    }
+    if (!opts.sourceIds && sources.length <= 1) {
       return {
         name: 'federation_health',
         status: 'ok',
@@ -232,7 +218,7 @@ export async function checkOauthConfidentialHealth(engine: BrainEngine): Promise
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // Pre-OAuth schema (oauth_clients table missing) → ok.
-    if (msg.toLowerCase().includes('relation') && msg.toLowerCase().includes('does not exist')) {
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')) {
       return { name: 'oauth_confidential_client_health', status: 'ok', message: 'OAuth not configured (skipping)' };
     }
     return { name: 'oauth_confidential_client_health', status: 'warn', message: `Check failed: ${msg}` };
@@ -299,11 +285,9 @@ export async function checkOauthClientScopeHealth(engine: BrainEngine): Promise<
       orphaned = await engine.executeRaw<{ id: string }>(orphanSql(true), [WORKSPACE_SUFFIX]);
     } catch (e) {
       // Pre-v0.31 brain without the facts table: a source can't hold facts it
-      // has no table for — retry without the exclusion. Scoped here (code-first
-      // classification + the message must name `facts`) so the dangling-grant
-      // arm's findings above aren't lost to the outer catch's schema-degrade.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!(isUndefinedTableError(e) && /facts/i.test(msg))) throw e;
+      // has no table for — retry without the exclusion. Scoped here so the
+      // dangling-grant arm's findings above aren't lost to the outer catch.
+      if (!isMissingSchemaObject(e, 'table', 'facts')) throw e;
       orphaned = await engine.executeRaw<{ id: string }>(orphanSql(false), [WORKSPACE_SUFFIX]);
     }
     // (c) PRIVILEGED SELF-REGISTERED CLIENTS — an active row whose scope
@@ -337,7 +321,7 @@ export async function checkOauthClientScopeHealth(engine: BrainEngine): Promise<
         [privilegedScopeRegex],
       );
     } catch (e) {
-      if (!(isUndefinedTableError(e) || isUndefinedColumnError(e, 'grant_revision'))) throw e;
+      if (!(isMissingSchemaObject(e, 'table', 'oauth_grant_audit') || isMissingSchemaObject(e, 'column', 'grant_revision'))) throw e;
       privilegedDcrNote = 'self-registered-client scope audit skipped: grant audit schema not present (run `gbrain apply-migrations --yes`), so privileged self-registered clients are unknown';
     }
     const problems: string[] = [];
@@ -390,16 +374,13 @@ export async function checkOauthClientScopeHealth(engine: BrainEngine): Promise<
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // Pre-OAuth schema (table missing) or pre-migration schema (column
-    // missing) → ok, matching the confidential-client check's posture.
-    // CODE-FIRST classification (42P01/42703 via core/utils): a bare message
-    // regex would classify e.g. `function unnest(jsonb) does not exist` — a
-    // type-drift failure this check exists to catch — as "schema not present"
-    // and lie green. Column candidates are the optional oauth-scoping columns
-    // this check's queries touch.
-    const missingColumn = ['federated_read', 'source_id', 'deleted_at', 'archived', 'local_path']
-      .some((c) => isUndefinedColumnError(e, c));
-    if (isUndefinedTableError(e) || missingColumn) {
+    // Pre-OAuth schema (oauth_clients missing) or pre-migration schema (one
+    // of the optional oauth-scoping columns missing) → ok, matching the
+    // confidential-client check's posture. Any other missing object, or a
+    // type-drift failure like `function unnest(jsonb) does not exist`, is a
+    // real failure this check exists to catch.
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')
+      || isMissingSchemaObject(e, 'column', ['federated_read', 'source_id', 'deleted_at', 'archived', 'local_path'])) {
       return { name: 'oauth_client_scope_health', status: 'ok', message: 'OAuth scoping schema not present (skipping)' };
     }
     return { name: 'oauth_client_scope_health', status: 'warn', message: `Check failed: ${msg}` };
@@ -534,7 +515,7 @@ export async function checkStaleLocks(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // Pre-v0.30 brains may not have the gbrain_cycle_locks table yet.
-    if (/relation .* does not exist|no such table/i.test(msg)) {
+    if (isMissingSchemaObject(e, 'table', 'gbrain_cycle_locks')) {
       return { name: 'stale_locks', status: 'ok', message: 'gbrain_cycle_locks table not yet provisioned (skipping)' };
     }
     return { name: 'stale_locks', status: 'warn', message: `Check failed: ${msg}` };

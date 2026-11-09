@@ -22,3 +22,12 @@ test('docs/guides/sync-unblock-runbook.md renders SYNC_FAULT_TABLE verbatim', ()
   const expected = SYNC_FAULT_TABLE.map(rule => ({ code: rule.code, class: rule.class, safe_actions: [...rule.safe_actions], needs_human: rule.needs_human, escalate: rule.escalate }));
   expect(rows).toEqual(expected);
 });
+
+test('#6696 (A5/A6): the background pause is a wait; the full or too-small cap needs the host', async () => {
+  const { classifySyncFault } = await import('../src/core/persistence/sync-fault-class.ts');
+  expect(classifySyncFault({ code: 'write_capacity_backpressure', detail: 'principal_terminal_bytes' })).toEqual({ class: 'connection', safe_actions: ['retry'], needs_human: false });
+  for (const code of ['write_quota_exhausted', 'write_quota_insufficient']) {
+    expect(classifySyncFault({ code, detail: 'brain_lifetime_ids' })).toMatchObject({ class: 'systemic', safe_actions: ['none'], needs_human: true,
+      human_reason: expect.stringContaining('gbrain config set') });
+  }
+});

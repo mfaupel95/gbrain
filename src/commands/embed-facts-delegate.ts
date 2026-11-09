@@ -6,7 +6,7 @@ import { inspectLockHolder } from '../core/pglite-lock.ts';
 import { maybeDelegateLocalAdministration, persistenceConfigForBrain } from '../core/persistence/local-client.ts';
 import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { validateEmbedFactsOptions, type EmbedFactsOptions } from '../core/embed-facts-options.ts';
-import type { EmbedFactsResult } from '../core/embed-facts.ts';
+import { refusedFactsLine, type EmbedFactsResult } from '../core/embed-facts.ts';
 import { OperationError, opError } from '../core/ops/contract.ts';
 import { readFix } from '../core/ops/op-fix.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
@@ -56,6 +56,8 @@ export async function maybeDelegateFactEmbed(hostConfig: GBrainConfig | null, ar
           why: 'The owner stopped before admission, so the same request has not run yet.' } });
     }
     const result = delegated.result as EmbedFactsResult;
+    const refused = refusedFactsLine(result);
+    if (refused) process.stderr.write(refused + '\n');
     await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
     if (result.failures) setCliExitVerdict(1);
     return true;

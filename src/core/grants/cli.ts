@@ -1,4 +1,4 @@
-import { GRANT_PROFILES, GrantError, validatePrincipalGrant, type GrantPatch, type GrantProfileId } from './model.ts';
+import { GRANT_PROFILES, GrantError, validatePrincipalGrant, type GrantPatch, type GrantProfileId, type PrivatePagesGrant } from './model.ts';
 import { parseScopeString, assertAllowedScopes } from '../scope.ts';
 import { isValidHolder } from '../takes-fence.ts';
 
@@ -9,16 +9,22 @@ export interface RescopeGrantArgs {
   repair: boolean;
   dryRun: boolean;
   json: boolean;
+  /** No grant field and no --profile: print the stored grants and write nothing (#6993). */
+  printOnly: boolean;
 }
 
 export function parseRescopeGrantArgs(args: string[]): RescopeGrantArgs {
-  const result = parseRescopeGrantFlags(args);
-  if (!result.profile && Object.keys(result.patch).length === 0) throw new GrantError('invalid_grant', 'Pass a grant field or --profile to rescope');
-  return result;
+  return markPrintOnly(parseRescopeGrantFlags(args));
+}
+
+function markPrintOnly(result: RescopeGrantArgs): RescopeGrantArgs {
+  if (result.profile || Object.keys(result.patch).length > 0) return result;
+  if (result.repair) throw new GrantError('invalid_grant', 'Pass a grant field or --profile with --repair');
+  return { ...result, printOnly: true };
 }
 
 function parseRescopeGrantFlags(args: string[]): RescopeGrantArgs {
-  const result: RescopeGrantArgs = { patch: {}, repair: false, dryRun: false, json: false };
+  const result: RescopeGrantArgs = { patch: {}, repair: false, dryRun: false, json: false, printOnly: false };
   const csv = (value: string): string[] => value.split(',').map(s => s.trim()).filter(Boolean);
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
@@ -60,11 +66,19 @@ function parseRescopeGrantFlags(args: string[]): RescopeGrantArgs {
         if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new GrantError('invalid_grant', '--if-version must be a non-negative integer');
         result.expectedRevision = Number(value);
         break;
+      case '--private-pages': result.patch.privatePages = parsePrivatePagesFlag(value); break;
       default: throw new GrantError('invalid_grant', `Unknown flag: ${flag}`);
     }
   }
   assertProfileKept(result, '--allowed-operations all');
   return result;
+}
+
+/** `--private-pages granted-sources|none` (GBRA-156). */
+export function parsePrivatePagesFlag(value: string): PrivatePagesGrant {
+  if (value === 'granted-sources') return 'granted_sources';
+  if (value === 'none') return 'none';
+  throw new GrantError('invalid_grant', '--private-pages must be granted-sources or none', ['private_pages_invalid']);
 }
 
 /**
@@ -176,7 +190,7 @@ export function parseClientRescopeArgs(clientId: string, args: string[]): Rescop
   const result = parseRescopeGrantFlags(legacy);
   if (sources !== undefined) {
     validatePrincipalGrant({
-      principal: { kind: 'oauth_client', id: clientId }, scopes: [], allowedOperations: null, takesHolders: null, revision: 0,
+      principal: { kind: 'oauth_client', id: clientId }, scopes: [], allowedOperations: null, takesHolders: null, privatePages: 'none', revision: 0,
       shape: 'unified', drift: [], permissionsMalformed: false,
       sources: sources.length === 0 ? { kind: 'none' } : { kind: 'federated', writeSource: sources[0], readSources: sources },
     }, { operationNames: new Set() });
@@ -195,6 +209,5 @@ export function parseClientRescopeArgs(clientId: string, args: string[]): Rescop
     if (invalid.length) throw new GrantError('invalid_grant', `Invalid takes holder: ${invalid.join(', ')} (use world, brain, people/<slug>, companies/<slug> or a bare slug)`, ['takes_holders_invalid']);
     result.patch.takesHolders = takesHolders;
   }
-  if (!result.profile && Object.keys(result.patch).length === 0) throw new GrantError('invalid_grant', 'Pass a grant field or --profile to rescope');
-  return result;
+  return markPrintOnly(result);
 }

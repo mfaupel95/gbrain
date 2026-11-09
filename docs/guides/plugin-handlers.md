@@ -103,7 +103,13 @@ network library they use.
 
 **Idempotency.** The queue enforces unique `idempotency_key` at the DB
 layer, so you don't need to worry about double-submits from a cron that
-fires while the previous invocation is still running.
+fires while the previous invocation is still running. A dead or cancelled
+job does not hold its key: the next submit with that key clears it from the
+old row and records it there as `data.__released_idempotency_key`, which is
+why many rows (subagent rows especially) carry that field. It is bookkeeping,
+not a parameter: the dream paid-loop breaker, the synthesize daily cap and
+doctor's queue checks read it so a resubmitted key's earlier deaths and
+submissions still count.
 
 ## Gbrain's migration flow
 

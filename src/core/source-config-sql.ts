@@ -5,7 +5,9 @@
  * strings or arrays of config fragments. The recursive CTE unwraps strings up
  * to the same depth as the application reader, then merges recoverable array
  * fragments left-to-right. Invalid fragments are ignored instead of making a
- * repair or archive operation fail.
+ * repair or archive operation fail: gbrain_try_jsonb (schema.sql, v263) parses
+ * a string layer or returns NULL, which works on Postgres 15 where the IS JSON
+ * predicate does not parse (#7112).
  *
  * This expression is static SQL: it contains no user input.
  */
@@ -14,11 +16,11 @@ export const SOURCE_CONFIG_OBJECT_SQL = `(
   root_layers(value, depth) AS (
     SELECT COALESCE(config, '{}'::jsonb), 0
     UNION ALL
-    SELECT (value #>> '{}')::jsonb, depth + 1
+    SELECT gbrain_try_jsonb(value #>> '{}'), depth + 1
       FROM root_layers
      WHERE depth < 10
        AND jsonb_typeof(value) = 'string'
-       AND (value #>> '{}') IS JSON
+       AND gbrain_try_jsonb(value #>> '{}') IS NOT NULL
   ),
   root(value) AS (
     SELECT value FROM root_layers ORDER BY depth DESC LIMIT 1
@@ -35,11 +37,11 @@ export const SOURCE_CONFIG_OBJECT_SQL = `(
   fragment_layers(ordinality, value, depth) AS (
     SELECT ordinality, value, 0 FROM fragment_seeds
     UNION ALL
-    SELECT ordinality, (value #>> '{}')::jsonb, depth + 1
+    SELECT ordinality, gbrain_try_jsonb(value #>> '{}'), depth + 1
       FROM fragment_layers
      WHERE depth < 10
        AND jsonb_typeof(value) = 'string'
-       AND (value #>> '{}') IS JSON
+       AND gbrain_try_jsonb(value #>> '{}') IS NOT NULL
   ),
   fragments AS (
     SELECT DISTINCT ON (ordinality) ordinality, value

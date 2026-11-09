@@ -34,15 +34,14 @@
  * sees the constraint.
  */
 
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
+import { execFileSync } from '../spawn.ts';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility, FactKind, FactAttribution } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
 import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
 import { yamlScalar } from '../frontmatter-inference.ts';
-import { sanitizeText } from '../batch-rows.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
 import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesystemLock } from '../minions/source-filesystem.ts';
@@ -52,7 +51,6 @@ import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-dura
 import { upsertFactRow, parseFactsFence, formatFenceDate } from '../facts-fence.ts';
 import { unparsedFenceRefusal } from '../fence-repair/refusal.ts';
 import type { OperationError } from '../ops/contract.ts';
-import { contentHash } from '../utils.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
@@ -62,6 +60,10 @@ import { withPageTierKept } from '../trust/fence-append.ts';
 import { recordTaintEdges } from '../trust/taint.ts';
 import { recordFlaggedRow, type GatedRowDecision } from '../write-gate-store.ts';
 import type { TaintInput, WriteTrust } from '../trust/tier.ts';
+import { gitChildEnv } from '../git-env.ts';
+import { urlCloneReadOnly } from '../url-clone.ts';
+import { bodyUnread } from '../page-body/page-shape.ts';
+import { bestEffortStoredBodyMirror, fileBodyMatchesStored, fileDatabaseDriftToken, mirrorFileBody, readStoredBody } from './file-body-guard.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -114,8 +116,12 @@ export interface FenceWriteResult {
   inserted: number;
   /** DB ids assigned to the inserted rows, in input order. */
   ids: number[];
-  /** True when the path fell through to DB-only because local_path was unset. */
+  /** True when the path fell through to DB-only: local_path unset, `sync.write_through` off, or a gbrain-owned clone (`databaseOnlyReason`). */
   legacyFallback?: true;
+  /** #6946: why a `legacyFallback` is expected — `url_clone`: the source is a clone gbrain owns and pulls (url-clone.ts), so its checkout is never written. */
+  databaseOnlyReason?: 'url_clone' | 'file_database_drift';
+  /** A held file mirror's typed diagnostic and repair instructions; facts take the DB-only fallback. */
+  warning?: string;
   /** True when fence parse-validate failed; rows were NOT inserted, .tmp quarantined. */
   fenceWriteFailed?: true;
   /**
@@ -201,7 +207,7 @@ export function gitPathState(repoPath: string, filePath: string): FactFenceGitPa
     const status = execFileSync(
       'git',
       ['-C', repoPath, 'status', '--porcelain=v1', '--untracked-files=all', '--', rel],
-      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: process.env },
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv() },
     );
     const lines = status.split('\n').filter((l) => l.length > 0);
     if (lines.length === 0) return 'clean';
@@ -298,7 +304,9 @@ export function stubEntityPage(
  * the `## Facts` fence, atomically renames the .tmp into place, and
  * stamps the DB index via engine.insertFacts.
  *
- * Returns `legacyFallback: true` when `target.localPath` is null —
+ * Returns `legacyFallback: true` when `target.localPath` is null (also
+ * under `sync.write_through` off and, with `databaseOnlyReason: 'url_clone'`,
+ * for a clone gbrain owns, #6946) —
  * the caller is responsible for falling through to the legacy
  * DB-only `engine.insertFact` path. We don't do the legacy fallback
  * here because the caller has the FactsBackstopCtx (visibility,
@@ -343,9 +351,8 @@ export async function writeFactsToFence(
   // choice: no fence file, no stub entity page, no git commit. Same
   // legacyFallback contract as a missing local_path — the caller's DB-only
   // path still records the facts.
-  if (await isWriteThroughDisabled(engine)) {
-    return { inserted: 0, ids: [], legacyFallback: true };
-  }
+  if (await isWriteThroughDisabled(engine)) return { inserted: 0, ids: [], legacyFallback: true };
+  if (await urlCloneReadOnly(engine, target.sourceId)) return { inserted: 0, ids: [], legacyFallback: true, databaseOnlyReason: 'url_clone' };
 
   // #4204: compute the SAME path writePageThrough computes for this
   // (source, slug) — the fence appends to the page's file, so the two writers
@@ -386,8 +393,24 @@ export async function writeFactsToFence(
 
       // 1. Read existing body or stub-create.
       let body: string;
-      if (existsSync(filePath)) {
+      const fromFile = existsSync(filePath);
+      const stored = fromFile ? await readStoredBody(engine, target.sourceId, target.slug) : null;
+      const drift = (when: 'before' | 'during'): FenceWriteResult => {
+        const warning = fileDatabaseDriftToken(target.slug, target.sourceId, when);
+        console.warn(`[facts.fence] ${warning}`);
+        return { inserted: 0, ids: [], legacyFallback: true, databaseOnlyReason: 'file_database_drift', warning, ...withdrawnSkipped };
+      };
+      if (fromFile) {
         body = readFileSync(filePath, 'utf-8');
+        const refusal = refuseUnparsedFence(body, target, filePath);
+        if (refusal) return { inserted: 0, ids: [], fenceWriteFailed: true, fenceRefusal: refusal, ...withdrawnSkipped };
+        const page = await engine.getPage(target.slug, { sourceId: target.sourceId });
+        if (page && bodyUnread(page)) {
+          const warning = `${target.slug} (page_body_segmented: its file is not compared or rewritten here; facts are recorded database-only)`;
+          console.warn(`[facts.fence] ${warning}`);
+          return { inserted: 0, ids: [], legacyFallback: true, warning, ...withdrawnSkipped };
+        }
+        if (stored ? !fileBodyMatchesStored(body, target.slug, stored) : page !== null) return drift('before');
       } else {
         // Stub-creation guard, two arms:
         //
@@ -441,11 +464,14 @@ export async function writeFactsToFence(
           );
           return { inserted: 0, ids: [], stubGuardBlocked: true, ...withdrawnSkipped };
         }
+        const dbOnly = await dbOnlyPageRoute(engine, target, facts.length); if (dbOnly) return { ...dbOnly, ...withdrawnSkipped };
         // Stub-create the parent directory if it doesn't exist.
         mkdirSync(dirname(filePath), { recursive: true });
         const activePack = await loadActivePackBestEffort({ engine } as never);
         body = stubEntityPage(target.slug, activePack?.manifest ?? null);
       }
+
+      const fileBefore = fromFile ? body : null;
 
       // 2. Upsert each fact onto the fence in input order. row_num
       //    monotonically increases (max-existing + 1 per call, append-only).
@@ -536,42 +562,6 @@ export async function writeFactsToFence(
         return { inserted: 0, ids: [], fenceWriteFailed: true };
       }
 
-      // 5. Rename .tmp → file. POSIX atomic; the canonical file is
-      //    either the old content or the new content, never partial.
-      renameSync(tmpPath, filePath);
-
-      // #4872: mirror the rewritten file into pages.compiled_truth. get_page
-      // and the extract_facts reconcile read the DB body, not the file — left
-      // stale, a plain get→put round-trip flattens the new row off disk and
-      // the next reconcile deletes it from the facts table. Same recipe as
-      // forget.ts (#4696): parse + sanitize the FILE bytes as import-file.ts
-      // does. Body-only: content_chunks are untouched, so the row KEEPS its
-      // old content_hash and the next sync re-imports + re-chunks. Stamping
-      // the importer's hash here made sync skip the page and left search
-      // blind to the new row forever. Never persist an EMPTY hash: a row
-      // that had none gets a row-shaped hash of its pre-mirror content,
-      // which the rewritten file can't match. Best-effort: the file is
-      // already committed; a stub page with no DB row is created by sync.
-      try {
-        const reparsed = parseMarkdown(tmpBody, `${target.slug}.md`);
-        const existing = await engine.getPage(target.slug, { sourceId: target.sourceId });
-        if (existing) {
-          // #5575 ENG-1: the appended rows carry their own tier; the page keeps its tier.
-          await maintenanceTransaction(engine, tx => withPageTierKept(tx, target, () => tx.refreshPageBody(target.slug, target.sourceId,
-            sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
-            existing.content_hash || contentHash(existing))));
-        }
-      } catch (err) {
-        // The file is committed; the page cache stays stale until the next
-        // sync (reconcile refuses destructive work meanwhile). Say so.
-        console.warn(`[facts.fence] FACTS_PAGE_MIRROR_FAILED: ${target.slug} (source ${target.sourceId}): ${err instanceof Error ? err.message : String(err)}; pages cache stale until the next sync`);
-      }
-
-      // 6. Stamp the DB. extractFactsFromFenceText handles the
-      //    validFrom/validUntil date derivation + the strikethrough
-      //    semantic distinction. We only want to insert the NEW rows
-      //    (those with row_nums in assignedRowNums), so filter the
-      //    re-parsed facts to that subset.
       const allExtracted = extractFactsFromFenceText(parsed.facts, target.slug, target.sourceId);
       const newRowSet = new Set(assignedRowNums);
       const toInsert = allExtracted.filter(r => newRowSet.has(r.row_num));
@@ -588,7 +578,27 @@ export async function writeFactsToFence(
         source_session: facts[i].sessionId,
       }));
 
-      const result = await insertFenceRows(engine, target.sourceId, enriched, facts, derivation);
+      const result = await maintenanceTransaction(engine, async tx => {
+        if (fileBefore === null ? existsSync(filePath) : !existsSync(filePath) || readFileSync(filePath, 'utf-8') !== fileBefore) return null;
+        if (stored && !await bestEffortStoredBodyMirror(tx, target.sourceId, target.slug, stored,
+          savepoint => withPageTierKept(savepoint, target, () => mirrorFileBody(savepoint, target.sourceId, target.slug, tmpBody, stored)),
+          err => console.warn(`[facts.fence] FACTS_PAGE_MIRROR_FAILED: ${target.slug} (source ${target.sourceId}): ${err instanceof Error ? err.message : String(err)}; page cache stale until gbrain sync --source ${target.sourceId}`))) return null;
+        if (!stored && await readStoredBody(tx, target.sourceId, target.slug, true)) return null;
+        const inserted = await insertFenceRows(tx, target.sourceId, enriched, facts, derivation);
+        if (fileBefore === null ? existsSync(filePath) : !existsSync(filePath) || readFileSync(filePath, 'utf-8') !== fileBefore) {
+          throw new FenceFileChanged();
+        }
+        assertSourceFilesystemActive();
+        renameSync(tmpPath, filePath);
+        return inserted;
+      }).catch(err => {
+        if (err instanceof FenceFileChanged) return null;
+        throw err;
+      });
+      if (!result) {
+        rmSync(tmpPath, { force: true });
+        return drift('during');
+      }
       // v0.46 (#3014) — an unresolvable `superseded by #N` reference (self
       // / dangling / struck target) leaves superseded_by NULL; log it rather
       // than swallow it. The row still lands (expired_at set for struck
@@ -612,6 +622,8 @@ export async function writeFactsToFence(
   );
 }
 
+class FenceFileChanged extends Error {}
+
 /**
  * The DB stamp of new fence rows in one attributed transaction: at the
  * deriver's tier when it declared one, with input edges, and the flag receipt
@@ -627,6 +639,27 @@ async function insertFenceRows(engine: BrainEngine, sourceId: string, rows: Para
     }
     return inserted;
   }, derivation?.trust);
+}
+
+/**
+ * #6398: no file is not no page. A DB-only page (a row with no file, a row
+ * whose recorded source_path file vanished, or a tombstoned row) takes the
+ * DB-only route: a stub would be mirrored over the DB body and timeline, or
+ * resurrect a deleted page. An unreadable row writes nothing. Null: no row,
+ * the stub may be created.
+ */
+async function dbOnlyPageRoute(engine: BrainEngine, target: FenceTarget, factCount: number): Promise<FenceWriteResult | null> {
+  let live: Awaited<ReturnType<BrainEngine['getPage']>>;
+  try {
+    live = await engine.getPage(target.slug, { sourceId: target.sourceId, includeDeleted: true });
+  } catch (err) {
+    console.warn(`[facts.fence] FACTS_PAGE_READ_FAILED: ${target.slug} (source ${target.sourceId}): ${err instanceof Error ? err.message : String(err)}; nothing written`);
+    return { inserted: 0, ids: [], fenceWriteFailed: true };
+  }
+  if (!live) return null;
+  logStubGuardEvent({ slug: target.slug, source_id: target.sourceId, fact_count: factCount, reason: 'db_only_page' });
+  console.warn(`[facts] page ${target.slug} (source ${target.sourceId}) has no file${live.deleted_at ? ' and is deleted' : ''} — routing facts to the legacy DB-only path instead of creating a stub that would overwrite it.`);
+  return { inserted: 0, ids: [], stubGuardBlocked: true };
 }
 
 /**

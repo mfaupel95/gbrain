@@ -3,6 +3,7 @@
  * Each stage reads the resolved request (HybridRequest, request.ts) and
  * writes its per-request accumulators only as `req.<field>`.
  */
+import { applyGeneratedDemotion, type GeneratedPage } from '../provenance-demotion.ts';
 import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import { perArmPoolLimit } from '../eval-pool-depth.ts';
@@ -16,6 +17,7 @@ import type { ResolveSearchModeInput, ResolvedSearchKnobs } from '../mode.ts';
 import { normalizeExpansionVariantBudget } from '../fusion-lists.ts';
 import { normalizeKeywordArmConfidenceFloor } from '../arm-confidence.ts';
 import { normalizeMetadataBoostGate } from '../metadata-boost-gate.ts';
+import { normalizeRerankGate } from '../crag.ts';
 import { normalizeRelationalRerankPin } from '../relational-rerank-pin.ts';
 import { isRelationalQuery } from '../relational-plan.ts';
 import { pushDegraded } from './degraded.ts';
@@ -28,6 +30,23 @@ import { resolveCjkKeywordDeadlineMs } from '../cjk-keyword-deadline.ts';
 import { resolveSearchDateBounds } from '../date-bounds.ts';
 import { type DecideSearchContext, decideMetaFor, resolveAndLaunchDecide } from '../decide-stage.ts';
 import { applySearchIntent } from '../decide-retrieval.ts';
+import { liftModeCut } from '../page-rank-cut.ts';
+import { type StageTimer, UNTIMED } from '../stage-timings.ts';
+
+/**
+ * searchVector's bounded-escalation exhaustion signal: stamped on `degraded`,
+ * accumulated on `req` (the vector side passes its own stamp list).
+ */
+export function vectorPoolMetaSink(req: HybridRequest, degraded: DegradedStageEntry[]): NonNullable<SearchOpts['onVectorPoolMeta']> {
+  return (m) => {
+    if (!m.underfilled) return;
+    pushDegraded(degraded, 'vector_candidates_incomplete', m.reason === 'deadline' ? 'timeout' : m.reason ?? 'candidate_budget');
+    if (!req.vectorPoolUnderfill || m.escalations >= req.vectorPoolUnderfill.escalations) {
+      const { underfilled, ...detail } = m;
+      req.vectorPoolUnderfill = { ...detail, incomplete: true };
+    }
+  };
+}
 
 /**
  * Everything the stages read, resolved once at hybridSearch entry, plus the
@@ -59,6 +78,8 @@ export interface HybridRequest {
   vectorPoolUnderfill: HybridSearchMeta['vector_pool_underfilled'];
   /** #5989: the last bounded CJK keyword arm outcome. */
   keywordCandidates?: HybridSearchMeta['keyword_candidates'];
+  /** Set when the cosine re-score fell back from SQL to JavaScript (search/cosine-rescore.ts). */
+  cosineRescore?: HybridSearchMeta['cosine_rescore'];
   /** v0.25.0: whether query expansion actually produced variants (onMeta). */
   expansionApplied: boolean;
   /** Telemetry counters set at each return path before emitHybridMeta. */
@@ -69,8 +90,18 @@ export interface HybridRequest {
   decide?: DecideSearchContext;
   /** Set by the rerank stage when the System One reranker answered. */
   rerankMeta?: { model_resolved: string };
+  /** #7492: set when an image-reading vector arm ran; emitted as `image_arm` (coverage counts pending images only then). */
+  imageArmRan?: boolean;
   /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
   relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
+  /** Set by the collapse stage when it folded or read in a row (meta.collapse). */
+  collapse?: import('../collapse.ts').CollapseDecision;
+  /** Page facts the collapse stage read, reused by its second pass after the identity tiers. */
+  collapseFacts?: Map<number, import('../collapse.ts').PageFacts>;
+  /** GBRA-156: the fused pages' facts, read beside the post-fusion stages (collapse.ts prefetchPageFacts). */
+  collapsePrefetch?: Promise<Map<number, import('../collapse.ts').PageFacts> | null>;
+  /** The op's stage-timing collector (`opts._timings`), or the no-op timer. */
+  timer: StageTimer;
 }
 
 const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
@@ -92,7 +123,7 @@ export async function resolveHybridRequest(
   // (#4359) hybridSearchCached threads its already-loaded snapshot; reuse it.
   const { loadSearchModeConfig, resolveSearchMode } = await import('../mode.ts');
   const modeInput = opts?._searchModeInput ?? await loadSearchModeConfig(engine);
-  const resolvedMode = resolveSearchMode({
+  const resolvedMode = liftModeCut(resolveSearchMode({
     // T4/D5 — per-call mode selector (e.g. `--mode tokenmax`). The op layer
     // only passes this for trusted/local callers; remote callers leave it
     // undefined and fall through to the server-configured mode (no cost
@@ -139,8 +170,10 @@ export async function resolveHybridRequest(
       keyword_arm_confidence_floor: normalizeKeywordArmConfidenceFloor(opts?.keywordArmConfidenceFloor),
       // Ranker wave (Phase E3) — metadata boost gate per-call thread-through (eval A/B).
       metadata_boost_gate: normalizeMetadataBoostGate(opts?.metadataBoostGate),
+      // W3 — rerank gate per-call thread-through (eval A/B; knobsHash `rrg=`).
+      reranker_gate: normalizeRerankGate(opts?.rerankGate),
     },
-  });
+  }), opts?.pageRankCut);
 
   // System One: resolve the decide context and launch S2 now, alongside the
   // regex classifier (undefined when every slot is off: no decide work).
@@ -165,7 +198,7 @@ export async function resolveHybridRequest(
 
   const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
-  const innerLimit = perArmPoolLimit(limit, offset, PRE_FUSION_POOL_FLOOR);
+  const innerLimit = perArmPoolLimit(limit, offset, Math.max(PRE_FUSION_POOL_FLOOR, resolvedMode.diverse_pool_depth));
 
   // v0.32.x search-lite: classify intent once up front. Drives BOTH the
   // legacy auto-detail / salience / recency suggestions AND the new
@@ -207,6 +240,8 @@ export async function resolveHybridRequest(
     // type filter to SQL level so the limit budget goes to candidate-typed
     // pages instead of being eaten by note/transcript/article pages.
     types: opts?.types,
+    // #7159: frontmatter equality, pushed into the same legs.
+    where: opts?.where,
     // Exact-slug and prefix exclusions are caller contract too (grade-takes
     // passes exclude_slugs; SDK callers pass prefix excludes); dropping them
     // here silently ignored them on every arm.
@@ -216,6 +251,7 @@ export async function resolveHybridRequest(
     // Per-brain `search.source_boosts` (read in the mode snapshot) over the
     // defaults; the env override still wins inside resolveBoostMap.
     source_boosts: resolveBoostMap(undefined, modeInput.sourceBoosts),
+    keywordPhrase: resolvedMode.keyword_phrase,
     // v0.29.1: since/until take precedence over deprecated afterDate/beforeDate.
     // The engine still consumes the legacy field names; this aliasing keeps
     // PR #618 callers compiling while the new names are the public surface.
@@ -247,8 +283,8 @@ export async function resolveHybridRequest(
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
     // #5824 rollback switch, latched once per process from env/config.
-    vectorLegacyGuard: resolveVectorLegacyGuard(cfgForColumn),
-    hnswIterativeScan: resolveHnswIterativeScan(cfgForColumn),
+    vectorLegacyGuard: resolveVectorLegacyGuard(engine, cfgForColumn),
+    hnswIterativeScan: resolveHnswIterativeScan(engine, cfgForColumn),
     // #5989: bound the CJK keyword arm by one deadline; its outcome and wall time ride the meta.
     cjkKeyword: {
       deadlineMs: resolveCjkKeywordDeadlineMs(cfgForColumn),
@@ -262,19 +298,13 @@ export async function resolveHybridRequest(
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this. Knob: search.keywordOrFallback (rationale: ModeBundle).
     orFallback: resolvedMode.keywordOrFallback,
+    onKeywordIncomplete: (reason) => pushDegraded(degraded, 'keyword_candidates_incomplete', reason),
     // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
     // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
     // ACCUMULATES across vector calls (adversarial F8): expansion runs N
     // sub-queries through this one opts object — last-write-wins would
     // under-report multi-query exhaustion. Keep the max-escalations event.
-    onVectorPoolMeta: (m) => {
-      if (!m.underfilled) return;
-      pushDegraded(degraded, 'vector_candidates_incomplete', m.reason === 'deadline' ? 'timeout' : m.reason ?? 'candidate_budget');
-      if (!req.vectorPoolUnderfill || m.escalations >= req.vectorPoolUnderfill.escalations) {
-        const { underfilled, ...detail } = m;
-        req.vectorPoolUnderfill = { ...detail, incomplete: true };
-      }
-    },
+    onVectorPoolMeta: (m) => vectorPoolMetaSink(req, degraded)(m),
   };
   // Post-arm identity injections re-apply the arms' exclude contract.
   const identityTierOpts: IdentityTierOpts = {
@@ -305,6 +335,7 @@ export async function resolveHybridRequest(
     expansionApplied: false,
     lastResultsCount: 0,
     lastRank1Score: undefined,
+    timer: opts?._timings ?? UNTIMED,
   };
   if (decide) req.decide = decide;
   return req;
@@ -312,8 +343,9 @@ export async function resolveHybridRequest(
 
   // Intent identity boosts (exact/mentioned title or slug, mentioned alias),
   // shared by the fused path and both keyword-only paths. Caller re-sorts.
-export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[]): Promise<void> {
+export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[], generatedRead?: Promise<GeneratedPage[] | null>): Promise<void> {
   const { engine, query, opts, suggestions, intentWeightingOn, intentWeights, resolvedMode } = req;
+  await applyGeneratedDemotion(engine, list, query, { sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate }, generatedRead);
   if (intentWeights.exactMatchBoost === 1.0) {
     // #4694: general and temporal questions still honor a multi-token
     // title that is the query's subject. Not concept intent (Cat 13: a
@@ -341,13 +373,16 @@ export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult
   // never waits.
 export function emitHybridMeta(req: HybridRequest, armMeta: HybridSearchMeta): void {
   const { engine, opts } = req;
-  const rawMeta = req.keywordCandidates ? { ...armMeta, keyword_candidates: req.keywordCandidates } : armMeta;
+  const rawMeta = req.keywordCandidates || req.imageArmRan
+    ? { ...armMeta, ...(req.keywordCandidates ? { keyword_candidates: req.keywordCandidates } : {}), ...(req.imageArmRan ? { image_arm: true as const } : {}) }
+    : armMeta;
   const decide = decideMetaFor(req.decide);
   const answerability = req.decide?.answerability;
-  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan
+  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan || req.collapse
     ? {
         ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}),
         ...(answerability ? { answerability } : {}), ...(req.relationalPlan ? { relational_plan: req.relationalPlan } : {}),
+        ...(req.collapse ? { collapse: req.collapse } : {}),
       }
     : rawMeta;
   try {

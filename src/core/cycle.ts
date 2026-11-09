@@ -43,8 +43,9 @@
  * trigger lock acquisition.
  */
 
+import { withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, realpathSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import { gbrainPath, loadConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import { createProgress, type ProgressReporter } from './progress.ts';
@@ -58,8 +59,8 @@ import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 import { acquireLeaseSet, maintenanceLockBusySkip, MAINTENANCE_LEASE_ID } from './cycle/lock-set.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts'; import { embedBackfillFix } from './embed-consent.ts';
-import { anyAbortSignal } from './abort-signals.ts';
-import { maybeRefreshPlannerStats } from './planner-stats.ts';
+import { anyAbortSignal } from './abort-signals.ts'; import { urlClonePullBlock, urlClonePullBlockSummary } from './url-clone.ts';
+import { maybeRefreshPlannerStats } from './planner-stats.ts'; import { listSourceChangedPages, sourceCycleWindowStamp, unionSlugSets, type SourceCycleWindow } from './cycle/source-window.ts';
 
 export { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 export { anyAbortSignal } from './abort-signals.ts';
@@ -70,6 +71,7 @@ export type CyclePhase =
   | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
   | 'fence_repair' // #6188: repairs held and stored malformed facts/takes fences (global maintenance lane)
   | 'content_repair' // #6377: the rest of the content-repair lane (slug conflicts and later kinds), right after fence_repair
+  | 'unindexed_files' // #6865: committed files with no page and no hold, scheduled for a re-screen on the next sync
   | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   // v0.36.1.0 Hindsight calibration wave:
@@ -81,10 +83,12 @@ export type CyclePhase =
   //    narrative pattern statements + active bias tags. Voice-gated.
   | 'propose_takes' | 'grade_takes' | 'calibration_profile'
   | 'edge_contradictions' // temporal typed edges: LLM flags conflicts, date math closes
+  | 'claim_conflicts' // GBRA-216: keyless typed-claim conflicts filed as decide_proposals (default off)
   // #2653 — drift detection (default OFF; dream.drift.enabled). LLM-judges
   // soft-band takes against recent timeline evidence; report-only in v1
   // (writes reports/drift-<date>; auto_update mutates nothing).
   | 'drift'
+  | 'standing_questions' // C4 pinned questions (src/core/questions/phase.ts)
   // #5876 — Life Chronicle events from meeting/conversation/calendar pages (default ON).
   | 'chronicle'
   // Lane D — runs queued facts-absorb jobs on PGLite (no job worker there); bounded per run and per day.
@@ -129,6 +133,8 @@ export const ALL_PHASES: CyclePhase[] = [
   'fence_repair',
   // #6377: the other content-repair kinds (src/core/repair/content-lane.ts) right after it, same reason.
   'content_repair',
+  // #6865: after the repair lane, so its holds are settled; schedules unindexed files for the next sync.
+  'unindexed_files',
   'synthesize',
   'extract',
   // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
@@ -179,10 +185,12 @@ export const ALL_PHASES: CyclePhase[] = [
   'grade_takes',
   'calibration_profile',
   'edge_contradictions', // temporal typed edges; after extract so it judges fresh relationship state
+  'claim_conflicts', // GBRA-216: keyless typed-claim conflicts; after extract_facts so it reads fresh fence claims
   // #2653 — drift detection. Default OFF (dream.drift.enabled). Runs AFTER
   // the calibration trio (fresh take resolutions) and BEFORE embed so the
   // drift report page gets embedded same-cycle. Report-only in v1.
   'drift',
+  'standing_questions', // C4 pinned questions (global); BEFORE embed so question pages embed same-cycle.
   // #5876 — Life Chronicle events (global). BEFORE embed so event pages embed same-cycle.
   'chronicle',
   // Lane D — automatic facts drain (PGLite). BEFORE embed so new facts embed same-cycle.
@@ -329,6 +337,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'sync',
   'fence_repair', // #6188: writes repaired fences through coordinated writes
   'content_repair', // #6377: writes content repairs through the same coordinated file-repair path
+  'unindexed_files', // #6865: writes the re-screen schedule and its stored result
   'synthesize',
   'extract',
   // v0.32.2 — wipes + re-inserts facts per affected page.
@@ -347,7 +356,9 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'calibration_profile',
   // #2653 — writes the reports/drift-<date> page.
   'drift',
+  'standing_questions', // C4: writes pinned answers and question pages.
   'edge_contradictions', // writes proposals and (apply mode) closure lines
+  'claim_conflicts', // writes decide_proposals rows
   // #5876 — writes event pages, projections and the chronicle ledger.
   'chronicle',
   // Lane D — writes facts (fence + index) through facts-absorb jobs.
@@ -485,11 +496,19 @@ export interface CycleReport {
      */
     phantoms_skipped_drift: number;
   };
+  /** #6696 (A4): `write_capacity_low` / `write_capacity_backpressure` when a cumulative write cap needs attention (every cycle, unthrottled). */
+  notices?: import('./agent-output.ts').Notice[];
 }
 
 export interface CycleOpts {
   /** If true, no writes to filesystem or DB. All phases honor this. */
   dryRun?: boolean;
+  /**
+   * #6023: caller trust for the consolidate dry-run preview. Only the local
+   * CLI (`remote: false`) sees private fact text in `details.clusters`;
+   * minion handlers and anything else leave it unset (fail-closed).
+   */
+  remote?: boolean;
   /** Defaults to ALL_PHASES. Pass a subset for --phase lint etc. */
   phases?: CyclePhase[];
   /**
@@ -508,6 +527,8 @@ export interface CycleOpts {
    * + refreshes the cycle-lock-table TTL.
    */
   yieldBetweenPhases?: () => Promise<void>;
+  /** #7241: awaited as each selected phase starts its work (index and count within this cycle's selection); errors are logged, never fatal. */
+  onPhaseStart?: (phase: CyclePhase, index: number, count: number) => Promise<void> | void;
   /**
    * Generic in-phase keepalive (v0.23). Long-running phases (synthesize
    * waiting on a fan-out aggregator, patterns rolling up reflections)
@@ -568,6 +589,8 @@ export interface CycleOpts {
    * Validated via `assertValidSourceId` in `cycleLockIdFor` (defense-in-depth).
    */
   sourceId?: string;
+  /** #6803, #8573: a source cycle with no sync works on a bounded window of its pages changed after this (null: from its oldest page); see cycle/source-window.ts. */
+  sourceChangedSince?: string | null;
   /**
    * #4700 — bare `gbrain dream` may opt the brain's default-like source
    * (sources.default / sole-non-default routing) into the full implicit
@@ -589,13 +612,15 @@ export interface CycleOpts {
    * Never reads or writes config — the phase still evaluates its config
    * gate every call; this only overrides the boolean OUTCOME for that one
    * call. Applies to: patterns, synthesize, conversation_facts_backfill,
-   * enrich_thin, skillopt (the phases that gate on a `.enabled` config
+   * enrich_thin, skillopt, lint, consolidate (the phases that gate on a `.enabled` config
    * key read inside the phase's own module). Does NOT apply to
    * extract_atoms / synthesize_concepts — those are pack-gated via
    * `packDeclaresPhase`, a different mechanism with its own existing
    * one-shot escape hatch (`--drain` for extract_atoms).
    */
   onceForPhase?: CyclePhase;
+  /** #6297: the operator named the phases (`gbrain dream --phase`); patterns then skips its in-cycle cadence. */
+  directPhases?: boolean;
   /**
    * Absolute wall-clock deadline (epoch ms) of the enclosing minion job,
    * from `MinionJobContext.deadlineAtMs` (the claim-time `timeout_at`
@@ -1045,9 +1070,13 @@ function checkAborted(signal?: AbortSignal): void {
 // keyword is the minimal seam that lets behavioral tests drive the
 // wrapper's result-mapping (counter → status enum + summary) without
 // going through runCycle's full setup cost.
-export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string): Promise<PhaseResult> {
+export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string, opts: { once?: boolean } = {}): Promise<PhaseResult> {
   try {
-    const [{ runLintCore }, { cycleLintFixEnabled, cycleLintExcludes }] = await Promise.all([import('../commands/lint.ts'), import('./cycle/lint-fix-setting.ts')]);
+    const [{ runLintCore }, { cycleLintFixEnabled, cycleLintExcludes, cycleLintPhaseEnabled }] = await Promise.all([import('../commands/lint.ts'), import('./cycle/lint-fix-setting.ts')]);
+    // #6369: `cycle.lint.enabled=false` skips the phase before any scan; `dream --phase lint --once` bypasses it.
+    if (!opts.once && !(await cycleLintPhaseEnabled(engine))) {
+      return { phase: 'lint', status: 'skipped', duration_ms: 0, summary: 'lint skipped: cycle.lint.enabled=false', details: { reason: 'disabled', enable_hint: 'gbrain config set cycle.lint.enabled true' } };
+    }
     // issue #1678: pass the cycle's live engine so lint's content-sanity
     // DB-plane lift REUSES it instead of creating + disconnecting a
     // competing module-style engine that nulls the shared db singleton
@@ -1198,7 +1227,7 @@ export async function resolveSourceForDir(
     const matched: string[] = [];
     for (const row of candidates) {
       try {
-        if (realpathSync(row.local_path) === realDir) matched.push(row.id);
+        if (isAbsolute(row.local_path) && realpathSync(row.local_path) === realDir) matched.push(row.id);
       } catch {
         // Stale/unreadable registered path — not a match, keep scanning.
       }
@@ -1259,6 +1288,8 @@ async function runPhaseSync(
     // instead of the global config key. The global key can drift out of
     // git history (force push, GC) causing a full reimport of all files.
     const sourceId = await resolveSourceForDir(engine, brainDir);
+    // #7630: with no matching source, a relative default local_path would leave this sync on the global anchors; refuse like sync does.
+    if (!sourceId) await (await import('./sync-applicability.ts')).assertSyncAnchorAbsolute(engine, { sourceId: 'default' });
     // #5255: managed sync refuses `git pull`; a cycle syncs local HEAD and reports it (explicit sync keeps refusing).
     const managedPullSkipped = pull && await isManagedBrain(engine);
     const result = await performSync(engine, {
@@ -1270,7 +1301,7 @@ async function runPhaseSync(
       noExtract: willRunExtractPhase,      // dedupe ONLY when cycle's extract phase will also run.
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
                                            // sync's inline extract still runs to preserve prior behavior.
-      explicitProcessing: [],              // unattended: an unfinished managed cursor keeps its own options (#5632)
+      drainHolder: { kind: 'cycle', id: null }, // #6712 PR 1: a busy drain lease skips like a busy sync lock
     });
     const syncedCount = result.added + result.modified;
     // #3068: a pull_failed partial means the internal git pull failed and the
@@ -1279,6 +1310,7 @@ async function runPhaseSync(
     // doesn't report a clean run over a wedged source. Timeout-class partials
     // keep the pre-existing 'ok' mapping (they converge on retry by design).
     const pullFailedPartial = result.status === 'partial' && result.reason === 'pull_failed';
+    const pullBlock = pullFailedPartial && sourceId ? await urlClonePullBlock(engine, sourceId) : null;
     // Untracked-gap fix: uncommitted working-tree drift (files invisible to
     // commit-driven sync) surfaces as 'warn', not a clean 'ok +0' — a nightly
     // cycle over a dirty vault otherwise reports convergence it never achieved.
@@ -1297,7 +1329,7 @@ async function runPhaseSync(
       duration_ms: 0,
       summary: dryRun
         ? `${syncedCount} page(s) would sync, ${result.deleted} would delete`
-        : pullFailedPartial
+        : pullBlock ? urlClonePullBlockSummary(pullBlock) : pullFailedPartial
           ? `git pull failed, nothing imported — source may be behind its remote (sync anchor unchanged)`
           : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted${uncommittedNote}${upstreamNote}`,
       details: {
@@ -1311,6 +1343,7 @@ async function runPhaseSync(
         syncStatus: result.status,
         ...(result.reason ? { syncReason: result.reason } : {}),
         ...(result.uncommitted ? { uncommitted: result.uncommitted } : {}),
+        ...(pullBlock ? { pull_blocked: { code: pullBlock.code, paths: pullBlock.paths, fix: pullBlock.fix } } : {}),
         dryRun,
       },
       pagesAffected: result.pagesAffected,
@@ -1324,6 +1357,11 @@ async function runPhaseSync(
     const { SyncLockBusyError } = await import('../commands/sync.ts');
     if (e instanceof SyncLockBusyError) {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: 'sync already in progress elsewhere — skipped', details: { syncStatus: 'lock_busy' } };
+    }
+    if ((e as { code?: unknown } | null)?.code === 'sync_anchor_relative') {
+      const { renderAction, cliRenderContext } = await import('./agent-output.ts');
+      const fix = (e as { fix?: Parameters<typeof renderAction>[0] }).fix;
+      return { phase: 'sync', status: 'fail', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_anchor_relative' }, error: makeErrorFromException(e), code: 'sync_anchor_relative', ...(fix ? { fix: renderAction(fix, cliRenderContext()) } : {}) };
     }
     if ((e as { code?: unknown } | null)?.code === 'sync_not_applicable') {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_not_applicable' } };
@@ -1353,7 +1391,7 @@ async function runPhaseExtract(
   sourceId?: string,
 ): Promise<PhaseResult> {
   try {
-    const { runExtractCore } = await import('../commands/extract.ts');
+    const [{ runExtractCore }, { ExtractBatchWriteError }] = await Promise.all([import('../commands/extract.ts'), import('./extract-watermark.ts')]);
     const { resolveIncludeFrontmatter } = await import('./extract-frontmatter.ts');
     // Shared resolver (file plane wins, then DB plane, fail-closed) so this
     // cycle, sync's inline extract, the extract_stale minion and maintain all
@@ -1373,6 +1411,8 @@ async function runPhaseExtract(
     }
     // Incremental path: if sync told us which slugs changed, only extract those.
     // On a 54K-page brain this turns a 10-minute full walk into a sub-second pass.
+    // #6954: a lost link/timeline write leaves its pages due; the stale drain below retries them and the phase warns.
+    let lostWrites: string | null = null;
     const result = await runExtractCore(engine, {
       mode: 'all',
       jsonMode: false, // batch errors stay human-readable on stderr, as in a plain `gbrain extract`
@@ -1382,7 +1422,9 @@ async function runPhaseExtract(
       signal,
       sourceId,
       includeFrontmatter,  // honored on the incremental (slugs) path only
-    });
+      // GBRA-133: with no slug list a managed brain's pass covers every stale page of the source; bound it like the drain below.
+      timeBudgetMs: changedSlugs === undefined ? CYCLE_STALE_DRAIN_BUDGET_MS : undefined,
+    }).catch((error: unknown) => { if (!(error instanceof ExtractBatchWriteError)) throw error; lostWrites = `; ${error.message}`; return null; });
     const linksCreated = result?.links_created ?? 0;
     const timelineCreated = result?.timeline_entries_created ?? 0;
     const incremental = changedSlugs !== undefined;
@@ -1400,6 +1442,8 @@ async function runPhaseExtract(
     // hiccup must not fail the phase).
     let staleRemaining: number | undefined;
     let staleDetails: Record<string, unknown> = {};
+    // GBRA-130 A-1: pages the drain could not derive, or a drain its breaker stopped, make the phase warn with the page and code.
+    let staleWarning: string | null = null;
     try {
       const { extractStaleFromDB } = await import('../commands/extract.ts');
       const drained = await extractStaleFromDB(engine, {
@@ -1418,18 +1462,23 @@ async function runPhaseExtract(
         stale_timeline_created: drained.timelineCreated,
         staleRemaining: drained.staleRemaining, ...(drained.mentions ? { mention_pages: drained.mentions.pages, mention_links_created: drained.mentions.created, mention_due: drained.mentions.remaining, mention_state: drained.mentions.state } : {}),
       };
+      const failures = (await import('./cycle/connector-extract.ts')).staleDrainFailures(drained);
+      if (failures) { staleDetails = { ...staleDetails, ...failures.details }; staleWarning = failures.note; }
     } catch (e) {
       staleDetails = { stale_drain_error: e instanceof Error ? e.message : String(e) };
+      // The breaker stopped a source-scoped drain because most of its pages failed: warn, not a hiccup.
+      if ((e as { code?: unknown } | null)?.code === 'item_failures_systemic') staleWarning = `; the stale drain stopped: ${staleDetails.stale_drain_error}`;
     }
     const { sweepStaleRelationships } = await import('./link-relationships.ts');
     staleDetails = { ...staleDetails, ...(await sweepStaleRelationships(engine)) };
+    staleDetails = { ...staleDetails, ...(await (await import('./belief/coverage-report.ts')).cycleBeliefReconcile(engine, sourceId)) };
     return {
       phase: 'extract',
-      status: 'ok',
+      status: staleWarning || lostWrites ? 'warn' : 'ok',
       duration_ms: 0,
-      summary: incremental
+      summary: (incremental
         ? `${linksCreated} link(s), ${timelineCreated} timeline entries (incremental: ${changedSlugs.length} slugs)`
-        : `${linksCreated} link(s), ${timelineCreated} timeline entries`,
+        : `${linksCreated} link(s), ${timelineCreated} timeline entries`) + (lostWrites ?? '') + (staleWarning ?? ''),
       details: {
         linksCreated, timelineCreated,
         pages_processed: result?.pages_processed ?? 0,
@@ -1476,8 +1525,9 @@ async function runPhaseExtractFacts(
     // so the daily cycle report makes the cleanup visible.
     const phantomSummary = (result.phantomsRedirected
       || result.phantomsAmbiguous
-      || result.phantomsSkippedDrift)
-      ? `, ${result.phantomsRedirected} phantom(s) redirected (${result.phantomsAmbiguous} ambiguous, ${result.phantomsSkippedDrift} drift-skipped)`
+      || result.phantomsSkippedDrift
+      || result.phantomsHeldLegacyRows)
+      ? `, ${result.phantomsRedirected} phantom(s) redirected (${result.phantomsAmbiguous} ambiguous, ${result.phantomsSkippedDrift} drift-skipped${result.phantomsHeldLegacyRows ? `, ${result.phantomsHeldLegacyRows} held for unfenced fact rows` : ''})`
       : '';
     // #1928: a reconcile that deletes far more facts than it reinserts is the
     // signature of the conversation-facts wipe (factsDeleted 1829, inserted 0
@@ -1526,6 +1576,7 @@ async function runPhaseExtractFacts(
         phantoms_redirected: result.phantomsRedirected,
         phantoms_ambiguous: result.phantomsAmbiguous,
         phantoms_skipped_drift: result.phantomsSkippedDrift,
+        phantoms_held_legacy_rows: result.phantomsHeldLegacyRows,
         phantoms_lock_busy: result.phantomsLockBusy,
         phantoms_more_pending: result.phantomsMorePending,
         ...(decideConflict ? { decide_conflict: decideConflict } : {}),
@@ -1641,7 +1692,7 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
         // In dry-run, this counts pages with stale chunks that would
         // have been processed (same semantic as a real run).
         pages_embedded_count: dryRun ? result.pages_processed : embeddedCount > 0 ? result.pages_processed : 0,
-        failures: result.failures,
+        failures: result.failures, ...(result.content_drift ? { content_drift: result.content_drift } : {}),
         ...(failed ? { failure_samples: result.failure_samples, fix: embedBackfillFix({ backlog: result.failures, verifyCheck: 'embeddings' }) } : {}),
       },
     };
@@ -1661,7 +1712,8 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
  * v0.26.5 — purge phase. Hard-deletes:
  *  - source rows where `archived = true AND archive_expires_at <= now()`
  *    (paired with the cascade FK to `pages`, this also drops the source's pages)
- *  - page rows where `deleted_at` is older than 72h
+ *  - page rows where `deleted_at` is older than `purge.retention_hours` (default 72h), except
+ *    managed sync tombstones with no live twin (#7130), which wait for `gbrain pages purge-deleted`
  *
  * Cascade on `pages` covers `content_chunks`, `page_links`, `chunk_relations`.
  * `dryRun` short-circuits — no DELETEs are issued.
@@ -1716,13 +1768,15 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
       };
     }
-    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts')]);
+    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated, purgePhaseNote, purgePhaseStatus }, { readPurgeRetentionHours }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts'), import('./sync-reconcile.ts')]);
     // gbrain#4115: {purged, blocked} — a RESTRICT-FK-held source (revoked
     // oauth_client, v64) is reported and skipped instead of aborting the sweep.
     const purgeResult = await purgeExpiredSources(engine);
     const purgedSources = purgeResult.purged;
-    const purgedPages = await purgeDeletedPagesCoordinated(engine, SOFT_DELETE_TTL_HOURS_FOR_PURGE); // #5405: coordinated on managed brains
-    const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    const retentionHours = await readPurgeRetentionHours(engine); // #7130: purge.retention_hours (default 72, never less)
+    // #5405: coordinated on managed brains; #7130: `automatic` keeps managed sync tombstones with no live twin.
+    const purgedPages = await purgeDeletedPagesCoordinated(engine, retentionHours, { automatic: true });
+    const purgedClones = await purgeOrphanClones(retentionHours);
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
     // 7-day TTL is deliberately generous; any reasonable long-running op
     // finishes inside that window. Cheap (few KB per row).
@@ -1767,16 +1821,18 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     // System One: decision receipts past decide.receipts.retention_days (reported only when rows were pruned).
     let purgedDecisionReceipts = 0;
     try { purgedDecisionReceipts = await (await import('./ai/decide/store.ts')).pruneReceiptsForCycle(engine); } catch { /* pre-v179 brain */ }
+    // GST-1856: applied-capture records past 90 days (ingestion/applied-captures.ts; 0 on a brain before v296).
+    const purgedAppliedCaptures = await (await import('./ingestion/applied-captures.ts')).purgeStaleAppliedCaptures(engine);
     let purgedFeedback = { events: 0, weights: 0 };
     try { purgedFeedback = await (await import('./feedback/store.ts')).pruneRetrievalFeedback(engine, (await (await import('./feedback/settings.ts')).loadFeedbackSettings(engine)).eventRetentionDays); } catch { /* pre-v207 brain */ }
     return {
       phase: 'purge',
-      status: purgedPages.error ? 'fail' : 'ok', error: purgedPages.error,
+      status: purgePhaseStatus(purgedPages), error: purgedPages.error, // #6741: a writer in recovery or a parked page warns
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s)` +
         (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} blocked, see details)` : '') +
-        `, ${purgedPages.count} page(s), ` +
+        `, ${purgedPages.count} page(s)${purgePhaseNote(purgedPages)}, ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s), ` +
@@ -1784,7 +1840,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       details: {
         purged_sources_count: purgedSources.length,
         purged_sources_blocked: purgeResult.blocked,
-        purged_pages_count: purgedPages.count, purged_pages_blocked: purgedPages.blocked, purged_pages_deferred: purgedPages.deferred,
+        purged_pages_count: purgedPages.count, purged_pages_blocked: purgedPages.blocked, purged_pages_deferred: purgedPages.deferred, purged_pages_capacity_deferred: purgedPages.capacity_deferred,
         purged_orphan_clones_count: purgedClones.count,
         purged_orphan_clone_names: purgedClones.names,
         purged_sources: purgedSources,
@@ -1794,6 +1850,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_batch_retry_audit_files_count: purgedBatchRetryAuditFiles,
         purged_volunteer_events_count: purgedVolunteerEvents,
         ...(purgedDecisionReceipts > 0 ? { purged_decision_receipts_count: purgedDecisionReceipts } : {}),
+        ...(purgedAppliedCaptures > 0 ? { purged_applied_captures_count: purgedAppliedCaptures } : {}),
         ...(purgedFeedback.events + purgedFeedback.weights > 0 ? { purged_retrieval_feedback_events_count: purgedFeedback.events, purged_retrieval_weights_count: purgedFeedback.weights } : {}),
       },
     };
@@ -1808,10 +1865,6 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     };
   }
 }
-
-/** v0.26.5: matches SOFT_DELETE_TTL_HOURS in destructive-guard.ts. Inlined here
- *  to avoid a static import (purge phase is only loaded in the autopilot path). */
-const SOFT_DELETE_TTL_HOURS_FOR_PURGE = 72;
 
 async function runPhaseOrphans(engine: BrainEngine, sourceId?: string): Promise<PhaseResult> {
   try {
@@ -1857,13 +1910,14 @@ async function runPhaseOrphans(engine: BrainEngine, sourceId?: string): Promise<
 
 
 /**
- * #6188 / #6377: the two repair-lane phases that run right after `sync`, in this order. `runCycle` dispatches them
- * through one loop; each phase module owns its gate, budget and report.
+ * #6188 / #6377 / #6865: the bounded phases that run right after `sync`, in this order: the two repair-lane phases, then
+ * the unindexed-file detector. `runCycle` dispatches them through one loop; each phase module owns its gate, budget and report.
  */
-const REPAIR_LANE_PHASES = ['fence_repair', 'content_repair'] as const;
+const REPAIR_LANE_PHASES = ['fence_repair', 'content_repair', 'unindexed_files'] as const;
 
 async function runRepairLanePhase(phase: typeof REPAIR_LANE_PHASES[number], engine: BrainEngine | null,
   opts: { dryRun: boolean; signal?: AbortSignal; deadlineAtMs: number | null }): Promise<PhaseResult> {
+  if (phase === 'unindexed_files') return (await import('./cycle/unindexed-files.ts')).runUnindexedFilesPhase(engine, opts);
   return phase === 'fence_repair' ? (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, opts) : (await import('./cycle/content-repair.ts')).runContentRepairPhase(engine, opts);
 }
 
@@ -1878,6 +1932,20 @@ async function runRepairLanePhase(phase: typeof REPAIR_LANE_PHASES[number], engi
  * single-phase runs are always responsive even if another cycle is live.
  */
 export async function runCycle(
+  engine: BrainEngine | null,
+  opts: CycleOpts,
+): Promise<CycleReport> {
+  // #6696 (A5): every cycle phase is background work, even under an operator's command.
+  const report = await withAdmissionOrigin('background', () => runCycleUnscoped(engine, opts));
+  if (!engine || report.status === 'skipped' || opts.dryRun) return report;
+  const notices = await (await import('./persistence/capacity-snapshot.ts')).capacityNotices(engine, { throttle: false }).catch(() => []);
+  return notices.length ? { ...report, notices } : report;
+}
+
+/** #7241: tell `opts.onPhaseStart` a selected phase is starting; a hook error is logged, never fatal. */
+const notifyPhaseStart = (opts: CycleOpts, phase: CyclePhase, phases: readonly CyclePhase[]): Promise<void> => Promise.resolve().then(() => opts.onPhaseStart?.(phase, phases.indexOf(phase), phases.length)).then(() => undefined, (e: unknown) => { console.warn(`[cycle] onPhaseStart hook error (non-fatal): ${e instanceof Error ? e.message : String(e)}`); });
+
+async function runCycleUnscoped(
   engine: BrainEngine | null,
   opts: CycleOpts,
 ): Promise<CycleReport> {
@@ -1932,6 +2000,7 @@ export async function runCycle(
     ? (opts.sourceId ?? (await resolveSourceForDir(engine, brainDir)))
     : opts.sourceId;
   const orphansSourceId = opts.forceGlobalOrphans ? undefined : cycleSourceId;
+  let sourceWindow: SourceCycleWindow | undefined;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
@@ -2136,7 +2205,7 @@ export async function runCycle(
   // synthesize_concepts still can't carry one (W6). Steal-free cycles behave
   // byte-identically to timePhase.
   // Phase containment (#5484): a failing phase returns a `fail` result so later phases run; abort, lease loss and budget exhaustion still stop the job.
-  const timePhase = <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => timeContainedPhase({ engine, sourceId: cycleSourceId ?? 'default', signal: cycleSignal }, phase, fn);
+  const timePhase = async <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => { await notifyPhaseStart(opts, phase, phases); return timeContainedPhase({ engine, sourceId: cycleSourceId ?? 'default', signal: cycleSignal }, phase, fn); };
   const racedTimePhase = <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => raceStolen(timePhase(fn, phase));
 
   // #1972: reap dead-holder sync/cycle locks at cycle start — before the sync
@@ -2185,7 +2254,7 @@ export async function runCycle(
         phaseResults.push(skipNoBrainDir('lint'));
       } else {
         progress.start('cycle.lint');
-        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId), 'lint');
+        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId, { once: opts.onceForPhase === 'lint' }), 'lint');
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2219,6 +2288,8 @@ export async function runCycle(
     // legitimate full reconcile — only a sync that ran and failed suppresses it.
     let syncAttempted = false;
     let synthesizeWrittenSlugs: string[] | undefined;
+    sourceWindow = engine && cycleSourceId && opts.sourceChangedSince !== undefined
+      ? await listSourceChangedPages(engine, cycleSourceId, opts.sourceChangedSince) : undefined;
     if (phases.includes('sync')) {
       checkAborted(cycleSignal);
       if (!engine) {
@@ -2325,10 +2396,10 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(async () => (await import('./cycle/connector-extract.ts')).runPhaseExtractDatabaseOnly(engine, { dryRun, sourceId: cycleSourceId, timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS }), 'extract');
         phaseResults.push({ ...result, duration_ms });
       } else {
-        // If sync didn't run (phases exclude it) or failed, syncPagesAffected
+        // No sync (or a failed one) and no source window (#8573): syncPagesAffected
         // is undefined → extract falls back to full walk (safe default).
         progress.start('cycle.extract');
-        const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, brainDir, dryRun, syncPagesAffected, cycleSignal, cycleSourceId), 'extract');
+        const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, brainDir, dryRun, sourceWindow?.slugs ?? syncPagesAffected, cycleSignal, cycleSourceId), 'extract');
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2375,7 +2446,7 @@ export async function runCycle(
         // (#1928, codex: keying off phases.includes('sync') wrongly suppressed
         // the skipped-sync full reconcile).
         const syncRanButFailed = syncAttempted && syncPagesAffected === undefined;
-        const xfSlugs = syncRanButFailed ? [] : syncPagesAffected;
+        const xfSlugs = syncRanButFailed ? [] : (sourceWindow?.slugs ?? syncPagesAffected);
         const { result, duration_ms } = await timePhase(() =>
           runPhaseExtractFacts(engine, brainDir, xfSourceId, dryRun, xfSlugs, cycleSignal), 'extract_facts');
         result.duration_ms = duration_ms;
@@ -2507,7 +2578,7 @@ export async function runCycle(
           // the cycle lock (pre-fix these sites passed the raw — in production
           // always-undefined — hook, so long phases never refreshed).
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
-          once: opts.onceForPhase === 'patterns',
+          once: opts.onceForPhase === 'patterns', direct: opts.directPhases === true,
           cycleDate,
           deadlineAtMs: opts.deadlineAtMs ?? null,
           privateQueueOwnerJobId: opts.privateQueueOwnerJobId ?? null,
@@ -2592,13 +2663,7 @@ export async function runCycle(
         // Determine incremental vs full mode. If sync OR synthesize ran in this
         // cycle, do incremental over their union. If neither phase ran (e.g.,
         // user passed `--phase recompute_emotional_weight`), do full walk.
-        const incremental: string[] | undefined =
-          (syncPagesAffected || synthesizeWrittenSlugs)
-            ? Array.from(new Set([
-                ...(syncPagesAffected ?? []),
-                ...(synthesizeWrittenSlugs ?? []),
-              ]))
-            : undefined;
+        const incremental = unionSlugSets(syncPagesAffected, synthesizeWrittenSlugs, sourceWindow?.slugs);
         // #4797: raced + signal + lock-refresh + progress, like consolidate —
         // the full-brain write is sliced inside the phase; these hooks fire
         // between slices so a long first run stays observable and abortable.
@@ -2636,7 +2701,8 @@ export async function runCycle(
         progress.start('cycle.consolidate');
         const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
         const { result, duration_ms } = await racedTimePhase(() => runPhaseConsolidate(engine, {
-          dryRun,
+          dryRun, once: opts.onceForPhase === 'consolidate',
+          remote: opts.remote,
           sourceId: cycleSourceId,
           // W0 (Tier-1 #1): wrap the caller hook so this phase ALSO refreshes
           // the cycle lock (pre-fix these sites passed the raw — in production
@@ -2731,12 +2797,12 @@ export async function runCycle(
       }
     }
 
-    // Temporal typed edges: proposes (or, certified, applies) closures for live relationships that cannot both hold.
-    if (phases.includes('edge_contradictions')) {
-      checkAborted(cycleSignal);
-      progress.start('cycle.edge_contradictions');
-      const { edgeContradictionsCyclePhase } = await import('./cycle/edge-contradictions.ts');
-      const { result, duration_ms } = await timePhase(() => edgeContradictionsCyclePhase(engine, dryRun), 'edge_contradictions');
+    // Temporal typed edges (proposes or, certified, applies closures for live relationships that cannot both hold), then keyless typed-claim conflicts (GBRA-216); both cover sources with no local path.
+    for (const [phase, run] of [['edge_contradictions', async () => (await import('./cycle/edge-contradictions.ts')).edgeContradictionsCyclePhase(engine, dryRun)],
+      ['claim_conflicts', async () => (await import('./facts/claim-conflicts.ts')).claimConflictsCyclePhase(engine, dryRun)]] as const) {
+      if (!phases.includes(phase)) continue;
+      checkAborted(cycleSignal); progress.start(`cycle.${phase}`);
+      const { result, duration_ms } = await timePhase(run, phase);
       result.duration_ms = duration_ms; phaseResults.push(result); progress.finish();
       await safeYield(opts.yieldBetweenPhases);
     }
@@ -2782,6 +2848,13 @@ export async function runCycle(
         phaseResults.push(result);
         progress.finish();
       }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    if (phases.includes('standing_questions')) { // C4 pinned questions (src/core/questions/phase.ts)
+      checkAborted(cycleSignal);
+      if (!engine) phaseResults.push({ phase: 'standing_questions', status: 'skipped', duration_ms: 0, summary: 'no database connected', details: { reason: 'no_database' } });
+      else { const { result, duration_ms } = await timePhase(async () => (await import('./questions/phase.ts')).runPhaseStandingQuestions(engine, { dryRun, signal: cycleSignal }), 'standing_questions'); phaseResults.push({ ...result, duration_ms }); }
       await safeYield(opts.yieldBetweenPhases);
     }
 
@@ -3115,6 +3188,7 @@ export async function runCycle(
       await engine.updateSourceConfig(opts.sourceId, {
         last_source_cycle_at: nowIso,
         last_full_cycle_at: nowIso,
+        ...sourceCycleWindowStamp(phaseResults, sourceWindow),
       });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);

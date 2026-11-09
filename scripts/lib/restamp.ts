@@ -72,8 +72,15 @@ export function versionOfHeader(header: string): string | null {
   return /^## \[([^\]]+)\]/.exec(header)?.[1] ?? null;
 }
 
+const VERSION_TOKEN = /^\d+(?:\.\d+){2,3}(?:-[A-Za-z0-9]+)?$/;
+
+/** A release header's version token (`0.60.1.0`); `Unreleased` and other labels are not. */
+export function isVersionToken(token: string): boolean {
+  return VERSION_TOKEN.test(token);
+}
+
 function replaceVersionToken(text: string, oldVersion: string, newVersion: string): string {
-  if (!/^\d+(?:\.\d+){2,3}(?:-[A-Za-z0-9]+)?$/.test(oldVersion)) throw new Error(`restamp: refusing to rewrite a non-numeric version token '${oldVersion}'`);
+  if (!VERSION_TOKEN.test(oldVersion)) throw new Error(`restamp: refusing to rewrite a non-numeric version token '${oldVersion}'`);
   const esc = oldVersion.replace(/\./g, '\\.');
   // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- oldVersion is validated above as dotted digits (optional alphanumeric suffix) and its dots escaped, so the pattern is a fixed literal with bounded lookarounds (no ReDoS)
   return text.replace(new RegExp(`(?<![\\d.])${esc}(?![\\d.]*\\d)`, 'g'), newVersion);
@@ -84,12 +91,13 @@ function replaceVersionToken(text: string, oldVersion: string, newVersion: strin
  * re-stamped: header `## [new] - date`, every other mention of the branch's
  * old version inside the entry rewritten. A copy of the entry already in
  * `currentText` (a clean merge kept it, or an earlier restamp pass wrote it)
- * is removed first, so the rebuild is idempotent.
+ * is removed first, so the rebuild is idempotent. An entry headed with a label
+ * (`## [Unreleased]`) has no old version to rewrite: only its header is stamped.
  */
 export function rebuildChangelog(currentText: string, entry: ChangelogSection, oldVersion: string, newVersion: string, date: string): string {
   const { preamble, sections } = splitChangelog(currentText);
   const bodyOf = (text: string) => text.split('\n').slice(1).join('\n').replace(/\n+$/, '');
-  const body = replaceVersionToken(bodyOf(entry.text), oldVersion, newVersion);
+  const body = isVersionToken(oldVersion) ? replaceVersionToken(bodyOf(entry.text), oldVersion, newVersion) : bodyOf(entry.text);
   const ours = new Set([bodyOf(entry.text), body]);
   const rest = sections.filter((s) => {
     const v = versionOfHeader(s.header);
@@ -157,10 +165,24 @@ export const STAMPS: Stamp[] = [
 /** Files restamp keeps in step beyond STAMPS (named so the coverage test can match the CLAUDE.md table). */
 export const OTHER_STAMPED_FILES = ['CHANGELOG.md', 'TODOS.md', 'templates/bootstrap/template-repo/'];
 
+/** The BEHAVIOR_CHANGES registry whose since: 'TBD' rows restamp gives the new version. */
+export const BEHAVIOR_NOTICE_FILE = 'src/core/behavior-change-notice.ts';
+
+/** Rewrite every `since: 'TBD'` row to `since: '<version>'`. */
+export function stampTbdSince(text: string, version: string): string {
+  return text.replace(/since:(\s*)'TBD'/g, (_match, space: string) => `since:${space}'${version}'`);
+}
+
 /** Rewrite `vOLD` to `vNEW` in branch-added TODOS.md lines (1-based line numbers). */
 export function restampTodoLines(text: string, addedLines: Set<number>, oldVersion: string, newVersion: string): string {
   if (oldVersion === newVersion) return text;
   return text.split('\n').map((l, i) => (addedLines.has(i + 1) ? l.split(`v${oldVersion}`).join(`v${newVersion}`) : l)).join('\n');
+}
+
+/** Rewrite `since: 'OLD'` to `since: 'NEW'` on branch-added lines (1-based): a stamped branch's own BEHAVIOR_CHANGES rows follow a restamp. */
+export function restampSinceLines(text: string, addedLines: Set<number>, oldVersion: string, newVersion: string): string {
+  if (oldVersion === newVersion) return text;
+  return text.split('\n').map((l, i) => (addedLines.has(i + 1) ? l.split(`since: '${oldVersion}'`).join(`since: '${newVersion}'`) : l)).join('\n');
 }
 
 // ---------------------------------------------------------------- migrations

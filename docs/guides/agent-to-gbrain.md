@@ -35,7 +35,8 @@ The two surfaces are **not interchangeable**. Pick by op, not by preference.
 ## Surface 1 — MCP ops over HTTP (thin-client + OAuth)
 
 Use for any operation that has an MCP equivalent: `search`, `query`,
-`put_page`, `get_page`, `find_experts`, `find_orphans`, `find_anomalies`,
+`put_page`, `get_page`, `find_experts`, `find_orphans`, `rank_entities`
+([graph ranking](graph-ranking.md)), `find_anomalies`,
 `get_recent_salience`, `find_trajectory`, and so on. The canonical list is
 the set of ops in `src/core/operations.ts` whose `localOnly` flag is unset
 (or `false`).
@@ -179,7 +180,7 @@ worker env.
 | `search` / `query` | HTTP MCP via thin-client | Has MCP op; OAuth-scoped. |
 | `get_page` / `list_pages` | HTTP MCP | Same. |
 | `put_page` | HTTP MCP | Same; respects subagent allow-list when applicable. |
-| `find_experts` / `find_orphans` | HTTP MCP | Same. |
+| `find_experts` / `find_orphans` / `rank_entities` | HTTP MCP | Same. |
 | `sync` / `embed` / `extract` | Shell job + `inherit:` | Thin-client refused; needs local engine + FS. |
 | `dream` | Shell job + `inherit:` | Thin-client refused; synthesis runs on the host. |
 | `doctor` | Run directly (any install) | Not refused: thin clients get the remote probe set. |

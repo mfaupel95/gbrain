@@ -40,7 +40,7 @@ import { classifyBrainAudience } from '../../../core/facts/writeback-audience.ts
 import { readVerbUsage } from '../../../core/verbs/usage-log.ts';
 import { readClientOpUsage } from '../../../core/mcp-usage.ts';
 import { OPENCLAW_COMPACT_EVENT, readHeartbeatTail } from '../../../core/context/hook-heartbeat.ts';
-import { CORPUS_UNINGESTED_RETENTION_FACTOR, corpusBacklog, corpusSpoolDir } from '../../../core/context/corpus-segments.ts';
+import { CORPUS_UNINGESTED_RETENTION_FACTOR, CORPUS_WINDOW_FAILURE_CAP, corpusBacklog, corpusSpoolDir, listCorpusFailures } from '../../../core/context/corpus-segments.ts';
 import { listCorpusSourceHolds } from '../../../core/context/corpus-source.ts';
 import { readHarnessReceiptState } from '../../../core/bootstrap/format.ts';
 import { mutedFirstRunDecisionsNotice } from '../../../core/onboard/mcp-onboarding.ts';
@@ -175,6 +175,36 @@ async function corpusBacklogProblem(engine: BrainEngine, fileCfg: ReturnType<typ
     + `(oldest ${oldestDays}d); they are deleted at ${purgeDays}d. Extract them now: gbrain sweep --once --budget-ms 600000`;
 }
 
+/** #6785: the problem text a stopped corpus window carries; the check's fix keys on it. */
+const CORPUS_RETRY_COMMAND = 'gbrain sweep --retry-failed --apply';
+
+/**
+ * #6785: corpus windows the sweep stopped paying for after
+ * CORPUS_WINDOW_FAILURE_CAP failures past the model call. Nothing retries
+ * them until the operator does (paid), so the check names the retry as its
+ * fix. Records `details.corpus_failed_windows`.
+ */
+async function corpusFailureProblem(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>, details: Record<string, unknown>): Promise<string | null> {
+  const dir = await sessionCorpusDir(engine, fileCfg);
+  const failed = [...listCorpusFailures(corpusSpoolDir(dir)), ...listCorpusFailures(dir)];
+  const stopped = failed.filter((f) => f.record.count >= CORPUS_WINDOW_FAILURE_CAP);
+  if (!failed.length) return null;
+  const codes = new Map<string, number>();
+  for (const f of stopped) codes.set(f.record.last_code, (codes.get(f.record.last_code) ?? 0) + 1);
+  details.corpus_failed_windows = { retrying: failed.length - stopped.length, stopped: stopped.length, last_codes: Object.fromEntries(codes) };
+  if (!stopped.length) return null;
+  const [topCode] = [...codes.entries()].sort((a, b) => b[1] - a[1])[0]!;
+  return `${stopped.length} captured session file(s) stopped extracting after ${CORPUS_WINDOW_FAILURE_CAP} failed attempts at one window (top: ${topCode}); `
+    + `fix the cause, then retry them (paid): ${CORPUS_RETRY_COMMAND}`;
+}
+
+const CORPUS_RETRY_FIX = {
+  argv: ['gbrain', 'sweep', '--retry-failed', '--apply'], consent: ['paid'] as Effect[], actor: 'agent' as const, requires_exclusive: false,
+  why: 'Clears the failure counts of corpus windows the sweep stopped retrying, so the next sweep pays to extract them again.',
+  user_message: 'Some captured session text stopped being turned into memory because extracting it kept failing (gbrain doctor names the error). Once the cause is fixed, retrying costs model calls. OK to retry them?',
+  verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] },
+};
+
 export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Promise<Check> {
   try {
     const fileCfg = loadConfig();
@@ -280,9 +310,12 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
       if (offHoldProblem) offProblems.push(offHoldProblem);
       const offCompactProblem = explicitOff ? null : await openclawCompactionProblem(details).catch(() => null);
       if (offCompactProblem) offProblems.push(offCompactProblem);
+      const offFailureProblem = explicitOff ? null : await corpusFailureProblem(engine, fileCfg, details).catch(() => null);
+      if (offFailureProblem) offProblems.push(offFailureProblem);
       if (explicitOff) details.restart_after_off = WRITEBACK_RESTART_AFTER_OFF;
       return {
         name: MEMORY_WRITEBACK_CHECK_NAME,
+        ...(offFailureProblem && !lingering.length ? { fix: CORPUS_RETRY_FIX } : {}),
         status: offProblems.length ? 'warn' : 'ok',
         message: offProblems.length
           ? `ambient writeback off: ${offProblems.join('; ')}`
@@ -300,6 +333,8 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
     if (holdProblem) problems.push(holdProblem);
     const compactProblem = await openclawCompactionProblem(details).catch(() => null);
     if (compactProblem) problems.push(compactProblem);
+    const failureProblem = await corpusFailureProblem(engine, fileCfg, details).catch(() => null);
+    if (failureProblem) problems.push(failureProblem);
     if (!wb.ttl_valid) {
       problems.push(`memory.auto_writeback_transient_ttl is invalid — using '${wb.transient_ttl}'`);
     }
@@ -441,6 +476,7 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
           why: 'Rewrites the gbrain memory instruction block in each harness config from the current writeback settings.',
           user_message: "gbrain's memory instructions in your agent app's config are missing or out of date. OK if I reinstall them?",
           verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] } } }
+        : failureProblem ? { fix: CORPUS_RETRY_FIX }
         : problems.length ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
     };
   } catch (e) {

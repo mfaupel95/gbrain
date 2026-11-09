@@ -1,8 +1,8 @@
 diff --git a/cjs/src/connection.js b/vendor/postgres/cjs/src/connection.js
-index 07f67167..472ac81e 100644
+index 07f6716..2978d0b 100644
 --- a/cjs/src/connection.js
 +++ b/vendor/postgres/cjs/src/connection.js
-@@ -20,6 +20,7 @@ const Sync = b().S().end()
+@@ -20,6 +20,7 @@
      , SSLRequest = b().i32(8).i32(80877103).end(8)
      , ExecuteUnnamed = Buffer.concat([b().E().str(b.N).i32(0).end(), Sync])
      , DescribeUnnamed = b().D().str('S').str(b.N).end()
@@ -10,20 +10,29 @@ index 07f67167..472ac81e 100644
      , noop = () => { /* noop */ }
  
  const retryRoutines = new Set([
-@@ -49,7 +50,7 @@ const errorFields = {
+@@ -49,7 +50,7 @@
    82  : 'routine'            // R
  }
  
 -function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
-+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop } = {}) {
++function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop, ondesync = noop } = {}) {
    const {
      sslnegotiation,
      ssl,
-@@ -75,9 +76,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -64,6 +65,7 @@
+     onnotify,
+     onparameter,
+     max_pipeline,
++    transaction_pipeline,
+     keep_alive,
+     backoff,
+     target_session_attrs
+@@ -75,9 +77,14 @@
        , idleTimer = timer(end, options.idle_timeout)
        , lifeTimer = timer(end, options.max_lifetime)
        , connectTimer = timer(connectTimedOut, options.connect_timeout)
-+      , inflightTimer = timer(inflightTimedOut, options.inflight_timeout)
++      , inflightTimer = budgetTimer('idle')
++      , ageTimer = budgetTimer('age')
  
    let socket = null
      , cancelMessage
@@ -33,21 +42,37 @@ index 07f67167..472ac81e 100644
      , errorResponse = null
      , result = new Result()
      , incoming = Buffer.alloc(0)
-@@ -105,11 +110,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -95,6 +102,9 @@
+     , rows = 0
+     , serverSignature = null
+     , nextWriteTimer = null
++    , lastWritten = null
++    , lastExecuted = null
++    , deferredRetries = []
+     , terminated = false
+     , incomings = null
+     , results = null
+@@ -105,11 +115,19 @@
      , ended = null
      , nonce = null
      , query = null
 +    , queryStart = 0
++    , received = 0
++    , localBudget = undefined
++    , sessionBudget = undefined
++    , recovering = null
      , final = null
++    , inTransactionAfterSent = false
  
    const connection = {
      queue: queues.closed,
      idleTimer,
 +    inflightSince: 0,
++    inflightCap: 0,
      connect(query) {
        initial = query
        reconnect()
-@@ -143,11 +150,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -143,11 +161,13 @@
    }
  
    async function cancel({ pid, secret }, resolve, reject) {
@@ -63,7 +88,12 @@ index 07f67167..472ac81e 100644
      } catch (error) {
        reject(error)
      }
-@@ -167,21 +176,70 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -163,22 +183,174 @@
+     if (q.cancelled)
+       return
+ 
++    let mayPipeline = !q.options.onexecute
+     try {
        q.state = backend
        query
          ? sent.push(q)
@@ -71,16 +101,22 @@ index 07f67167..472ac81e 100644
 +        : (query = q, query.active = true, armInflight())
  
        build(q)
-+      const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
++      mayPipeline = mayPipeline || q.options.onexecute(connection)
++      noteBudget(q)
++      noteTransaction(q)
++      lastWritten = q
++      lastExecuted = { string: q.string, strings: q.strings }
        return write(toBuffer(q))
          && !q.describeFirst
          && !q.cursorFn
-         && sent.length < max_pipeline
+-        && sent.length < max_pipeline
 -        && (!q.options.onexecute || q.options.onexecute(connection))
++        && sent.length < pipelineLimit()
 +        && mayPipeline
      } catch (error) {
 -      sent.length === 0 && write(Sync)
 -      errored(error)
+-      return true
 +      // GBrain (#6383), the approach of porsager/postgres#1236: q already has its place in the queue of
 +      // queries awaiting an answer, but nothing of it was written. The stock catch rejected the connection's
 +      // current query with q's error and left q waiting, so every later answer went to the wrong query.
@@ -92,16 +128,54 @@ index 07f67167..472ac81e 100644
 +      q.retried = error
 +      q.describeFirst = false
 +      q.cursorFn = null
++      // GBrain (#6543): the stock `return true` let the pool route more statements behind q whatever max_pipeline and
++      // onexecute said, so a pool built not to pipeline (a transaction-mode pooler) pipelined after every build failure.
++      // onexecute (a transaction's begin) ran only if q built; a begin that failed to build is never pipelined behind.
 +      options.onbuilderror && reportBuildError(q, error)
-+      write(Unbuildable)
-       return true
-     }
-   }
- 
++      return write(Unbuildable)
++        && sent.length < max_pipeline
++        && mayPipeline
++    }
++  }
++
++  // GBrain (#6930): a transaction-mode pooler cannot carry statements pipelined across a transaction boundary (#6543,
++  // max_pipeline 0), but it pins one server connection from BEGIN until the transaction ends. So on a connection its
++  // owner holds (sql.begin, sql.reserve) a statement may follow others still in flight when every one of them leaves the
++  // connection inside a transaction: the last ReadyForQuery said T or E, or an in-flight statement began one, and none
++  // since may end it (COMMIT, ROLLBACK, END, ABORT, PREPARE TRANSACTION). Nothing is ever sent behind a statement that
++  // may end a transaction, so the next owner's statements never reach the server connection this one held.
++  function noteTransaction(q) {
++    const control = transactionControl(q.string || '')
++    control === 'end'
++      ? inTransactionAfterSent = false
++      : control === 'begin'
++        ? inTransactionAfterSent = true
++        : q === query && (inTransactionAfterSent = connection.status === 84 || connection.status === 69)
++  }
++
++  function pipelineLimit() {
++    return transaction_pipeline > max_pipeline && inTransactionAfterSent && connection.reserved
++      ? transaction_pipeline
++      : max_pipeline
++  }
++
 +  function reportBuildError(q, error) {
 +    try {
-+      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q))
++      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q), error && error.parameter)
 +    } catch (_) {}
++  }
++
++  // GBrain (#6930): 'begin' when the text opens a transaction, 'end' when any statement in it may end one.
++  function transactionControl(text) {
++    let control = null
++    for (const part of text.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '').split(';')) {
++      const statement = part.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '')
++      if (/^(?:commit|end|abort|rollback(?!\s+to\b)|prepare\s+transaction)\b/i.test(statement))
++        return 'end'
++      if (/^(?:begin|start\s+transaction)\b/i.test(statement))
++        control = 'begin'
++    }
++    return control
 +  }
 +
 +  // The statement's text with $n placeholders, never its parameter values.
@@ -114,16 +188,76 @@ index 07f67167..472ac81e 100644
 +  // byte the server sends and stops at ReadyForQuery. A statement that outlives options.inflight_timeout with
 +  // nothing coming back (a desynced connection, a pooler that swallowed a CancelRequest, a dead peer) has no
 +  // server-side timeout left to save it: the connection is retired instead of holding its queue forever.
++  //
++  // GBrain (#6543 A4): a second clock, `ageTimer`, is not restarted by received bytes, so a statement that keeps
++  // streaming (or keeps receiving notices) past its budget is retired too (`reason: 'age'`; `'idle'` when nothing came
++  // back). Both budgets are derived per statement from the statement_timeout the operation itself declared on this
++  // connection (`SET [LOCAL] statement_timeout`, `set_config('statement_timeout', ...)`, tracked client-side so it
++  // holds behind a transaction-mode pooler that never applies it): max(the pool's budget, the declared timeout) plus
++  // `inflight_grace`, and none at all for a declared timeout of 0 (an index build, a bulk copy).
 +  function armInflight() {
 +    queryStart = connection.inflightSince = performance.now()
++    received = 0
++    query.inflightCaps || (query.inflightCaps = inflightCaps())
++    connection.inflightCap = query.inflightCaps.age
 +    inflightTimer.start()
++    ageTimer.start()
 +  }
 +
-+  function inflightTimedOut() {
++  function budgetTimer(kind) {
++    let handle = null
++    return {
++      cancel() {
++        handle && (clearTimeout(handle), handle = null)
++      },
++      start() {
++        handle && clearTimeout(handle)
++        const ms = query && query.inflightCaps ? query.inflightCaps[kind] : 0
++        handle = ms ? setTimeout(() => (handle = null, inflightTimedOut(kind)), ms) : null
++      }
++    }
++  }
++
++  function inflightCaps() {
++    const declared = localBudget !== undefined ? localBudget : sessionBudget
++    if (declared === 0)
++      return { idle: 0, age: 0 }
++    const raised = declared === undefined ? 0 : declared + (options.inflight_grace || 0) * 1000
++    return {
++      idle: options.inflight_timeout ? Math.max(options.inflight_timeout * 1000, raised) : 0,
++      age: options.inflight_max ? Math.max(options.inflight_max * 1000, raised) : 0
++    }
++  }
++
++  // The statement_timeout changes a statement makes on this connection; a later statement is budgeted by them.
++  function noteBudget(q) {
++    const text = q.string || ''
++    if (localBudget === undefined && sessionBudget === undefined && !/statement_timeout/i.test(text))
++      return
++    for (const change of statementTimeoutChanges(text, q.parameters)) {
++      change.kind === 'end'
++        ? localBudget = undefined
++        : change.kind === 'reset'
++          ? localBudget = sessionBudget = undefined
++          : change.kind === 'set' && (change.local ? localBudget = change.ms : (sessionBudget = change.ms, localBudget = undefined))
++    }
++    q.inflightCaps = inflightCaps()
++    if (q === query) {
++      connection.inflightCap = q.inflightCaps.age
++      inflightTimer.start()
++      ageTimer.start()
++    }
++  }
++
++  function inflightTimedOut(kind = 'idle') {
 +    if (!query)
 +      return
-+    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query) }
++    inflightTimer.cancel()
++    ageTimer.cancel()
++    const reason = kind === 'age' && received > 0 ? 'age' : 'idle'
++    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query), reason, budget_ms: query.inflightCaps ? query.inflightCaps[kind] : 0 }
 +    const s = socket
++    recovering = recovering || 'stuck'
 +    error(Errors.connection('CONNECTION_STUCK', options, socket))
 +    query = null
 +    connection.inflightSince = 0
@@ -132,13 +266,10 @@ index 07f67167..472ac81e 100644
 +    if (s && !s.destroyed) {
 +      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
 +      t.unref && t.unref()
-+    }
-+  }
-+
-   function toBuffer(q) {
-     if (q.parameters.length >= 65534)
-       throw Errors.generic('MAX_PARAMETERS_EXCEEDED', 'Max number of parameters (65534) exceeded')
-@@ -235,10 +293,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     }
+   }
+ 
+@@ -235,10 +407,15 @@
      q.onlyDescribe && (delete statements[q.signature])
      q.parameters = q.parameters || parameters
      q.prepared = q.prepare && q.signature in statements
@@ -156,7 +287,7 @@ index 07f67167..472ac81e 100644
  
      typeof options.debug === 'function' && options.debug(id, string, parameters, types)
    }
-@@ -295,10 +358,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -295,10 +472,11 @@
  
    /* c8 ignore next 3 */
    function drain() {
@@ -165,11 +296,29 @@ index 07f67167..472ac81e 100644
    }
  
    function data(x) {
-+    query && inflightTimer.start()
++    query && (received += x.length, inflightTimer.start())
      if (incomings) {
        incomings.push(x)
        remaining -= x.length
-@@ -379,6 +443,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -330,6 +508,9 @@
+       remaining = 0
+       incomings = null
+     }
++
++    if (incoming.length === 0)
++      incoming = Buffer.alloc(0)
+   }
+ 
+   async function connect() {
+@@ -366,6 +547,7 @@
+     try {
+       statements = {}
+       needsTypes = options.fetch_types
++      inTransactionAfterSent = false
+       statementId = Math.random().toString(36).slice(2)
+       statementCount = 1
+       lifeTimer.start()
+@@ -379,20 +561,35 @@
    }
  
    function error(err) {
@@ -178,7 +327,11 @@ index 07f67167..472ac81e 100644
      if (connection.queue === queues.connecting && options.host[retries + 1])
        return
  
-@@ -388,6 +454,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     errored(err)
+     while (sent.length)
+       queryError(sent.shift(), err)
++    while (deferredRetries.length)
++      queryError(deferredRetries.shift(), err)
    }
  
    function errored(err) {
@@ -186,10 +339,26 @@ index 07f67167..472ac81e 100644
 +      cancelError = err
      stream && (stream.destroy(err), stream = null)
      query && queryError(query, err)
++    initial && recovering && recoveryFailed(err)
      initial && (queryError(initial, err), initial = null)
-@@ -438,19 +506,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
++  // GBrain (#6543 A6): a connection retired by an incident (stuck, desync, closed under statements) that completes a
++  // new startup is `recovered`; one whose reconnect fails is `recovery_failed` (it stays marked until one succeeds).
++  function recoveryFailed(err) {
++    try {
++      options.onrecoveryfailed && options.onrecoveryfailed({ connection: id, cause: recovering, code: String(err && err.code || 'CONNECTION_ERROR') })
++    } catch (_) {}
++  }
++
+   function queryError(query, err) {
+     if (query.reserve)
+       return query.reject(err)
+@@ -437,20 +634,53 @@
+     incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
++    lastWritten = null
      clearImmediate(nextWriteTimer)
 +    // GBrain (#6355): bytes still waiting for the cleared immediate belonged to this socket. Left in place, the next
 +    // connection's StartupMessage is appended to them and never scheduled for writing (the timer handle is not
@@ -201,7 +370,9 @@ index 07f67167..472ac81e 100644
      lifeTimer.cancel()
      connectTimer.cancel()
 +    inflightTimer.cancel()
-+    connection.inflightSince = 0
++    ageTimer.cancel()
++    connection.inflightSince = connection.inflightCap = 0
++    localBudget = sessionBudget = undefined
  
      socket.removeAllListeners()
      socket = null
@@ -222,17 +393,83 @@ index 07f67167..472ac81e 100644
        return reconnect()
 +    }
  
-     !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
-+    query = null
+-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // GBrain (#6543 A6): a socket that closed under statements is a recovery the next completed startup reports.
++    ;(query || sent.length) && (recovering = recovering || 'closed')
++    // GBRA-133: a socket error rejects the statements in flight, but their rejection handlers run before 'close' and may
++    // issue more on this connection (a transaction's settings restore in its finally). Skipped on hadError, those stayed
++    // queued: the next socket's startup ReadyForQuery made one the current statement without ever sending it, so it hung
++    // until the in-flight watchdog (330 s) and the reservation waiting for that startup never got its connection.
++    ;(query || sent.length || deferredRetries.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // GBrain (#6543): the dead socket's ErrorResponse (a FATAL 57P01, a pooler's XX000) and its partial result belonged
++    // to statements that just failed. Left in place, the replacement connection's startup ReadyForQuery handed that
++    // error to its first statement, and a stale row count left holes at the start of the next result.
++    query = errorResponse = results = null
++    result = new Result()
++    rows = 0
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -533,8 +620,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -459,6 +689,10 @@
+ 
+   /* Handlers */
+   function handle(xs, x = xs[0]) {
++    if (!query && !initial && !stream && answersStatement(xs, x)) {
++      desynced(x)
++      return
++    }
+     (
+       x === 68 ? DataRow :                   // D
+       x === 100 ? CopyData :                 // d
+@@ -489,6 +723,39 @@
+     )(xs)
+   }
+ 
++  // GBrain: a message that answers a statement (its columns, rows, completion, parse/bind acknowledgements or a
++  // statement error) arriving when no statement is waiting for one means the client and the server no longer
++  // agree on which answer belongs to which statement: every later answer on this connection would be read for
++  // the wrong query. The connection is retired and everything queued on it fails with CONNECTION_DESYNC.
++  // Notices, parameter changes, notifications, ReadyForQuery and a FATAL/PANIC error legitimately arrive
++  // without a statement and pass through.
++  function answersStatement(xs, x) {
++    if (x === 84 || x === 68 || x === 67 || x === 73 || x === 49 || x === 50 || x === 116 || x === 110)
++      return true
++    if (x !== 69)
++      return false
++    const fields = parseError(xs)
++    const severity = fields.severity || fields.severity_local
++    return severity !== 'FATAL' && severity !== 'PANIC'
++  }
++
++  function desynced(x) {
++    const s = socket
++    const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
++    recovering = recovering || 'desync'
++    error(Errors.connection('CONNECTION_DESYNC', options, socket))
++    inflightTimer.cancel()
++    ageTimer.cancel()
++    query = null
++    connection.inflightSince = connection.inflightCap = 0
++    ondesync(connection, info)
++    terminate()
++    if (s && !s.destroyed) {
++      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
++      t.unref && t.unref()
++    }
++  }
++
+   function DataRow(x) {
+     let index = 7
+     let length
+@@ -533,13 +800,25 @@
    }
  
    function ReadyForQuery(x) {
 +    connection.status = x[5]
-+    connection.inflightSince = 0
++    query && query === lastWritten && (lastWritten = null)
++    connection.inflightSince = connection.inflightCap = 0
++    // A transaction that ended takes its SET LOCAL statement_timeout with it.
++    x[5] === 73 && !sent.length && (localBudget = undefined)
      if (query) {
 +      options.shared.completed++
        if (errorResponse) {
@@ -240,16 +477,46 @@ index 07f67167..472ac81e 100644
 +        query.sharedTypes && options.shared_types.delete(query.typesKey)
          query.retried
            ? errored(query.retried)
-           : query.prepared && retryRoutines.has(errorResponse.routine)
-@@ -550,6 +642,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+-          : query.prepared && retryRoutines.has(errorResponse.routine)
++          : query.prepared && retryRoutines.has(errorResponse.routine) && !query.cancelled
+             ? retry(query, errorResponse)
+             : errored(errorResponse)
++      } else if (query.cancelled) {
++        // GBrain: a query cancelled while it waited behind another one on this connection still gets the
++        // server's answer to it; that answer is consumed here and the query rejects as cancelled.
++        query.reject(Errors.generic('57014', 'canceling statement due to user request'))
+       } else {
+         query.resolve(results || result)
+       }
+@@ -547,9 +826,16 @@
+       errored(errorResponse)
+     }
+ 
++    // GBrain: a statement that streamed rows and then failed (a cancel, a timeout or an error after its first rows) never
++    // reached CommandComplete, which is where the row count resets. Left in place, the next statement on this connection
++    // stored its rows after that many empty slots: a one-row read came back as [empty, row], so a reader that requires
++    // exactly one row refused and `const [row] = rows` read nothing.
      query = results = errorResponse = null
      result = new Result()
++    rows = 0
      connectTimer.cancel()
 +    inflightTimer.cancel()
++    ageTimer.cancel()
  
      if (initial) {
        if (target_session_attrs) {
-@@ -564,23 +657,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -559,28 +845,54 @@
+           return terminate()
+       }
+ 
++      // GBrain (#6930): the array types a pool for this database already fetched are applied without a round trip.
++      if (needsTypes && options.array_types && options.array_types.rows) {
++        needsTypes = false
++        options.array_types.rows.forEach(([oid, typarray]) => addArrayType(oid, typarray))
++      }
++
+       if (needsTypes) {
+         initial.reserve && (initial = null)
          return fetchArrayTypes()
        }
  
@@ -259,12 +526,32 @@ index 07f67167..472ac81e 100644
        options.shared.retries = retries = 0
        initial = null
 -      return
++      if (recovering) {
++        const cause = recovering
++        recovering = null
++        try {
++          options.onrecovered && options.onrecovered({ connection: id, cause })
++        } catch (_) {}
++      }
 +      if (!reserving)
 +        return
++    }
++
++    // GBrain: the stock loop skipped a query cancelled while it waited behind another one, so the answer the
++    // server still sent for it was read for the next query (the next query resolved with another statement's
++    // rows, and the cancelled one never settled). The cancelled query stays current and absorbs its own answer.
++    // A server cancel targets the backend, not a statement, so it is only sent when nothing is pipelined behind.
++    if (sent.length) {
++      query = sent.shift()
++      query.active = true
++      query.cancelled && (sent.length
++        ? query.cancelled.resolve()
++        : Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject))
      }
  
-     while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
+-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
++    flushRetries()
  
      if (query)
 -      return // Consider opening if able and sent.length < 50
@@ -279,7 +566,7 @@ index 07f67167..472ac81e 100644
          : connection.reserved()
        : ending
          ? terminate()
-@@ -630,6 +725,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -630,7 +942,11 @@
        !query.statement.types[i] && (query.statement.types[i] = x.readUInt32BE(7 + i * 4))
  
      query.prepare && (statements[query.signature] = query.statement)
@@ -287,9 +574,11 @@ index 07f67167..472ac81e 100644
 +    query.typesKey && query.statement.types.every(t => t > 0 && t < 16384)
 +      && options.shared_types.set(query.typesKey, query.statement.types.slice())
      query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
++    flushRetries()
    }
  
-@@ -767,14 +865,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function RowDescription(x) {
+@@ -767,15 +1083,23 @@
  
    async function fetchArrayTypes() {
      needsTypes = false
@@ -317,18 +606,98 @@ index 07f67167..472ac81e 100644
 +      return
 +    }
      types.forEach(({ oid, typarray }) => addArrayType(oid, typarray))
++    options.array_types && (options.array_types.rows = types.map(({ oid, typarray }) => [oid, typarray]))
    }
  
+   function addArrayType(oid, typarray) {
+@@ -821,7 +1145,16 @@
+   function retry(q, error) {
+     delete statements[q.signature]
+     q.retried = error
+-    execute(q)
++    deferredRetries.push(q)
++    flushRetries()
++  }
++
++  // GBrain: a describe-first or cursor query writes its next messages only when the server answers its first
++  // ones. A retry written in that gap lands between them on the wire, and every later response is then read
++  // for the wrong query (rows built with another statement's columns). Retries wait for that query.
++  function flushRetries() {
++    while (deferredRetries.length && !(lastWritten && (lastWritten.describeFirst || lastWritten.cursorFn)))
++      execute(deferredRetries.shift())
+   }
+ 
+   function NotificationResponse(x) {
+@@ -1039,6 +1372,59 @@
+   return buffer
+ }
+ 
++// GBrain (#6543 A4): what one statement does to the connection's statement_timeout, in order: `set` (`local`, `ms`;
++// 0 disables it, undefined is DEFAULT), `reset` (RESET statement_timeout / RESET ALL / DISCARD ALL), `end` (a
++// transaction began or ended, which drops a SET LOCAL), and `unknown` for a change whose value cannot be read here.
++// Dollar-quoted bodies are skipped, so a function body's BEGIN/END is not a transaction boundary.
++const budgetSyntax = /(?:^|;)\s*(begin|start\s+transaction|commit|end|abort|rollback(?!\s+(?:to|prepared)\b))\b|\bset\s+(local\s+|session\s+)?statement_timeout\s*(?:=|\bto\b)\s*('(?:[^']|'')*'|[^\s;)]+)|\breset\s+(?:statement_timeout|all)\b|\bdiscard\s+all\b|\bset_config\s*\(\s*'statement_timeout'\s*,\s*('(?:[^']|'')*'|\$\d+)\s*,\s*([^)\s]+)\s*\)/gi
++
++function statementTimeoutChanges(text, parameters) {
++  const changes = []
++  const plain = String(text || '').replace(/\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1\$/g, ' ')
++  budgetSyntax.lastIndex = 0
++  let m
++  while ((m = budgetSyntax.exec(plain))) {
++    if (m[1]) {
++      changes.push({ kind: 'end' })
++    } else if (m[3] !== undefined) {
++      const ms = timeoutMs(m[3], parameters)
++      changes.push(Number.isNaN(ms) ? { kind: 'unknown' } : { kind: 'set', local: /^local/i.test(m[2] || ''), ms })
++    } else if (m[4] !== undefined) {
++      const ms = timeoutMs(m[4], parameters)
++      const local = parameterValue(m[5], parameters)
++      changes.push(Number.isNaN(ms) || local === undefined ? { kind: 'unknown' } : { kind: 'set', local: /^(t|true|on|1)$/i.test(local), ms })
++    } else {
++      changes.push({ kind: 'reset' })
++    }
++  }
++  return changes
++}
++
++function parameterValue(raw, parameters) {
++  const p = /^\$(\d+)$/.exec(raw.trim())
++  if (p) {
++    const v = parameters && parameters[p[1] - 1]
++    return v === null || v === undefined ? undefined : String(v)
++  }
++  const v = raw.trim()
++  return /^'.*'$/s.test(v) ? v.slice(1, -1).replace(/''/g, "'") : v
++}
++
++function timeoutMs(raw, parameters) {
++  const v = parameterValue(raw, parameters)
++  if (v === undefined)
++    return NaN
++  if (/^default$/i.test(v.trim()))
++    return undefined
++  const m = /^\s*(\d+(?:\.\d+)?)\s*(us|ms|s|min|h|d)?\s*$/i.exec(v)
++  if (!m)
++    return NaN
++  const unit = (m[2] || 'ms').toLowerCase()
++  return Math.round(+m[1] * { us: 0.001, ms: 1, s: 1000, min: 60000, h: 3600000, d: 86400000 }[unit])
++}
++
++Connection.statementTimeoutChanges = statementTimeoutChanges
++
+ function timer(fn, seconds) {
+   seconds = typeof seconds === 'function' ? seconds() : seconds
+   if (!seconds)
 diff --git a/cjs/src/index.js b/vendor/postgres/cjs/src/index.js
-index f09c61c7..abb4a158 100644
+index f09c61c..2c31a38 100644
 --- a/cjs/src/index.js
 +++ b/vendor/postgres/cjs/src/index.js
-@@ -62,10 +62,34 @@ function Postgres(a, b) {
+@@ -62,10 +62,36 @@ function Postgres(a, b) {
        , full = Queue()
        , queues = { connecting, reserved, closed, ended, open, busy, full }
  
 -  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose }))
-+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
++  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
  
    const sql = Sql(handler)
  
@@ -351,6 +720,8 @@ index f09c61c7..abb4a158 100644
 +        ended: ended.length,
 +        queued: queries.length,
 +        inflight_oldest_ms: connections.reduce((age, c) => c.inflightSince ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
++        // GBrain (#6543 A4): the oldest head statement past its own budget (the cap the driver retires it at), 0 when none is.
++        inflight_over_budget_ms: connections.reduce((age, c) => c.inflightSince && c.inflightCap && now - c.inflightSince > c.inflightCap ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
 +        completed: options.shared.completed
 +      }
 +    }
@@ -359,7 +730,7 @@ index f09c61c7..abb4a158 100644
    Object.assign(sql, {
      get parameters() { return options.parameters },
      largeObject: largeObject.bind(null, sql),
-@@ -200,40 +224,134 @@ function Postgres(a, b) {
+@@ -200,58 +226,248 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -368,7 +739,7 @@ index f09c61c7..abb4a158 100644
      const queue = Queue()
 -    const c = open.length
 -      ? open.shift()
-+    let busy = false, fence = null, holding = null, releasing = false
++    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
 +    const reservation = c.reserved = (ended = false) => {
 +      if (c.reserved !== reservation)
 +        return
@@ -392,7 +763,7 @@ index f09c61c7..abb4a158 100644
 +      }
 +    }
 +    reservation.enqueue = q => {
-+      if (c.reserved !== reservation || releasing)
++      if (c.reserved !== reservation || releasing || discarding)
 +        return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
 +      queue.push(q)
 +      pump()
@@ -408,6 +779,52 @@ index f09c61c7..abb4a158 100644
 +      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
 +      c.terminate()
 +    }
++    // A Terminate message on the busy socket cannot interrupt its current
++    // statement. Preserve the fenced Query/canceller until CancelRequest and
++    // the query's backend response settle; never let a later query use it.
++    // The bounded fallback still discards, but rejects as unconfirmed.
++    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
++      if (discardPromise)
++        return discardPromise
++      if (c.reserved !== reservation)
++        return Promise.resolve()
++      discarding = true
++      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
++      const q = fence || holding
++      if (!q) {
++        // A busy, unfenced query has no retained canceller/settlement proof.
++        // Retire the socket but never report that as confirmed server stop.
++        const unconfirmed = busy
++        reservation.discard()
++        return discardPromise = unconfirmed
++          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
++          : Promise.resolve()
++      }
++      let timer
++      let cancelling
++      try {
++        cancelling = q.cancel()
++      } catch (error) {
++        reservation.discard()
++        return discardPromise = Promise.reject(error)
++      }
++      discardPromise = Promise.race([
++        Promise.all([
++          cancelling,
++          Promise.prototype.then.call(q, () => {}, error => {
++            if (!error || error.code !== '57014')
++              throw error
++          })
++        ]),
++        new Promise((_, reject) => {
++          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
++        })
++      ]).then(() => {}).finally(() => {
++        clearTimeout(timer)
++        reservation.discard()
++      })
++      return discardPromise
++    }
 +    reservation.releaseConnection = () => {
 +      if (c.reserved !== reservation)
 +        return
@@ -417,7 +834,7 @@ index f09c61c7..abb4a158 100644
 +    return reservation
 +
 +    function pump() {
-+      if (c.reserved !== reservation || holding || fence)
++      if (c.reserved !== reservation || discarding || holding || fence)
 +        return
 +      while (queue.length) {
 +        const q = queue.peek()
@@ -503,6 +920,7 @@ index f09c61c7..abb4a158 100644
 +      const sql = Sql(reservation.enqueue)
 +      sql.release = reservation.releaseConnection
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
 +      return sql
      }
    }
@@ -510,12 +928,69 @@ index f09c61c7..abb4a158 100644
    async function begin(options, fn) {
      !fn && (fn = options, options = '')
 -    const queries = Queue()
++    // GBrain (#6930): `{ first }` opts one transaction in to sending its first statement right behind BEGIN, before
++    // BEGIN's answer, on a pool that pipelines inside transactions (transaction_pipeline). Only that one statement, and
++    // only when `first(text)` accepts its text: if BEGIN fails it runs in autocommit, so the caller's test must accept
++    // nothing but a read or a transaction-local set_config (a no-op outside a transaction), never a write. Every
++    // other statement, the first one too when the test refuses it, waits for BEGIN's answer as before, and a failed
++    // BEGIN rejects them unsent. The transaction still settles only after `fn` does.
++    const first = typeof options === 'object' && options.first && sql.options.transaction_pipeline > sql.options.max_pipeline
++      ? options.first
++      : null
++    // GBrain (GBRA-156): `{ early }` sends every statement it accepts, in order, behind BEGIN before BEGIN's answer,
++    // on any pool that pipelines inside a transaction (a pipelining pool, or transaction_pipeline behind a pooler that
++    // does not). The first statement it refuses, and every later one, waits for the answer. If BEGIN fails the accepted
++    // statements run in autocommit, so `early` must accept only reads and transaction-local set_config, never a write.
++    const early = typeof options === 'object' && options.early
++      && (sql.options.transaction_pipeline > sql.options.max_pipeline || sql.options.max_pipeline > 0)
++      ? options.early
++      : null
++    typeof options === 'object' && (options = options.mode || '')
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +367,13 @@ function Postgres(a, b) {
++      , opening = null
++      , firstSeen = false
++      , held = false
++      , written
+ 
+     try {
+-      await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+-      return await Promise.race([
+-        scope(connection, fn),
+-        new Promise((_, reject) => connection.onclose = reject)
+-      ])
++      const begun = sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
++      if (!first && !early) {
++        await begun
++        return await raceClose(scope(connection, fn))
++      }
++      await Promise.race([new Promise(resolve => written = resolve), begun])
++      opening = begun.then(() => { opening = null })
++      opening.catch(() => { /* each held statement rejects with BEGIN's error */ })
++      const ran = raceClose(scope(connection, fn))
++      const [opened, result] = await Promise.allSettled([begun, ran])
++      if (opened.status === 'rejected')
++        throw opened.reason
++      if (result.status === 'rejected')
++        throw result.reason
++      return result.value
+     } catch (error) {
+       throw error
      }
  
++    // GBrain (#7358): the close handler leaves the connection when the transaction settles; left in place, it kept the
++    // transaction's result reachable from the pooled connection until its next transaction.
++    async function raceClose(ran) {
++      const c = connection
++      let onclose
++      try {
++        return await Promise.race([ran, new Promise((_, reject) => c.onclose = onclose = reject)])
++      } finally {
++        c.onclose === onclose && (c.onclose = null)
++      }
++    }
++
      async function scope(c, fn, name) {
 +      const reservation = c.reserved
 +      if (!reservation)
@@ -524,10 +999,11 @@ index f09c61c7..abb4a158 100644
        sql.savepoint = savepoint
        sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
        let uncaughtError
          , result
  
-@@ -281,6 +403,8 @@ function Postgres(a, b) {
+@@ -281,6 +497,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -536,7 +1012,7 @@ index f09c61c7..abb4a158 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +414,16 @@ function Postgres(a, b) {
+@@ -290,18 +508,33 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -545,6 +1021,22 @@ index f09c61c7..abb4a158 100644
 -          : c.execute(q) || move(c, full)
 +        if (!reservation || c.reserved !== reservation)
 +          return q.reject(Errors.generic('CONNECTION_CLOSED', 'Transaction connection is no longer owned'))
++        // GBrain (#6930, GBRA-156): while BEGIN is unanswered only accepted statements are sent (the first one for
++        // `first`; each one until one is refused for `early`); the rest wait, in order. A statement is accepted on its
++        // text (`$n` for each argument, as statementText builds it) only when every argument is a parameter value: a
++        // fragment (a query, a helper, an identifier) would carry SQL the test never saw.
++        if (opening) {
++          const strings = Array.isArray(q.strings) ? q.strings : [String(q.strings)]
++          const test = early || !firstSeen && first
++          const sent = !held && test
++            && q.args.every(x => !(x instanceof Query || x instanceof Builder || x instanceof Identifier || Array.isArray(x) && x.some(y => y instanceof Query)))
++            && test(strings.reduce((a, s, i) => a + '$' + i + s))
++          firstSeen = true
++          if (!sent) {
++            held = true
++            return opening.then(() => handler(q), q.reject)
++          }
++        }
 +        reservation.enqueue(q)
        }
      }
@@ -556,10 +1048,11 @@ index f09c61c7..abb4a158 100644
 -        ? c.execute(queries.shift())
 -        : move(c, reserved)
 +      own(c)
++      written && written()
      }
    }
  
-@@ -351,7 +473,7 @@ function Postgres(a, b) {
+@@ -351,7 +584,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -568,7 +1061,7 @@ index f09c61c7..abb4a158 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +484,25 @@ function Postgres(a, b) {
+@@ -362,6 +595,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -594,7 +1087,7 @@ index f09c61c7..abb4a158 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +539,14 @@ function Postgres(a, b) {
+@@ -398,7 +650,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -610,7 +1103,7 @@ index f09c61c7..abb4a158 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +566,41 @@ function Postgres(a, b) {
+@@ -418,12 +677,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -620,6 +1113,15 @@ index f09c61c7..abb4a158 100644
 +    c.queue !== ended && move(c, ended)
 +    try {
 +      options.onstuck && options.onstuck(info)
++    } catch (_) {}
++  }
++
++  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
++  function ondesync(c, info) {
++    c.queue !== ended && move(c, ended)
++    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
++    try {
++      options.ondesync && options.ondesync(info)
 +    } catch (_) {}
 +  }
 +
@@ -653,31 +1155,38 @@ index f09c61c7..abb4a158 100644
    }
  }
  
-@@ -444,7 +621,7 @@ function parseOptions(a, b) {
+@@ -444,7 +741,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
 -  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive']
-+  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'inflight_timeout']
++  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'transaction_pipeline', 'backoff', 'keep_alive', 'inflight_timeout', 'inflight_max', 'inflight_grace']
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +630,7 @@ function parseOptions(a, b) {
+@@ -453,6 +750,10 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
++    transaction_pipeline: 0,
 +    inflight_timeout: null,
++    inflight_max    : null,
++    inflight_grace  : null,
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +669,15 @@ function parseOptions(a, b) {
+@@ -491,11 +792,19 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
 +    onpoisoned      : o.onpoisoned,
 +    onstuck         : o.onstuck,
 +    onbuilderror    : o.onbuilderror,
++    ondesync        : o.ondesync,
++    onrecovered     : o.onrecovered,
++    onrecoveryfailed: o.onrecoveryfailed,
 +    shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
++    array_types     : o.array_types || null,
      onparameter     : o.onparameter,
      socket          : o.socket,
      transform       : parseTransform(o.transform || { undefined: undefined }),
@@ -688,7 +1197,7 @@ index f09c61c7..abb4a158 100644
    }
  }
 diff --git a/cjs/src/query.js b/vendor/postgres/cjs/src/query.js
-index 45327f2f..1d092504 100644
+index 45327f2..1d09250 100644
 --- a/cjs/src/query.js
 +++ b/vendor/postgres/cjs/src/query.js
 @@ -23,11 +23,12 @@ const Query = module.exports.Query = class Query extends Promise {
@@ -732,7 +1241,7 @@ index 45327f2f..1d092504 100644
            this.execute()
            return promise
 diff --git a/cjs/src/queue.js b/vendor/postgres/cjs/src/queue.js
-index 8438f5da..c444310f 100644
+index 8438f5d..c444310 100644
 --- a/cjs/src/queue.js
 +++ b/vendor/postgres/cjs/src/queue.js
 @@ -15,6 +15,7 @@ function Queue(initial = []) {
@@ -743,11 +1252,24 @@ index 8438f5da..c444310f 100644
      shift: () => {
        const out = xs[index++]
  
+diff --git a/cjs/src/types.js b/vendor/postgres/cjs/src/types.js
+index 0578284..e80a868 100644
+--- a/cjs/src/types.js
++++ b/vendor/postgres/cjs/src/types.js
+@@ -80,7 +80,7 @@ module.exports.handleValue = handleValue;function handleValue(x, parameters, typ
+       : value = x = options.transform.undefined
+ 
+     if (value === undefined)
+-      throw Errors.generic('UNDEFINED_VALUE', 'Undefined values are not allowed')
++      throw Object.assign(Errors.generic('UNDEFINED_VALUE', 'Undefined values are not allowed (parameter $' + (types.length + 1) + ')'), { parameter: types.length + 1 })
+   }
+ 
+   return '$' + (types.push(
 diff --git a/src/connection.js b/vendor/postgres/src/connection.js
-index 1b1cccde..a178b3b6 100644
+index 1b1cccd..28f3e50 100644
 --- a/src/connection.js
 +++ b/vendor/postgres/src/connection.js
-@@ -20,6 +20,7 @@ const Sync = b().S().end()
+@@ -20,6 +20,7 @@
      , SSLRequest = b().i32(8).i32(80877103).end(8)
      , ExecuteUnnamed = Buffer.concat([b().E().str(b.N).i32(0).end(), Sync])
      , DescribeUnnamed = b().D().str('S').str(b.N).end()
@@ -755,20 +1277,29 @@ index 1b1cccde..a178b3b6 100644
      , noop = () => { /* noop */ }
  
  const retryRoutines = new Set([
-@@ -49,7 +50,7 @@ const errorFields = {
+@@ -49,7 +50,7 @@
    82  : 'routine'            // R
  }
  
 -function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
-+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop } = {}) {
++function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop, ondesync = noop } = {}) {
    const {
      sslnegotiation,
      ssl,
-@@ -75,9 +76,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -64,6 +65,7 @@
+     onnotify,
+     onparameter,
+     max_pipeline,
++    transaction_pipeline,
+     keep_alive,
+     backoff,
+     target_session_attrs
+@@ -75,9 +77,14 @@
        , idleTimer = timer(end, options.idle_timeout)
        , lifeTimer = timer(end, options.max_lifetime)
        , connectTimer = timer(connectTimedOut, options.connect_timeout)
-+      , inflightTimer = timer(inflightTimedOut, options.inflight_timeout)
++      , inflightTimer = budgetTimer('idle')
++      , ageTimer = budgetTimer('age')
  
    let socket = null
      , cancelMessage
@@ -778,21 +1309,37 @@ index 1b1cccde..a178b3b6 100644
      , errorResponse = null
      , result = new Result()
      , incoming = Buffer.alloc(0)
-@@ -105,11 +110,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -95,6 +102,9 @@
+     , rows = 0
+     , serverSignature = null
+     , nextWriteTimer = null
++    , lastWritten = null
++    , lastExecuted = null
++    , deferredRetries = []
+     , terminated = false
+     , incomings = null
+     , results = null
+@@ -105,11 +115,19 @@
      , ended = null
      , nonce = null
      , query = null
 +    , queryStart = 0
++    , received = 0
++    , localBudget = undefined
++    , sessionBudget = undefined
++    , recovering = null
      , final = null
++    , inTransactionAfterSent = false
  
    const connection = {
      queue: queues.closed,
      idleTimer,
 +    inflightSince: 0,
++    inflightCap: 0,
      connect(query) {
        initial = query
        reconnect()
-@@ -143,11 +150,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -143,11 +161,13 @@
    }
  
    async function cancel({ pid, secret }, resolve, reject) {
@@ -808,7 +1355,12 @@ index 1b1cccde..a178b3b6 100644
      } catch (error) {
        reject(error)
      }
-@@ -167,21 +176,70 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -163,22 +183,174 @@
+     if (q.cancelled)
+       return
+ 
++    let mayPipeline = !q.options.onexecute
+     try {
        q.state = backend
        query
          ? sent.push(q)
@@ -816,16 +1368,22 @@ index 1b1cccde..a178b3b6 100644
 +        : (query = q, query.active = true, armInflight())
  
        build(q)
-+      const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
++      mayPipeline = mayPipeline || q.options.onexecute(connection)
++      noteBudget(q)
++      noteTransaction(q)
++      lastWritten = q
++      lastExecuted = { string: q.string, strings: q.strings }
        return write(toBuffer(q))
          && !q.describeFirst
          && !q.cursorFn
-         && sent.length < max_pipeline
+-        && sent.length < max_pipeline
 -        && (!q.options.onexecute || q.options.onexecute(connection))
++        && sent.length < pipelineLimit()
 +        && mayPipeline
      } catch (error) {
 -      sent.length === 0 && write(Sync)
 -      errored(error)
+-      return true
 +      // GBrain (#6383), the approach of porsager/postgres#1236: q already has its place in the queue of
 +      // queries awaiting an answer, but nothing of it was written. The stock catch rejected the connection's
 +      // current query with q's error and left q waiting, so every later answer went to the wrong query.
@@ -837,16 +1395,54 @@ index 1b1cccde..a178b3b6 100644
 +      q.retried = error
 +      q.describeFirst = false
 +      q.cursorFn = null
++      // GBrain (#6543): the stock `return true` let the pool route more statements behind q whatever max_pipeline and
++      // onexecute said, so a pool built not to pipeline (a transaction-mode pooler) pipelined after every build failure.
++      // onexecute (a transaction's begin) ran only if q built; a begin that failed to build is never pipelined behind.
 +      options.onbuilderror && reportBuildError(q, error)
-+      write(Unbuildable)
-       return true
-     }
-   }
- 
++      return write(Unbuildable)
++        && sent.length < max_pipeline
++        && mayPipeline
++    }
++  }
++
++  // GBrain (#6930): a transaction-mode pooler cannot carry statements pipelined across a transaction boundary (#6543,
++  // max_pipeline 0), but it pins one server connection from BEGIN until the transaction ends. So on a connection its
++  // owner holds (sql.begin, sql.reserve) a statement may follow others still in flight when every one of them leaves the
++  // connection inside a transaction: the last ReadyForQuery said T or E, or an in-flight statement began one, and none
++  // since may end it (COMMIT, ROLLBACK, END, ABORT, PREPARE TRANSACTION). Nothing is ever sent behind a statement that
++  // may end a transaction, so the next owner's statements never reach the server connection this one held.
++  function noteTransaction(q) {
++    const control = transactionControl(q.string || '')
++    control === 'end'
++      ? inTransactionAfterSent = false
++      : control === 'begin'
++        ? inTransactionAfterSent = true
++        : q === query && (inTransactionAfterSent = connection.status === 84 || connection.status === 69)
++  }
++
++  function pipelineLimit() {
++    return transaction_pipeline > max_pipeline && inTransactionAfterSent && connection.reserved
++      ? transaction_pipeline
++      : max_pipeline
++  }
++
 +  function reportBuildError(q, error) {
 +    try {
-+      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q))
++      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q), error && error.parameter)
 +    } catch (_) {}
++  }
++
++  // GBrain (#6930): 'begin' when the text opens a transaction, 'end' when any statement in it may end one.
++  function transactionControl(text) {
++    let control = null
++    for (const part of text.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '').split(';')) {
++      const statement = part.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '')
++      if (/^(?:commit|end|abort|rollback(?!\s+to\b)|prepare\s+transaction)\b/i.test(statement))
++        return 'end'
++      if (/^(?:begin|start\s+transaction)\b/i.test(statement))
++        control = 'begin'
++    }
++    return control
 +  }
 +
 +  // The statement's text with $n placeholders, never its parameter values.
@@ -859,16 +1455,76 @@ index 1b1cccde..a178b3b6 100644
 +  // byte the server sends and stops at ReadyForQuery. A statement that outlives options.inflight_timeout with
 +  // nothing coming back (a desynced connection, a pooler that swallowed a CancelRequest, a dead peer) has no
 +  // server-side timeout left to save it: the connection is retired instead of holding its queue forever.
++  //
++  // GBrain (#6543 A4): a second clock, `ageTimer`, is not restarted by received bytes, so a statement that keeps
++  // streaming (or keeps receiving notices) past its budget is retired too (`reason: 'age'`; `'idle'` when nothing came
++  // back). Both budgets are derived per statement from the statement_timeout the operation itself declared on this
++  // connection (`SET [LOCAL] statement_timeout`, `set_config('statement_timeout', ...)`, tracked client-side so it
++  // holds behind a transaction-mode pooler that never applies it): max(the pool's budget, the declared timeout) plus
++  // `inflight_grace`, and none at all for a declared timeout of 0 (an index build, a bulk copy).
 +  function armInflight() {
 +    queryStart = connection.inflightSince = performance.now()
++    received = 0
++    query.inflightCaps || (query.inflightCaps = inflightCaps())
++    connection.inflightCap = query.inflightCaps.age
 +    inflightTimer.start()
++    ageTimer.start()
 +  }
 +
-+  function inflightTimedOut() {
++  function budgetTimer(kind) {
++    let handle = null
++    return {
++      cancel() {
++        handle && (clearTimeout(handle), handle = null)
++      },
++      start() {
++        handle && clearTimeout(handle)
++        const ms = query && query.inflightCaps ? query.inflightCaps[kind] : 0
++        handle = ms ? setTimeout(() => (handle = null, inflightTimedOut(kind)), ms) : null
++      }
++    }
++  }
++
++  function inflightCaps() {
++    const declared = localBudget !== undefined ? localBudget : sessionBudget
++    if (declared === 0)
++      return { idle: 0, age: 0 }
++    const raised = declared === undefined ? 0 : declared + (options.inflight_grace || 0) * 1000
++    return {
++      idle: options.inflight_timeout ? Math.max(options.inflight_timeout * 1000, raised) : 0,
++      age: options.inflight_max ? Math.max(options.inflight_max * 1000, raised) : 0
++    }
++  }
++
++  // The statement_timeout changes a statement makes on this connection; a later statement is budgeted by them.
++  function noteBudget(q) {
++    const text = q.string || ''
++    if (localBudget === undefined && sessionBudget === undefined && !/statement_timeout/i.test(text))
++      return
++    for (const change of statementTimeoutChanges(text, q.parameters)) {
++      change.kind === 'end'
++        ? localBudget = undefined
++        : change.kind === 'reset'
++          ? localBudget = sessionBudget = undefined
++          : change.kind === 'set' && (change.local ? localBudget = change.ms : (sessionBudget = change.ms, localBudget = undefined))
++    }
++    q.inflightCaps = inflightCaps()
++    if (q === query) {
++      connection.inflightCap = q.inflightCaps.age
++      inflightTimer.start()
++      ageTimer.start()
++    }
++  }
++
++  function inflightTimedOut(kind = 'idle') {
 +    if (!query)
 +      return
-+    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query) }
++    inflightTimer.cancel()
++    ageTimer.cancel()
++    const reason = kind === 'age' && received > 0 ? 'age' : 'idle'
++    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query), reason, budget_ms: query.inflightCaps ? query.inflightCaps[kind] : 0 }
 +    const s = socket
++    recovering = recovering || 'stuck'
 +    error(Errors.connection('CONNECTION_STUCK', options, socket))
 +    query = null
 +    connection.inflightSince = 0
@@ -877,13 +1533,10 @@ index 1b1cccde..a178b3b6 100644
 +    if (s && !s.destroyed) {
 +      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
 +      t.unref && t.unref()
-+    }
-+  }
-+
-   function toBuffer(q) {
-     if (q.parameters.length >= 65534)
-       throw Errors.generic('MAX_PARAMETERS_EXCEEDED', 'Max number of parameters (65534) exceeded')
-@@ -235,10 +293,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     }
+   }
+ 
+@@ -235,10 +407,15 @@
      q.onlyDescribe && (delete statements[q.signature])
      q.parameters = q.parameters || parameters
      q.prepared = q.prepare && q.signature in statements
@@ -901,7 +1554,7 @@ index 1b1cccde..a178b3b6 100644
  
      typeof options.debug === 'function' && options.debug(id, string, parameters, types)
    }
-@@ -295,10 +358,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -295,10 +472,11 @@
  
    /* c8 ignore next 3 */
    function drain() {
@@ -910,11 +1563,29 @@ index 1b1cccde..a178b3b6 100644
    }
  
    function data(x) {
-+    query && inflightTimer.start()
++    query && (received += x.length, inflightTimer.start())
      if (incomings) {
        incomings.push(x)
        remaining -= x.length
-@@ -379,6 +443,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -330,6 +508,9 @@
+       remaining = 0
+       incomings = null
+     }
++
++    if (incoming.length === 0)
++      incoming = Buffer.alloc(0)
+   }
+ 
+   async function connect() {
+@@ -366,6 +547,7 @@
+     try {
+       statements = {}
+       needsTypes = options.fetch_types
++      inTransactionAfterSent = false
+       statementId = Math.random().toString(36).slice(2)
+       statementCount = 1
+       lifeTimer.start()
+@@ -379,20 +561,35 @@
    }
  
    function error(err) {
@@ -923,7 +1594,11 @@ index 1b1cccde..a178b3b6 100644
      if (connection.queue === queues.connecting && options.host[retries + 1])
        return
  
-@@ -388,6 +454,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     errored(err)
+     while (sent.length)
+       queryError(sent.shift(), err)
++    while (deferredRetries.length)
++      queryError(deferredRetries.shift(), err)
    }
  
    function errored(err) {
@@ -931,10 +1606,26 @@ index 1b1cccde..a178b3b6 100644
 +      cancelError = err
      stream && (stream.destroy(err), stream = null)
      query && queryError(query, err)
++    initial && recovering && recoveryFailed(err)
      initial && (queryError(initial, err), initial = null)
-@@ -438,19 +506,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
++  // GBrain (#6543 A6): a connection retired by an incident (stuck, desync, closed under statements) that completes a
++  // new startup is `recovered`; one whose reconnect fails is `recovery_failed` (it stays marked until one succeeds).
++  function recoveryFailed(err) {
++    try {
++      options.onrecoveryfailed && options.onrecoveryfailed({ connection: id, cause: recovering, code: String(err && err.code || 'CONNECTION_ERROR') })
++    } catch (_) {}
++  }
++
+   function queryError(query, err) {
+     if (query.reserve)
+       return query.reject(err)
+@@ -437,20 +634,53 @@
+     incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
++    lastWritten = null
      clearImmediate(nextWriteTimer)
 +    // GBrain (#6355): bytes still waiting for the cleared immediate belonged to this socket. Left in place, the next
 +    // connection's StartupMessage is appended to them and never scheduled for writing (the timer handle is not
@@ -946,7 +1637,9 @@ index 1b1cccde..a178b3b6 100644
      lifeTimer.cancel()
      connectTimer.cancel()
 +    inflightTimer.cancel()
-+    connection.inflightSince = 0
++    ageTimer.cancel()
++    connection.inflightSince = connection.inflightCap = 0
++    localBudget = sessionBudget = undefined
  
      socket.removeAllListeners()
      socket = null
@@ -967,17 +1660,83 @@ index 1b1cccde..a178b3b6 100644
        return reconnect()
 +    }
  
-     !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
-+    query = null
+-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // GBrain (#6543 A6): a socket that closed under statements is a recovery the next completed startup reports.
++    ;(query || sent.length) && (recovering = recovering || 'closed')
++    // GBRA-133: a socket error rejects the statements in flight, but their rejection handlers run before 'close' and may
++    // issue more on this connection (a transaction's settings restore in its finally). Skipped on hadError, those stayed
++    // queued: the next socket's startup ReadyForQuery made one the current statement without ever sending it, so it hung
++    // until the in-flight watchdog (330 s) and the reservation waiting for that startup never got its connection.
++    ;(query || sent.length || deferredRetries.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // GBrain (#6543): the dead socket's ErrorResponse (a FATAL 57P01, a pooler's XX000) and its partial result belonged
++    // to statements that just failed. Left in place, the replacement connection's startup ReadyForQuery handed that
++    // error to its first statement, and a stale row count left holes at the start of the next result.
++    query = errorResponse = results = null
++    result = new Result()
++    rows = 0
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -533,8 +620,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -459,6 +689,10 @@
+ 
+   /* Handlers */
+   function handle(xs, x = xs[0]) {
++    if (!query && !initial && !stream && answersStatement(xs, x)) {
++      desynced(x)
++      return
++    }
+     (
+       x === 68 ? DataRow :                   // D
+       x === 100 ? CopyData :                 // d
+@@ -489,6 +723,39 @@
+     )(xs)
+   }
+ 
++  // GBrain: a message that answers a statement (its columns, rows, completion, parse/bind acknowledgements or a
++  // statement error) arriving when no statement is waiting for one means the client and the server no longer
++  // agree on which answer belongs to which statement: every later answer on this connection would be read for
++  // the wrong query. The connection is retired and everything queued on it fails with CONNECTION_DESYNC.
++  // Notices, parameter changes, notifications, ReadyForQuery and a FATAL/PANIC error legitimately arrive
++  // without a statement and pass through.
++  function answersStatement(xs, x) {
++    if (x === 84 || x === 68 || x === 67 || x === 73 || x === 49 || x === 50 || x === 116 || x === 110)
++      return true
++    if (x !== 69)
++      return false
++    const fields = parseError(xs)
++    const severity = fields.severity || fields.severity_local
++    return severity !== 'FATAL' && severity !== 'PANIC'
++  }
++
++  function desynced(x) {
++    const s = socket
++    const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
++    recovering = recovering || 'desync'
++    error(Errors.connection('CONNECTION_DESYNC', options, socket))
++    inflightTimer.cancel()
++    ageTimer.cancel()
++    query = null
++    connection.inflightSince = connection.inflightCap = 0
++    ondesync(connection, info)
++    terminate()
++    if (s && !s.destroyed) {
++      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
++      t.unref && t.unref()
++    }
++  }
++
+   function DataRow(x) {
+     let index = 7
+     let length
+@@ -533,13 +800,25 @@
    }
  
    function ReadyForQuery(x) {
 +    connection.status = x[5]
-+    connection.inflightSince = 0
++    query && query === lastWritten && (lastWritten = null)
++    connection.inflightSince = connection.inflightCap = 0
++    // A transaction that ended takes its SET LOCAL statement_timeout with it.
++    x[5] === 73 && !sent.length && (localBudget = undefined)
      if (query) {
 +      options.shared.completed++
        if (errorResponse) {
@@ -985,16 +1744,46 @@ index 1b1cccde..a178b3b6 100644
 +        query.sharedTypes && options.shared_types.delete(query.typesKey)
          query.retried
            ? errored(query.retried)
-           : query.prepared && retryRoutines.has(errorResponse.routine)
-@@ -550,6 +642,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+-          : query.prepared && retryRoutines.has(errorResponse.routine)
++          : query.prepared && retryRoutines.has(errorResponse.routine) && !query.cancelled
+             ? retry(query, errorResponse)
+             : errored(errorResponse)
++      } else if (query.cancelled) {
++        // GBrain: a query cancelled while it waited behind another one on this connection still gets the
++        // server's answer to it; that answer is consumed here and the query rejects as cancelled.
++        query.reject(Errors.generic('57014', 'canceling statement due to user request'))
+       } else {
+         query.resolve(results || result)
+       }
+@@ -547,9 +826,16 @@
+       errored(errorResponse)
+     }
+ 
++    // GBrain: a statement that streamed rows and then failed (a cancel, a timeout or an error after its first rows) never
++    // reached CommandComplete, which is where the row count resets. Left in place, the next statement on this connection
++    // stored its rows after that many empty slots: a one-row read came back as [empty, row], so a reader that requires
++    // exactly one row refused and `const [row] = rows` read nothing.
      query = results = errorResponse = null
      result = new Result()
++    rows = 0
      connectTimer.cancel()
 +    inflightTimer.cancel()
++    ageTimer.cancel()
  
      if (initial) {
        if (target_session_attrs) {
-@@ -564,23 +657,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -559,28 +845,54 @@
+           return terminate()
+       }
+ 
++      // GBrain (#6930): the array types a pool for this database already fetched are applied without a round trip.
++      if (needsTypes && options.array_types && options.array_types.rows) {
++        needsTypes = false
++        options.array_types.rows.forEach(([oid, typarray]) => addArrayType(oid, typarray))
++      }
++
+       if (needsTypes) {
+         initial.reserve && (initial = null)
          return fetchArrayTypes()
        }
  
@@ -1004,12 +1793,32 @@ index 1b1cccde..a178b3b6 100644
        options.shared.retries = retries = 0
        initial = null
 -      return
++      if (recovering) {
++        const cause = recovering
++        recovering = null
++        try {
++          options.onrecovered && options.onrecovered({ connection: id, cause })
++        } catch (_) {}
++      }
 +      if (!reserving)
 +        return
++    }
++
++    // GBrain: the stock loop skipped a query cancelled while it waited behind another one, so the answer the
++    // server still sent for it was read for the next query (the next query resolved with another statement's
++    // rows, and the cancelled one never settled). The cancelled query stays current and absorbs its own answer.
++    // A server cancel targets the backend, not a statement, so it is only sent when nothing is pipelined behind.
++    if (sent.length) {
++      query = sent.shift()
++      query.active = true
++      query.cancelled && (sent.length
++        ? query.cancelled.resolve()
++        : Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject))
      }
  
-     while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
+-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
++    flushRetries()
  
      if (query)
 -      return // Consider opening if able and sent.length < 50
@@ -1024,7 +1833,7 @@ index 1b1cccde..a178b3b6 100644
          : connection.reserved()
        : ending
          ? terminate()
-@@ -630,6 +725,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -630,7 +942,11 @@
        !query.statement.types[i] && (query.statement.types[i] = x.readUInt32BE(7 + i * 4))
  
      query.prepare && (statements[query.signature] = query.statement)
@@ -1032,9 +1841,11 @@ index 1b1cccde..a178b3b6 100644
 +    query.typesKey && query.statement.types.every(t => t > 0 && t < 16384)
 +      && options.shared_types.set(query.typesKey, query.statement.types.slice())
      query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
++    flushRetries()
    }
  
-@@ -767,14 +865,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function RowDescription(x) {
+@@ -767,15 +1083,23 @@
  
    async function fetchArrayTypes() {
      needsTypes = false
@@ -1062,18 +1873,98 @@ index 1b1cccde..a178b3b6 100644
 +      return
 +    }
      types.forEach(({ oid, typarray }) => addArrayType(oid, typarray))
++    options.array_types && (options.array_types.rows = types.map(({ oid, typarray }) => [oid, typarray]))
    }
  
+   function addArrayType(oid, typarray) {
+@@ -821,7 +1145,16 @@
+   function retry(q, error) {
+     delete statements[q.signature]
+     q.retried = error
+-    execute(q)
++    deferredRetries.push(q)
++    flushRetries()
++  }
++
++  // GBrain: a describe-first or cursor query writes its next messages only when the server answers its first
++  // ones. A retry written in that gap lands between them on the wire, and every later response is then read
++  // for the wrong query (rows built with another statement's columns). Retries wait for that query.
++  function flushRetries() {
++    while (deferredRetries.length && !(lastWritten && (lastWritten.describeFirst || lastWritten.cursorFn)))
++      execute(deferredRetries.shift())
+   }
+ 
+   function NotificationResponse(x) {
+@@ -1039,6 +1372,59 @@
+   return buffer
+ }
+ 
++// GBrain (#6543 A4): what one statement does to the connection's statement_timeout, in order: `set` (`local`, `ms`;
++// 0 disables it, undefined is DEFAULT), `reset` (RESET statement_timeout / RESET ALL / DISCARD ALL), `end` (a
++// transaction began or ended, which drops a SET LOCAL), and `unknown` for a change whose value cannot be read here.
++// Dollar-quoted bodies are skipped, so a function body's BEGIN/END is not a transaction boundary.
++const budgetSyntax = /(?:^|;)\s*(begin|start\s+transaction|commit|end|abort|rollback(?!\s+(?:to|prepared)\b))\b|\bset\s+(local\s+|session\s+)?statement_timeout\s*(?:=|\bto\b)\s*('(?:[^']|'')*'|[^\s;)]+)|\breset\s+(?:statement_timeout|all)\b|\bdiscard\s+all\b|\bset_config\s*\(\s*'statement_timeout'\s*,\s*('(?:[^']|'')*'|\$\d+)\s*,\s*([^)\s]+)\s*\)/gi
++
++function statementTimeoutChanges(text, parameters) {
++  const changes = []
++  const plain = String(text || '').replace(/\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1\$/g, ' ')
++  budgetSyntax.lastIndex = 0
++  let m
++  while ((m = budgetSyntax.exec(plain))) {
++    if (m[1]) {
++      changes.push({ kind: 'end' })
++    } else if (m[3] !== undefined) {
++      const ms = timeoutMs(m[3], parameters)
++      changes.push(Number.isNaN(ms) ? { kind: 'unknown' } : { kind: 'set', local: /^local/i.test(m[2] || ''), ms })
++    } else if (m[4] !== undefined) {
++      const ms = timeoutMs(m[4], parameters)
++      const local = parameterValue(m[5], parameters)
++      changes.push(Number.isNaN(ms) || local === undefined ? { kind: 'unknown' } : { kind: 'set', local: /^(t|true|on|1)$/i.test(local), ms })
++    } else {
++      changes.push({ kind: 'reset' })
++    }
++  }
++  return changes
++}
++
++function parameterValue(raw, parameters) {
++  const p = /^\$(\d+)$/.exec(raw.trim())
++  if (p) {
++    const v = parameters && parameters[p[1] - 1]
++    return v === null || v === undefined ? undefined : String(v)
++  }
++  const v = raw.trim()
++  return /^'.*'$/s.test(v) ? v.slice(1, -1).replace(/''/g, "'") : v
++}
++
++function timeoutMs(raw, parameters) {
++  const v = parameterValue(raw, parameters)
++  if (v === undefined)
++    return NaN
++  if (/^default$/i.test(v.trim()))
++    return undefined
++  const m = /^\s*(\d+(?:\.\d+)?)\s*(us|ms|s|min|h|d)?\s*$/i.exec(v)
++  if (!m)
++    return NaN
++  const unit = (m[2] || 'ms').toLowerCase()
++  return Math.round(+m[1] * { us: 0.001, ms: 1, s: 1000, min: 60000, h: 3600000, d: 86400000 }[unit])
++}
++
++Connection.statementTimeoutChanges = statementTimeoutChanges
++
+ function timer(fn, seconds) {
+   seconds = typeof seconds === 'function' ? seconds() : seconds
+   if (!seconds)
 diff --git a/src/index.js b/vendor/postgres/src/index.js
-index c7fba3da..32efd8bf 100644
+index c7fba3d..5bacfcb 100644
 --- a/src/index.js
 +++ b/vendor/postgres/src/index.js
-@@ -62,10 +62,34 @@ function Postgres(a, b) {
+@@ -62,10 +62,36 @@ function Postgres(a, b) {
        , full = Queue()
        , queues = { connecting, reserved, closed, ended, open, busy, full }
  
 -  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose }))
-+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
++  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
  
    const sql = Sql(handler)
  
@@ -1096,6 +1987,8 @@ index c7fba3da..32efd8bf 100644
 +        ended: ended.length,
 +        queued: queries.length,
 +        inflight_oldest_ms: connections.reduce((age, c) => c.inflightSince ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
++        // GBrain (#6543 A4): the oldest head statement past its own budget (the cap the driver retires it at), 0 when none is.
++        inflight_over_budget_ms: connections.reduce((age, c) => c.inflightSince && c.inflightCap && now - c.inflightSince > c.inflightCap ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
 +        completed: options.shared.completed
 +      }
 +    }
@@ -1104,7 +1997,7 @@ index c7fba3da..32efd8bf 100644
    Object.assign(sql, {
      get parameters() { return options.parameters },
      largeObject: largeObject.bind(null, sql),
-@@ -200,40 +224,134 @@ function Postgres(a, b) {
+@@ -200,58 +226,248 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -1113,7 +2006,7 @@ index c7fba3da..32efd8bf 100644
      const queue = Queue()
 -    const c = open.length
 -      ? open.shift()
-+    let busy = false, fence = null, holding = null, releasing = false
++    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
 +    const reservation = c.reserved = (ended = false) => {
 +      if (c.reserved !== reservation)
 +        return
@@ -1137,7 +2030,7 @@ index c7fba3da..32efd8bf 100644
 +      }
 +    }
 +    reservation.enqueue = q => {
-+      if (c.reserved !== reservation || releasing)
++      if (c.reserved !== reservation || releasing || discarding)
 +        return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
 +      queue.push(q)
 +      pump()
@@ -1153,6 +2046,52 @@ index c7fba3da..32efd8bf 100644
 +      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
 +      c.terminate()
 +    }
++    // A Terminate message on the busy socket cannot interrupt its current
++    // statement. Preserve the fenced Query/canceller until CancelRequest and
++    // the query's backend response settle; never let a later query use it.
++    // The bounded fallback still discards, but rejects as unconfirmed.
++    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
++      if (discardPromise)
++        return discardPromise
++      if (c.reserved !== reservation)
++        return Promise.resolve()
++      discarding = true
++      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
++      const q = fence || holding
++      if (!q) {
++        // A busy, unfenced query has no retained canceller/settlement proof.
++        // Retire the socket but never report that as confirmed server stop.
++        const unconfirmed = busy
++        reservation.discard()
++        return discardPromise = unconfirmed
++          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
++          : Promise.resolve()
++      }
++      let timer
++      let cancelling
++      try {
++        cancelling = q.cancel()
++      } catch (error) {
++        reservation.discard()
++        return discardPromise = Promise.reject(error)
++      }
++      discardPromise = Promise.race([
++        Promise.all([
++          cancelling,
++          Promise.prototype.then.call(q, () => {}, error => {
++            if (!error || error.code !== '57014')
++              throw error
++          })
++        ]),
++        new Promise((_, reject) => {
++          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
++        })
++      ]).then(() => {}).finally(() => {
++        clearTimeout(timer)
++        reservation.discard()
++      })
++      return discardPromise
++    }
 +    reservation.releaseConnection = () => {
 +      if (c.reserved !== reservation)
 +        return
@@ -1162,7 +2101,7 @@ index c7fba3da..32efd8bf 100644
 +    return reservation
 +
 +    function pump() {
-+      if (c.reserved !== reservation || holding || fence)
++      if (c.reserved !== reservation || discarding || holding || fence)
 +        return
 +      while (queue.length) {
 +        const q = queue.peek()
@@ -1248,6 +2187,7 @@ index c7fba3da..32efd8bf 100644
 +      const sql = Sql(reservation.enqueue)
 +      sql.release = reservation.releaseConnection
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
 +      return sql
      }
    }
@@ -1255,12 +2195,69 @@ index c7fba3da..32efd8bf 100644
    async function begin(options, fn) {
      !fn && (fn = options, options = '')
 -    const queries = Queue()
++    // GBrain (#6930): `{ first }` opts one transaction in to sending its first statement right behind BEGIN, before
++    // BEGIN's answer, on a pool that pipelines inside transactions (transaction_pipeline). Only that one statement, and
++    // only when `first(text)` accepts its text: if BEGIN fails it runs in autocommit, so the caller's test must accept
++    // nothing but a read or a transaction-local set_config (a no-op outside a transaction), never a write. Every
++    // other statement, the first one too when the test refuses it, waits for BEGIN's answer as before, and a failed
++    // BEGIN rejects them unsent. The transaction still settles only after `fn` does.
++    const first = typeof options === 'object' && options.first && sql.options.transaction_pipeline > sql.options.max_pipeline
++      ? options.first
++      : null
++    // GBrain (GBRA-156): `{ early }` sends every statement it accepts, in order, behind BEGIN before BEGIN's answer,
++    // on any pool that pipelines inside a transaction (a pipelining pool, or transaction_pipeline behind a pooler that
++    // does not). The first statement it refuses, and every later one, waits for the answer. If BEGIN fails the accepted
++    // statements run in autocommit, so `early` must accept only reads and transaction-local set_config, never a write.
++    const early = typeof options === 'object' && options.early
++      && (sql.options.transaction_pipeline > sql.options.max_pipeline || sql.options.max_pipeline > 0)
++      ? options.early
++      : null
++    typeof options === 'object' && (options = options.mode || '')
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +367,13 @@ function Postgres(a, b) {
++      , opening = null
++      , firstSeen = false
++      , held = false
++      , written
+ 
+     try {
+-      await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+-      return await Promise.race([
+-        scope(connection, fn),
+-        new Promise((_, reject) => connection.onclose = reject)
+-      ])
++      const begun = sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
++      if (!first && !early) {
++        await begun
++        return await raceClose(scope(connection, fn))
++      }
++      await Promise.race([new Promise(resolve => written = resolve), begun])
++      opening = begun.then(() => { opening = null })
++      opening.catch(() => { /* each held statement rejects with BEGIN's error */ })
++      const ran = raceClose(scope(connection, fn))
++      const [opened, result] = await Promise.allSettled([begun, ran])
++      if (opened.status === 'rejected')
++        throw opened.reason
++      if (result.status === 'rejected')
++        throw result.reason
++      return result.value
+     } catch (error) {
+       throw error
      }
  
++    // GBrain (#7358): the close handler leaves the connection when the transaction settles; left in place, it kept the
++    // transaction's result reachable from the pooled connection until its next transaction.
++    async function raceClose(ran) {
++      const c = connection
++      let onclose
++      try {
++        return await Promise.race([ran, new Promise((_, reject) => c.onclose = onclose = reject)])
++      } finally {
++        c.onclose === onclose && (c.onclose = null)
++      }
++    }
++
      async function scope(c, fn, name) {
 +      const reservation = c.reserved
 +      if (!reservation)
@@ -1269,10 +2266,11 @@ index c7fba3da..32efd8bf 100644
        sql.savepoint = savepoint
        sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
        let uncaughtError
          , result
  
-@@ -281,6 +403,8 @@ function Postgres(a, b) {
+@@ -281,6 +497,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -1281,7 +2279,7 @@ index c7fba3da..32efd8bf 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +414,16 @@ function Postgres(a, b) {
+@@ -290,18 +508,33 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -1290,6 +2288,22 @@ index c7fba3da..32efd8bf 100644
 -          : c.execute(q) || move(c, full)
 +        if (!reservation || c.reserved !== reservation)
 +          return q.reject(Errors.generic('CONNECTION_CLOSED', 'Transaction connection is no longer owned'))
++        // GBrain (#6930, GBRA-156): while BEGIN is unanswered only accepted statements are sent (the first one for
++        // `first`; each one until one is refused for `early`); the rest wait, in order. A statement is accepted on its
++        // text (`$n` for each argument, as statementText builds it) only when every argument is a parameter value: a
++        // fragment (a query, a helper, an identifier) would carry SQL the test never saw.
++        if (opening) {
++          const strings = Array.isArray(q.strings) ? q.strings : [String(q.strings)]
++          const test = early || !firstSeen && first
++          const sent = !held && test
++            && q.args.every(x => !(x instanceof Query || x instanceof Builder || x instanceof Identifier || Array.isArray(x) && x.some(y => y instanceof Query)))
++            && test(strings.reduce((a, s, i) => a + '$' + i + s))
++          firstSeen = true
++          if (!sent) {
++            held = true
++            return opening.then(() => handler(q), q.reject)
++          }
++        }
 +        reservation.enqueue(q)
        }
      }
@@ -1301,10 +2315,11 @@ index c7fba3da..32efd8bf 100644
 -        ? c.execute(queries.shift())
 -        : move(c, reserved)
 +      own(c)
++      written && written()
      }
    }
  
-@@ -351,7 +473,7 @@ function Postgres(a, b) {
+@@ -351,7 +584,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -1313,7 +2328,7 @@ index c7fba3da..32efd8bf 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +484,25 @@ function Postgres(a, b) {
+@@ -362,6 +595,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -1339,7 +2354,7 @@ index c7fba3da..32efd8bf 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +539,14 @@ function Postgres(a, b) {
+@@ -398,7 +650,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -1355,7 +2370,7 @@ index c7fba3da..32efd8bf 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +566,41 @@ function Postgres(a, b) {
+@@ -418,12 +677,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -1365,6 +2380,15 @@ index c7fba3da..32efd8bf 100644
 +    c.queue !== ended && move(c, ended)
 +    try {
 +      options.onstuck && options.onstuck(info)
++    } catch (_) {}
++  }
++
++  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
++  function ondesync(c, info) {
++    c.queue !== ended && move(c, ended)
++    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
++    try {
++      options.ondesync && options.ondesync(info)
 +    } catch (_) {}
 +  }
 +
@@ -1398,31 +2422,38 @@ index c7fba3da..32efd8bf 100644
    }
  }
  
-@@ -444,7 +621,7 @@ function parseOptions(a, b) {
+@@ -444,7 +741,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
 -  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive']
-+  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'inflight_timeout']
++  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'transaction_pipeline', 'backoff', 'keep_alive', 'inflight_timeout', 'inflight_max', 'inflight_grace']
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +630,7 @@ function parseOptions(a, b) {
+@@ -453,6 +750,10 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
++    transaction_pipeline: 0,
 +    inflight_timeout: null,
++    inflight_max    : null,
++    inflight_grace  : null,
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +669,15 @@ function parseOptions(a, b) {
+@@ -491,11 +792,19 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
 +    onpoisoned      : o.onpoisoned,
 +    onstuck         : o.onstuck,
 +    onbuilderror    : o.onbuilderror,
++    ondesync        : o.ondesync,
++    onrecovered     : o.onrecovered,
++    onrecoveryfailed: o.onrecoveryfailed,
 +    shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
++    array_types     : o.array_types || null,
      onparameter     : o.onparameter,
      socket          : o.socket,
      transform       : parseTransform(o.transform || { undefined: undefined }),
@@ -1433,7 +2464,7 @@ index c7fba3da..32efd8bf 100644
    }
  }
 diff --git a/src/query.js b/vendor/postgres/src/query.js
-index 0d44a15c..96967780 100644
+index 0d44a15..9696778 100644
 --- a/src/query.js
 +++ b/vendor/postgres/src/query.js
 @@ -23,11 +23,12 @@ export class Query extends Promise {
@@ -1477,7 +2508,7 @@ index 0d44a15c..96967780 100644
            this.execute()
            return promise
 diff --git a/src/queue.js b/vendor/postgres/src/queue.js
-index c4ef9716..8fba891b 100644
+index c4ef971..8fba891 100644
 --- a/src/queue.js
 +++ b/vendor/postgres/src/queue.js
 @@ -15,6 +15,7 @@ function Queue(initial = []) {
@@ -1488,11 +2519,24 @@ index c4ef9716..8fba891b 100644
      shift: () => {
        const out = xs[index++]
  
+diff --git a/src/types.js b/vendor/postgres/src/types.js
+index 7c7c2b9..d462498 100644
+--- a/src/types.js
++++ b/vendor/postgres/src/types.js
+@@ -80,7 +80,7 @@ export function handleValue(x, parameters, types, options) {
+       : value = x = options.transform.undefined
+ 
+     if (value === undefined)
+-      throw Errors.generic('UNDEFINED_VALUE', 'Undefined values are not allowed')
++      throw Object.assign(Errors.generic('UNDEFINED_VALUE', 'Undefined values are not allowed (parameter $' + (types.length + 1) + ')'), { parameter: types.length + 1 })
+   }
+ 
+   return '$' + (types.push(
 diff --git a/types/index.d.ts b/vendor/postgres/types/index.d.ts
-index 13c3432f..36233121 100644
+index 13c3432f7..1c4a50bbb 100644
 --- a/types/index.d.ts
 +++ b/vendor/postgres/types/index.d.ts
-@@ -119,6 +119,32 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
+@@ -119,6 +119,63 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
     */
    publications: string
    onclose: (connId: number) => void;
@@ -1508,13 +2552,32 @@ index 13c3432f..36233121 100644
 +   * @default null
 +   */
 +  inflight_timeout: number | null;
-+  /** GBrain: called once per connection the in-flight watchdog retired. */
-+  onstuck: (stuck: { age_ms: number; queued: number; statement: string }) => void;
++  /**
++   * GBrain (#6543): seconds a head statement may run in total, whatever the server keeps sending, before the
++   * connection is retired with `CONNECTION_STUCK` (`reason: 'age'`). A statement after a declared
++   * `statement_timeout` above the budget gets that timeout plus `inflight_grace`; a declared 0 disables both clocks.
++   * @default null
++   */
++  inflight_max: number | null;
++  /** GBrain (#6543): seconds added to a declared statement_timeout that raises a statement's budget. @default null */
++  inflight_grace: number | null;
++  /** GBrain: called once per connection the in-flight watchdog retired; `reason` is `age` when bytes kept arriving, else `idle`. */
++  onstuck: (stuck: { age_ms: number; queued: number; statement: string; reason: 'age' | 'idle'; budget_ms: number }) => void;
++  /** GBrain (#6543): a connection retired by an incident (`stuck`, `desync`, `closed` under statements) completed a new startup. */
++  onrecovered: (recovered: { connection: number; cause: 'stuck' | 'desync' | 'closed' }) => void;
++  /** GBrain (#6543): the reconnect of a connection retired by an incident failed; it stays marked until one succeeds. */
++  onrecoveryfailed: (failed: { connection: number; cause: 'stuck' | 'desync' | 'closed'; code: string }) => void;
 +  /**
 +   * GBrain: called when a statement fails to build (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`);
-+   * `statement` is its text with `$n` placeholders, never parameter values.
++   * `statement` is its text with `$n` placeholders, never parameter values; `parameter` is the 1-based
++   * index of an undefined parameter value, undefined when the failure names none (an array element).
 +   */
-+  onbuilderror: (code: string, statement: string) => void;
++  onbuilderror: (code: string, statement: string, parameter?: number) => void;
++  /**
++   * GBrain: called once per connection retired because a statement's answer arrived with no statement
++   * waiting for it; `statement` is the last statement written on it, with `$n` placeholders.
++   */
++  ondesync: (desync: { message: string; connection: number; statement: string }) => void;
 +  /**
 +   * GBrain: share the parameter types of a described statement across this pool's
 +   * connections, so a connection running it for the first time skips the describe
@@ -1522,10 +2585,22 @@ index 13c3432f..36233121 100644
 +   * @default true
 +   */
 +  shared_types: boolean | Map<string, number[]>;
++  /**
++   * GBrain (#6930): the array types the first connection to a database fetched, shared with every later
++   * connection (of any pool given the same object), so only that first connection runs the pg_type query.
++   * @default null
++   */
++  array_types: { rows: Array<[number, number]> | null } | null;
++  /**
++   * GBrain (#6930): the pipeline depth on a connection its owner holds (sql.begin, sql.reserve) while every statement
++   * in flight leaves it inside a transaction; used when above max_pipeline (a transaction-mode pooler's 0).
++   * @default 0
++   */
++  transaction_pipeline: number;
    backoff: boolean | ((attemptNum: number) => number);
    max_lifetime: number | null;
    keep_alive: number | null;
-@@ -605,7 +631,7 @@ declare namespace postgres {
+@@ -605,7 +662,7 @@ declare namespace postgres {
      writable(): Promise<Writable>;
  
      execute(): this;
@@ -1534,7 +2609,7 @@ index 13c3432f..36233121 100644
  
      /**
       * @deprecated `.stream` has been renamed to `.forEach`
-@@ -659,6 +685,7 @@ declare namespace postgres {
+@@ -659,6 +716,7 @@ declare namespace postgres {
    | Fragment[]
  
    interface UnsafeQueryOptions {
@@ -1542,7 +2617,7 @@ index 13c3432f..36233121 100644
      /**
       * When executes query as prepared statement.
       * @default false
-@@ -705,6 +732,8 @@ declare namespace postgres {
+@@ -705,6 +763,8 @@ declare namespace postgres {
  
      options: ParsedOptions<TTypes>;
      parameters: ConnectionParameters;
@@ -1551,9 +2626,18 @@ index 13c3432f..36233121 100644
  
      end(options?: { timeout?: number | undefined } | undefined): Promise<void>;
  
-@@ -717,10 +746,11 @@ declare namespace postgres {
+@@ -716,11 +776,21 @@ declare namespace postgres {
+ 
      begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
++    /**
++     * GBrain (#6930): with transaction_pipeline in force, the first statement `first` accepts (its text, `$n` for
++     * parameters) is sent behind BEGIN before BEGIN's answer. If BEGIN fails it runs in autocommit, so `first` must
++     * accept only a read or a transaction-local set_config, never a write.
++     * GBrain (GBRA-156): on any pool that pipelines inside a transaction, every statement `early` accepts, in order, is
++     * sent behind BEGIN before BEGIN's answer; the first it refuses, and every later one, waits. The same rule applies.
++     */
++    begin<T>(options: { mode?: string; first?: (statement: string) => boolean; early?: (statement: string) => boolean }, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
 -    reserve(): Promise<ReservedSql<TTypes>>
 +    reserve(options?: { signal?: AbortSignal }): Promise<ReservedSql<TTypes>>
@@ -1561,14 +2645,16 @@ index 13c3432f..36233121 100644
  
    interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes>  {
 +    discard(): void;
++    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
      savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
-@@ -728,6 +758,7 @@ declare namespace postgres {
+@@ -728,6 +798,8 @@ declare namespace postgres {
    }
  
    interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
 +    discard(): void;
++    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
      release(): void;
    }
  }

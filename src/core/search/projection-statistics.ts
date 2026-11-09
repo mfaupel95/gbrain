@@ -1,4 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
+import { analyzeDeferred, lockTableForAnalyze } from '../analyze-lock.ts';
 import { beginFullAnalyze, maybeRefreshPlannerStats, plannerAutoAnalyzeEnabled } from '../planner-stats.ts';
 
 export const PROJECTION_STATISTICS_NAME = 'pages_text_projection_current_stats';
@@ -11,14 +12,16 @@ ANALYZE pages(text_projection_revision, knowledge_revision);
 
 type ProjectionStatisticsState = 'collected' | 'undefined' | 'uninspectable' | 'uncollected';
 
-async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>): Promise<ProjectionStatisticsState> {
-  const rows = await engine.executeRaw<{
-    expression: string;
-    correct_table: boolean;
-    sampled_rows: number;
-    can_inspect: boolean;
-    collected: boolean;
-  }>(`SELECT pg_get_expr(e.stxexprs, e.stxrelid) AS expression,
+interface ProjectionStatisticsRow {
+  expression: string | null;
+  correct_table: boolean | null;
+  sampled_rows: number | null;
+  can_inspect: boolean | null;
+  collected: boolean | null;
+}
+
+/** The projection statistics' definition and collection state; `$${n}` binds PROJECTION_STATISTICS_NAME. */
+const projectionStatisticsSql = (n: number) => `SELECT pg_get_expr(e.stxexprs, e.stxrelid) AS expression,
        e.stxrelid = 'pages'::regclass AS correct_table,
        p.reltuples AS sampled_rows,
        has_table_privilege(p.oid, 'SELECT') AND NOT row_security_active(p.oid) AS can_inspect,
@@ -28,8 +31,14 @@ async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>)
        ON x.statistics_schemaname = (SELECT nspname FROM pg_namespace WHERE oid = e.stxnamespace)
        AND x.statistics_name = e.stxname
        AND x.expr = pg_get_expr(e.stxexprs, e.stxrelid)
-     WHERE p.oid = 'pages'::regclass AND e.stxname = $1`, [PROJECTION_STATISTICS_NAME]);
-  const state = rows[0];
+     WHERE p.oid = 'pages'::regclass AND e.stxname = $${n}`;
+
+async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>): Promise<ProjectionStatisticsState> {
+  const rows = await engine.executeRaw<ProjectionStatisticsRow>(projectionStatisticsSql(1), [PROJECTION_STATISTICS_NAME]);
+  return projectionStatisticsState(rows[0]);
+}
+
+function projectionStatisticsState(state: ProjectionStatisticsRow | undefined): ProjectionStatisticsState {
   if (!state || !state.correct_table || state.expression !== '(text_projection_revision = knowledge_revision)') return 'undefined';
   if (!state.can_inspect) return 'uninspectable';
   if (Number(state.sampled_rows) < 0 || (Number(state.sampled_rows) > 0 && !state.collected)) return 'uncollected';
@@ -55,8 +64,8 @@ export async function verifyProjectionStatistics(engine: Pick<BrainEngine, 'exec
  * source scope and run as pages-by-pages nested loops: at 5,000 pages a search took 50-60 s instead of 0.5 s.
  */
 export const SEARCH_STATISTICS_COLUMNS = {
-  pages: ['text_projection_revision', 'knowledge_revision', 'deleted_at', 'source_id', 'type', 'slug'],
-  content_chunks: ['model', 'modality', 'page_id'],
+  pages: ['text_projection_revision', 'knowledge_revision', 'deleted_at', 'source_id', 'type', 'slug', 'body_generation'],
+  content_chunks: ['model', 'modality', 'page_id', 'body_generation'],
 } as const;
 
 /**
@@ -79,36 +88,68 @@ export const CHUNK_STATISTICS_SQL = `ANALYZE content_chunks(${SEARCH_STATISTICS_
  */
 export const SEARCH_PAGE_STATISTICS_SQL = `ANALYZE pages(${SEARCH_STATISTICS_COLUMNS.pages.join(', ')})`;
 
-const CHUNK_STATISTICS_WARNING = `[search] Chunk planner statistics could not be refreshed (a lock or the 30 s bound). Vector search may skip its index until autovacuum analyzes content_chunks; run ${CHUNK_STATISTICS_SQL} as the table owner to fix it now.`;
+const CHUNK_STATISTICS_WARNING = `[search] Chunk planner statistics could not be refreshed (the 30 s bound or a missing privilege). Vector search may skip its index until autovacuum analyzes content_chunks; run ${CHUNK_STATISTICS_SQL} as the table owner to fix it now.`;
+const CHUNK_STATISTICS_DEFERRED = '[search] Chunk planner statistics refresh deferred: another session (a vacuum, an ANALYZE or an index build) holds content_chunks, and this refresh never waits on it (#7083). Autovacuum analyzes the table, and the next import, sync or embed drain refreshes it again.';
 
 /**
- * The chunk ANALYZE inside a caller's bounded Postgres transaction, behind a
- * savepoint: a concurrent index build holding the table's lock (2 s lock
- * timeout) costs this step alone, never the caller's page statistics. A role
- * that does not own the table gets Postgres's skip warning, not an error.
+ * The chunk ANALYZE inside a caller's bounded Postgres transaction, in a nested
+ * transaction (a savepoint the driver rolls back, so a failed statement never
+ * aborts the caller's transaction): a vacuum, ANALYZE or index build holding
+ * the table's lock defers this step alone (`lockTableForAnalyze`, which never
+ * waits, so it never cancels an autovacuum), never the caller's page
+ * statistics. A role that does not own the table gets Postgres's skip warning,
+ * not an error.
  */
 async function analyzeChunkColumns(tx: BrainEngine): Promise<boolean> {
-  await tx.executeRaw('SAVEPOINT chunk_statistics');
   try {
-    await tx.executeRaw(CHUNK_STATISTICS_SQL);
-    await tx.executeRaw('RELEASE SAVEPOINT chunk_statistics');
+    await tx.transaction(async step => {
+      await lockTableForAnalyze(step, 'content_chunks');
+      await step.executeRaw(CHUNK_STATISTICS_SQL);
+    });
     return true;
-  } catch {
-    await tx.executeRaw('ROLLBACK TO SAVEPOINT chunk_statistics');
-    console.warn(CHUNK_STATISTICS_WARNING);
+  } catch (error) {
+    console.warn(analyzeDeferred(error) ? CHUNK_STATISTICS_DEFERRED : CHUNK_STATISTICS_WARNING);
     return false;
   }
 }
 
 /**
- * Postgres only (PGLite's planner-stats deltas own its chunk statistics): one
- * bounded narrow ANALYZE of content_chunks after an embed drain, which moves
- * content_chunks.model on every row it embeds. Import, sync and reindex get
- * the same step inside refreshProjectionStatistics.
+ * #7083: whether a drain that changed `changedRows` chunks can leave the chunk statistics alone: content_chunks was
+ * sampled with rows, its `SEARCH_STATISTICS_COLUMNS` statistics exist, the configured embedding model (the
+ * provenance the drain writes to content_chunks.model) is among the sampled common models, and the drain changed fewer
+ * than 50 + 10% of the sampled rows (autovacuum's analyze threshold, as `statisticsStillCurrent` for pages). Such a
+ * drain barely moves them, and autovacuum's own analyze covers what small drains add up to. A model the sample has
+ * never seen (a partial or source-scoped model switch) refreshes, or vector search would estimate one row for it and
+ * sort every candidate. An unknown model refreshes too. Without this, every import's embed drain on a 10M-chunk
+ * table ran a 2-6 s ANALYZE.
  */
-export async function refreshChunkStatistics(engine: BrainEngine): Promise<boolean> {
+async function chunkStatisticsStillCurrent(engine: BrainEngine, changedRows: number): Promise<boolean> {
+  if (!Number.isFinite(changedRows)) return false;
+  let model: string | null = null;
+  try { model = (await import('../ai/gateway.ts')).getEmbeddingModelProvenance(); } catch { return false; } // engine-dynamic-import-ok
+  if (!model) return false;
+  const [state] = await engine.executeRaw<{ reltuples: number; sampled: boolean }>(
+    `SELECT c.reltuples::float8 AS reltuples,
+            EXISTS (SELECT 1 FROM pg_stats s WHERE s.schemaname = current_schema() AND s.tablename = 'content_chunks' AND s.attname = 'model'
+                      AND $1 = ANY (s.most_common_vals::text::text[])) AS sampled
+       FROM pg_class c WHERE c.oid = 'content_chunks'::regclass`, [model]);
+  const rows = Number(state?.reltuples ?? -1);
+  if (rows <= 0 || !state?.sampled || changedRows >= 50 + 0.1 * rows) return false;
+  return !(await missingSearchStatistics(engine)).some(column => column.startsWith('content_chunks.'));
+}
+
+/**
+ * Postgres only (PGLite's planner-stats deltas own its chunk statistics): one
+ * bounded narrow ANALYZE of content_chunks after an embed drain that changed
+ * `changedRows` chunks (omitted: always), which moves content_chunks.model on
+ * every row it embeds. A drain `chunkStatisticsStillCurrent` vouches for
+ * skips it. Import, sync and reindex get the same step inside
+ * refreshProjectionStatistics.
+ */
+export async function refreshChunkStatistics(engine: BrainEngine, changedRows = Infinity): Promise<boolean> {
   if (engine.kind !== 'postgres') return false;
   try {
+    if (await chunkStatisticsStillCurrent(engine, changedRows)) return true;
     return await engine.transaction(async tx => {
       await tx.executeRaw("SET LOCAL statement_timeout = '30s'");
       await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
@@ -120,10 +161,11 @@ export async function refreshChunkStatistics(engine: BrainEngine): Promise<boole
   }
 }
 
-/** Runs an embed drain, then refreshes the chunk statistics once when `changed()` says it embedded something (a drain moves content_chunks.model on every row it embeds). */
-export async function withChunkStatisticsRefresh<T>(engine: BrainEngine, changed: () => boolean, drain: () => Promise<T>): Promise<T> {
+/** Runs an embed drain, then refreshes the chunk statistics once for the `changed()` chunks it embedded (none: no refresh; a drain moves content_chunks.model on every row it embeds). */
+export async function withChunkStatisticsRefresh<T>(engine: BrainEngine, changed: () => number, drain: () => Promise<T>): Promise<T> {
   const out = await drain();
-  if (changed()) await refreshChunkStatistics(engine);
+  const rows = changed();
+  if (rows > 0) await refreshChunkStatistics(engine, rows);
   return out;
 }
 
@@ -144,6 +186,15 @@ const MISSING_SEARCH_STATISTICS_SQL = `SELECT r.tablename || '.' || r.attname AS
  ORDER BY r.position`;
 
 /**
+ * The three reads behind `missingSearchStatistics` in one statement (#7147: each is a round trip, and the search guard
+ * runs it on every cold CLI search): the missing columns in order, pages' sampled rows, and the projection statistics'
+ * state ($3), which only counts when pages holds SEARCH_STATISTICS_MIN_ROWS rows.
+ */
+const SEARCH_STATISTICS_STATE_SQL = `SELECT ARRAY(${MISSING_SEARCH_STATISTICS_SQL}) AS missing,
+       (SELECT reltuples::float8 FROM pg_class WHERE oid = 'pages'::regclass) AS pages_rows, projection.*
+  FROM (SELECT 1) AS one LEFT JOIN LATERAL (${projectionStatisticsSql(3)} LIMIT 1) AS projection ON true`;
+
+/**
  * Postgres: the planner statistics search needs that are absent, as `table.column` (plus PROJECTION_STATISTICS_NAME
  * when the projection statistics are not collected on such a table). Empty when every one exists, the tables hold fewer
  * than SEARCH_STATISTICS_MIN_ROWS sampled rows, or this role
@@ -155,10 +206,10 @@ const MISSING_SEARCH_STATISTICS_SQL = `SELECT r.tablename || '.' || r.attname AS
 export async function missingSearchStatistics(engine: Pick<BrainEngine, 'executeRaw' | 'kind'>): Promise<string[]> {
   if (engine.kind !== 'postgres') return [];
   const pairs = Object.entries(SEARCH_STATISTICS_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column] as const));
-  const rows = await engine.executeRaw<{ col: string }>(MISSING_SEARCH_STATISTICS_SQL, [pairs.map(p => p[0]), pairs.map(p => p[1])]);
-  const missing = rows.map(row => row.col);
-  const [pages] = await engine.executeRaw<{ reltuples: number }>(`SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass`);
-  if (Number(pages?.reltuples ?? -1) >= SEARCH_STATISTICS_MIN_ROWS && await readProjectionStatistics(engine) === 'uncollected') missing.push(PROJECTION_STATISTICS_NAME);
+  const [state] = await engine.executeRaw<ProjectionStatisticsRow & { missing: string[] | null; pages_rows: number | null }>(
+    SEARCH_STATISTICS_STATE_SQL, [pairs.map(p => p[0]), pairs.map(p => p[1]), PROJECTION_STATISTICS_NAME]);
+  const missing = [...(state?.missing ?? [])];
+  if (Number(state?.pages_rows ?? -1) >= SEARCH_STATISTICS_MIN_ROWS && projectionStatisticsState(state) === 'uncollected') missing.push(PROJECTION_STATISTICS_NAME);
   return missing;
 }
 
@@ -183,10 +234,12 @@ async function statisticsStillCurrent(engine: BrainEngine, changedPages: number)
   if (!Number.isFinite(changedPages)) return false;
   // PGLite has no autovacuum, and its full ANALYZE is what covers the tables outside the planner-stats deltas: a brain
   // under 500 pages (where it is cheap), or a table holding rows it never sampled or grown more than 10% (+8 pages)
-  // past the size it last sampled, refreshes.
+  // past the size it last sampled, refreshes. planner_stats_deltas is the accounting of those deltas: every write pass
+  // grows it, so counting it ran a full ANALYZE (~0.8 s at 10k pages, holding PGLite's one thread) after every sync.
   const [state] = await engine.executeRaw<{ reltuples: number; columns: boolean }>(
     `SELECT c.reltuples::float8 AS reltuples,
             $1::text = 'postgres' OR NOT EXISTS (SELECT 1 FROM pg_class t WHERE t.relnamespace = c.relnamespace AND t.relkind = 'r' AND pg_relation_size(t.oid) > 0
+              AND t.relname <> 'planner_stats_deltas'
               AND (t.reltuples < 0 OR pg_relation_size(t.oid) / current_setting('block_size')::int > t.relpages * 1.1 + 8)) AS columns
        FROM pg_class c WHERE c.oid = 'pages'::regclass`, [engine.kind]);
   const rows = Number(state?.reltuples ?? -1);
@@ -247,6 +300,7 @@ export async function refreshProjectionStatistics(engine: BrainEngine, changedPa
       if (engine.kind === 'postgres') {
         await tx.executeRaw("SET LOCAL statement_timeout = '30s'");
         await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
+        await lockTableForAnalyze(tx, 'pages');
       }
       // PGLite has no autovacuum, so nothing else ever collects planner statistics there. Without them the
       // planner sees empty tables and runs search's graph joins as pages-by-pages nested loops (about 50 s
@@ -260,8 +314,10 @@ export async function refreshProjectionStatistics(engine: BrainEngine, changedPa
       await verifyProjectionStatistics(tx);
     });
     return true;
-  } catch {
-    console.warn('[search] Projection planner statistics could not be refreshed. Run ANALYZE pages(text_projection_revision, knowledge_revision) as the table owner; completed page writes were retained.');
+  } catch (error) {
+    console.warn(analyzeDeferred(error)
+      ? '[search] Projection planner statistics refresh deferred: another session (a vacuum, an ANALYZE or an index build) holds pages, and this refresh never waits on it (#7083). Completed page writes were retained; the next import or sync refreshes them.'
+      : '[search] Projection planner statistics could not be refreshed. Run ANALYZE pages(text_projection_revision, knowledge_revision) as the table owner; completed page writes were retained.');
     return false;
   }
 }

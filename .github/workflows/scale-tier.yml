@@ -47,6 +47,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Trunk Dynamic CI filter (docs/ci-event-parity.md#trunk-dynamic-ci): one output
+  # per gated job key; a gated job runs unless its output is exactly 'false', so it
+  # fails open. Learning mode records verdicts and skips nothing.
+  # Event parity (docs/ci-event-parity.md#trunk-dynamic-ci): pull_request only; the
+  # nightly and dispatch runs skip it and run every gated job as before.
+  # scripts/check-dynamic-ci.ts guards the wiring.
+  dynamic-ci:
+    if: github.event_name == 'pull_request'
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      scale: ${{ steps.dynamic-ci.outputs.scale }}
+    steps:
+      - id: dynamic-ci
+        uses: trunk-io/dynamic-ci@5bcddbf3615c2b032c21eed1b514c91164bda4a8  # v1 (v0.1.7)
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          token: ${{ secrets.TRUNK_API_TOKEN }}
+          job-keys: scale
+          enable-annotation: 'true'
+
   plan:
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 10
@@ -65,7 +90,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         if: github.event_name == 'schedule'
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.4
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,9 +147,10 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "pages=$pages" >> "$GITHUB_OUTPUT"
 
+  # Gated by dynamic-ci (docs/ci-event-parity.md#trunk-dynamic-ci): runs unless Trunk's verdict is 'false'.
   scale:
-    needs: plan
-    if: needs.plan.outputs.run == 'true'
+    needs: [plan, dynamic-ci]
+    if: ${{ !cancelled() && needs.dynamic-ci.outputs.scale != 'false' && needs.plan.result == 'success' && needs.plan.outputs.run == 'true' }}
     name: scale ${{ matrix.engine }} ${{ matrix.pages }}
     strategy:
       fail-fast: false
@@ -159,13 +185,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.4
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
       # The generated Markdown corpus only (O-CEO-9): never an imported database.
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:

@@ -7,6 +7,8 @@ export interface AIInvocation {
   maxInputTokens?: number;
   maxOutputTokens?: number;
   cacheWriteTtl?: '5m' | '1h';
+  /** The input tokens the request is estimated at, for meters when the provider reports no usage. */
+  estimatedInputTokens?: number;
 }
 export interface AIInvocationUsage {
   inputTokens: number;
@@ -87,7 +89,15 @@ export function observeAIInvocations(observer: AIInvocationObserver): () => void
   observers.add(observer);
   return () => { observers.delete(observer); };
 }
-export function hasAIInvocationObservers(): boolean { return observers.size > 0; }
+const meters = new AsyncLocalStorage<AIInvocationObserver>();
+/** True when a global observer or an enclosing meter (`withAIInvocationMeter`) would see a call. */
+export function hasAIInvocationObservers(): boolean { return observers.size > 0 || meters.getStore() !== undefined; }
+
+/** Observe only the model calls made inside `run` (one search request's cost); an enclosing meter still sees them. */
+export function withAIInvocationMeter<T>(meter: AIInvocationObserver, run: () => Promise<T>): Promise<T> {
+  const parent = meters.getStore();
+  return meters.run(parent ? event => { parent(event); meter(event); } : meter, run);
+}
 /** Observer throws are swallowed and counted here, never surfaced to the call. */
 export function aiInvocationObserverFailures(): number { return observerFailures; }
 
@@ -104,7 +114,8 @@ function notifyObservers(event: AIInvocationEvent): void {
  */
 export async function invokeAI<T>(call: AIInvocation, run: () => Promise<T>, usage: (result: T) => AIInvocationUsage | null | Promise<AIInvocationUsage | null>,
   rejected?: (error: unknown) => AIInvocationUsage | null): Promise<T> {
-  if (observers.size === 0) return admitAndRun(call, run, usage, rejected);
+  const meter = meters.getStore();
+  if (observers.size === 0 && !meter) return admitAndRun(call, run, usage, rejected);
   const startedAt = Date.now();
   let outcome: AIInvocationEvent['outcome'] = 'error';
   let measured: AIInvocationUsage | null = null;
@@ -117,7 +128,9 @@ export async function invokeAI<T>(call: AIInvocation, run: () => Promise<T>, usa
     if (isAIInvocationPolicyError(error)) outcome = 'refused';
     throw error;
   } finally {
-    notifyObservers({ call, outcome, usage: measured, startedAt, ms: Date.now() - startedAt, attribution: currentAIAttribution() });
+    const event: AIInvocationEvent = { call, outcome, usage: measured, startedAt, ms: Date.now() - startedAt, attribution: currentAIAttribution() };
+    notifyObservers(event);
+    if (meter) { try { meter(event); } catch { observerFailures += 1; } }
   }
 }
 

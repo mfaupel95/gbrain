@@ -1,6 +1,7 @@
 import type { SyncResult } from './sync.ts';
 import type { GitHoldItem } from '../core/persistence/sync-holds.ts';
 import { fenceWhere } from '../core/fence-repair/refusal.ts';
+import { sizeStateLines } from '../core/page-embedding-budget.ts';
 
 const HOLD_LINES = 20;
 
@@ -27,6 +28,9 @@ export function printHoldNotes(result: SyncResult, write: (line: string) => void
     if (result.would_hold_count > HOLD_LINES) write(`  ... and ${result.would_hold_count - HOLD_LINES} more would be held (--json lists them).`);
   }
   for (const skipped of (result.screen_skipped ?? []).slice(0, HOLD_LINES)) write(`  Screen skipped ${skipped.path}: ${skipped.code} (not a content problem; the real sync reports it).`);
+  // #7199: the source synced, and files held this run wait on a person; the hold fix's verify step names the source.
+  const source = result.holds_fix?.verify?.argv?.[3];
+  if (result.reason === 'held_needs_human' && source) write(`Synced; ${result.held_needs_human} file(s) held for a person (gbrain sync status --source ${source}).`);
   for (const item of (result.held ?? []).slice(0, HOLD_LINES)) write(holdLine(item, 'Held'));
   const shown = Math.min(result.held?.length ?? 0, HOLD_LINES);
   if ((result.held_count ?? 0) > shown) write(`  ... and ${(result.held_count ?? 0) - shown} more held this run (--json lists ${result.holds_truncated ? 'the first ones' : 'them all'}).`);
@@ -38,6 +42,7 @@ export function printHoldNotes(result: SyncResult, write: (line: string) => void
   // #6188: lossless fence rewrites (committed), and in a dry run the ones a real run would make.
   if (result.fences_normalized) write(`  Normalized fences in ${result.fences_normalized.count} file(s) (${classList(result.fences_normalized.by_class)}). ${result.fences_normalized.fix.why}`);
   if (result.fence_issues) write(`  ${result.fence_issues.why} ${result.fence_issues.sample.slice(0, 5).map(item => item.path).join(', ')}`);
+  for (const line of sizeStateLines(result.size_states)) write(line);
   for (const item of (result.would_normalize ?? []).slice(0, HOLD_LINES)) write(`  Would normalize ${item.path}: ${item.classes.join(', ')} (rewritten losslessly and committed; preparation may pick other new row numbers).`);
   if ((result.would_normalize_count ?? 0) > HOLD_LINES) write(`  ... and ${result.would_normalize_count! - HOLD_LINES} more would be normalized (--json lists them).`);
 }
@@ -69,12 +74,16 @@ export function printManagedSyncNotes(result: SyncResult, write: (line: string) 
   for (const refusal of result.fileRefusals ?? []) {
     write(`  Refused ${refusal.code}: ${refusal.message} ${refusal.suggestion} (${refusal.docs})`);
   }
+  if (result.storage_invalid_kept) write(`  ${result.storage_invalid_kept} page(s) whose file is gone were kept, not deleted: gbrain.yml's storage section is invalid or ambiguous about db_only (it does not load, declares db_only in a form that resolved no directory, or lists a deprecated supabase_only next to canonical keys), so sync cannot tell which are database-only. Run \`gbrain storage status\`, fix gbrain.yml, then sync again.`);
+  if (result.working_tree_kept) write(`  ${result.working_tree_kept} page(s) whose file is in the working tree but not in Git were kept (imported from the working tree, or import provenance unknown); delete the file, or commit it, to change that.`);
   const skips = result.legacySkips;
   if (skips?.contextualMode) write(`  ${skips.contextualMode} legacy file(s) skipped because they parse to the same page but have no contextual retrieval mode, which a skipped import cannot stamp; to stamp it: gbrain repair contextual-mode`);
   if (skips?.canonicalBytes) write(`  ${skips.canonicalBytes} legacy file(s) skipped because they parse to the same page but their bytes are not what gbrain reads back (for example, not valid UTF-8); re-save them as UTF-8 to publish them exactly.`);
+  // #6803 (D4): the count is this sync's imports the tail left underived, never the source's whole stale backlog.
   const links = result.links;
-  if (links && (links.created || links.removed || links.remaining)) {
+  const underived = result.tail?.underived ?? 0;
+  if (links && (links.created || links.removed || underived)) {
     write(`  Links: ${links.created} created, ${links.removed} removed across ${links.pages} page(s)` +
-      (links.remaining ? `; ${links.remaining} page(s) still owe extraction — run 'gbrain extract --stale'.` : '.'));
+      (underived ? `; ${underived} page(s) this sync imported still owe extraction — run 'gbrain extract --stale'.` : '.'));
   }
 }

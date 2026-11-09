@@ -42,7 +42,13 @@ import { redactFindings } from '../secret-scan.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { EntityCandidate } from './entity-salience.ts';
 import { reflexPointerRationale } from './reflex-rationale.ts';
+import { preferEntityTitleMatches } from './title-matches.ts';
 import { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } from './volunteer-events.ts';
+import { boundedProjectedPrefix } from '../page-window/document.ts';
+import { boundedBodyPrefixSql, boundedRawPrefix, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+
+/** Large pages: candidate rows carry a bounded body prefix (the synopsis reads only its first sentence). */
+const PREFIX_SQL = boundedBodyPrefixSql('p');
 
 export { reflexPointerRationale } from './reflex-rationale.ts';
 
@@ -70,7 +76,7 @@ async function weakTitleHits(engine: BrainEngine, sourceIds: string[], privacySq
   if (!norms.length) return [];
   try {
     const rows = await engine.executeRaw<PageRow>(
-      `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, p.compiled_truth
+      `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
          FROM pages p
         WHERE p.deleted_at IS NULL ${privacySql}
           AND p.source_id = ANY($1::text[])
@@ -407,7 +413,7 @@ export async function resolveEntitiesToPointers(
     // class ("Labs", "Systems" as pseudo-surnames).
     rows = useSurnameArm
       ? await engine.executeRaw<PageRow>(
-          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, p.compiled_truth
+          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
              FROM pages p
             WHERE p.deleted_at IS NULL ${privacySql}
               AND p.source_id = ANY($1::text[])
@@ -418,7 +424,7 @@ export async function resolveEntitiesToPointers(
           [sourceIds, titlesLc, exactSlugs, slugSuffixes, surnamePatterns],
         )
       : await engine.executeRaw<PageRow>(
-          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, p.compiled_truth
+          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
              FROM pages p
             WHERE p.deleted_at IS NULL ${privacySql}
               AND p.source_id = ANY($1::text[])
@@ -437,7 +443,7 @@ export async function resolveEntitiesToPointers(
   if (aliasOnly.length) {
     try {
       const extra = await engine.executeRaw<PageRow>(
-        `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, p.compiled_truth
+        `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
            FROM pages p
           WHERE p.deleted_at IS NULL ${privacySql} AND p.source_id = ANY($1::text[]) AND p.slug = ANY($2::text[])`,
         [sourceIds, aliasOnly.map((p) => p.slug)],
@@ -521,7 +527,7 @@ export async function resolveEntitiesToPointers(
     if (cjkNorms.length) {
       try {
         const cjkRows = await engine.executeRaw<PageRow>(
-          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, p.compiled_truth
+          `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
              FROM pages p
             WHERE p.deleted_at IS NULL ${privacySql}
               AND p.source_id = ANY($1::text[])
@@ -557,7 +563,7 @@ export async function resolveEntitiesToPointers(
   const trust = await gatePointerCandidates(engine, resolved, opts); // #5575 gate; then pointers by confidence, suppression + cap
   const suppression = opts.suppression ?? 'slug-and-title';
   const pointers: ReflexPointer[] = [];
-  for (const { slug, source_id, arm, matchedNorm } of resolved) {
+  for (const { slug, source_id, arm, matchedNorm } of await preferEntityTitleMatches(engine, resolved, m => rowByKey.get(keyOf(m.source_id, m.slug)), m => trust.has(pageKey(m)), slugToNorm)) {
     const row = rowByKey.get(keyOf(source_id, slug));
     if (!row || !trust.has(pageKey({ source_id, slug }))) continue;
     // Suppression: already present in PRIOR context. The current turn is
@@ -573,7 +579,7 @@ export async function resolveEntitiesToPointers(
       }
     }
     const display = displayForRow(row, displayByNorm);
-    const synopsis = safeSynopsis(row);
+    const synopsis = safeSynopsis((await overlaidBoundedRows(engine, [row]))[0]!);
     pointers.push({ display, slug, source_id, synopsis, arm, confidence: ARM_CONFIDENCE[arm], matchedNorm, ...trust.get(pageKey({ source_id, slug })) });
     if (pointers.length >= maxPointers) break;
   }
@@ -639,7 +645,11 @@ export function safeSynopsis(
   if (typeof fmSummary === 'string' && fmSummary.trim()) {
     return clip(collapse(redactFindings(fmSummary, { highEntropy: true }).text), maxLen);
   }
-  const body = row.compiled_truth ?? '';
+  // Large pages: only a bounded prefix is sanitized. World-only reads take
+  // the sanitized projection's prefix; a trusted widening keeps private rows
+  // through the strip below, which drops a fence the cut leaves open.
+  const body = keepVisibility.length === 1 && keepVisibility[0] === 'world'
+    ? boundedProjectedPrefix(row.compiled_truth) : boundedRawPrefix(row.compiled_truth);
   if (!body) return '';
   const stripped = redactFindings(stripFactsFence(stripTakesFence(body), { keepVisibility }), { highEntropy: true }).text;
   // Drop frontmatter block, markdown headings, and blank lines; first real prose line.

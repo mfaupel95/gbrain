@@ -7,7 +7,11 @@
  * and queries on a brain with active saved facts and declared other names,
  * including one that fans out to the other name, plus the same searches on a
  * brain with neither. Regenerate only on a build whose search output is meant
- * to change, and say why in the commit.
+ * to change, and say why in the commit. The query facts arm
+ * (`search.query_facts_arm`, default on) and the query facts block
+ * (`search.query_facts_block`, default on) change query output on purpose, so
+ * these brains pin both off; test/search-facts-arm.test.ts and
+ * test/search-8k-conversion.test.ts cover them.
  *
  * Also: a fact saved with `remember` is found by the next search in the same
  * process, and by a search after another process saved it (no per-process
@@ -24,9 +28,13 @@ import { serializeMarkdown } from '../src/core/markdown.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { aliasDeclarations } from '../src/core/ops/search.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 
 const GOLDEN = join(import.meta.dir, 'fixtures/goldens/search-c5/notices.json');
-const REMOTE = { remote: true, transport: 'http' as const, sourceId: 'default' };
+/** The remote write path the fresh-fact probes save through. */
+const WRITER = { remote: true, transport: 'http' as const, sourceId: 'default' };
+/** A full-surface HTTP client with a read grant: `fetch` is callable, so lean rows keep `id`. */
+const REMOTE = { ...WRITER, auth: { token: 't', clientId: 'c5-client', clientName: 'c5', scopes: ['read'], expiresAt: Date.now() / 1000 + 3600 } };
 
 const PAGES: Array<[string, string, string]> = [
   ['crm/numbat-labs', 'CRM record: Numbat Labs', 'Account record. Account code: NULA. Segment: mid-market. Billing contact: Old Person.'],
@@ -53,11 +61,15 @@ let open: (dataDir?: string) => Promise<PGLiteEngine>;
 
 async function brain(withFactsAndNames: boolean): Promise<PGLiteEngine> {
   const engine = await open();
-  for (const [slug, title, body] of PAGES) {
-    const text = withFactsAndNames ? body : body.replace(/\(?account code NULA\)?|Account code: NULA\.|, also known as OCFR/g, '');
-    await importFromContent(engine, slug, serializeMarkdown({}, text, '', { type: 'note', title, tags: [] }), { noEmbed: true, forceRechunk: true });
-  }
-  if (withFactsAndNames) await engine.executeRaw(FACTS);
+  await asOwner(engine, async tx => {
+    for (const [slug, title, body] of PAGES) {
+      const text = withFactsAndNames ? body : body.replace(/\(?account code NULA\)?|Account code: NULA\.|, also known as OCFR/g, '');
+      await importFromContent(tx, slug, serializeMarkdown({}, text, '', { type: 'note', title, tags: [] }), { noEmbed: true, forceRechunk: true });
+    }
+    if (withFactsAndNames) await tx.executeRaw(FACTS);
+  });
+  await engine.setConfig('search.query_facts_arm', 'false');
+  await engine.setConfig('search.query_facts_block', 'false');
   return engine;
 }
 
@@ -65,7 +77,10 @@ async function capture(engine: PGLiteEngine): Promise<Record<string, unknown>> {
   const out: Record<string, unknown> = {};
   for (const [name, args] of CALLS) {
     const res = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, name, args, REMOTE));
-    out[`${name} ${args.query}`] = { content: res.content.map(c => c.text), retrieval: res._meta?.retrieval };
+    // Per-call stage timings vary run to run (pinned in test/search/stage-timings-ops.test.ts); the rest is compared.
+    const { timings, ...retrieval } = (res._meta?.retrieval ?? {}) as Record<string, unknown>;
+    expect(timings).toBeDefined();
+    out[`${name} ${args.query}`] = { content: res.content.map(c => c.text), retrieval };
   }
   return out;
 }
@@ -125,7 +140,7 @@ describe('a fresh fact is never hidden', () => {
       const before = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, 'search', { query: 'Numbat Labs escalation owner' }, REMOTE));
       expect(before.content.map(c => c.text).join('\n')).not.toContain('Saved facts');
       const saved = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, 'remember',
-        { fact: 'The Numbat Labs escalation owner is Alice Example.', provenance: 'test', entity: 'numbat-labs' }, { ...REMOTE, writeWaitMs: 30_000 }));
+        { fact: 'The Numbat Labs escalation owner is Alice Example.', provenance: 'test', entity: 'numbat-labs' }, { ...WRITER, writeWaitMs: 30_000 }));
       expect(saved.isError, saved.content[0].text).not.toBe(true);
       const after = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(engine, 'search', { query: 'Numbat Labs escalation owner' }, REMOTE));
       expect(after.content.map(c => c.text).join('\n')).toContain('escalation owner is Alice Example');

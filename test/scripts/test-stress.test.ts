@@ -10,7 +10,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { failureSignature, parseArgs, readReport } from '../../scripts/stress/run.ts';
+import { failureSignature, parseArgs, readReport, skipReason } from '../../scripts/stress/run.ts';
+import { withEnv } from '../helpers/with-env.ts';
 
 const RUNNER = join(import.meta.dir, '..', '..', 'scripts', 'stress', 'run.ts');
 const dirs: string[] = [];
@@ -86,6 +87,63 @@ describe('test:stress runner', () => {
     const r = stress(root, 'test/door.serial.test.ts', '--iterations', '2');
     expect(r.code, r.out).toBe(0);
     expect(r.manifest.files[0]).toMatchObject({ status: 'not-stressed', reason: expect.stringContaining('owning job in .github/workflows/heavy-tests.yml') });
+  });
+
+  test('a file that skips without the PgBouncer fixture its owning pooled job requires is not stressed', () => {
+    const body = "import { test } from 'bun:test';\nconst pooled = process.env.GBRAIN_PGBOUNCER_URL;\ntest.skipIf(!pooled)('pooled', () => {});\n";
+    const root = tree({
+      'test/pooled.test.ts': body,
+      'test/orphan-pooled.test.ts': body,
+      '.github/workflows/persistence-validation.yml': 'jobs:\n  pooled:\n    steps:\n      - env:\n          GBRAIN_CI_REQUIRE_PGBOUNCER: \'1\'\n        run: bun test test/pooled.test.ts\n',
+    });
+    const owned = stress(root, 'test/orphan-pooled.test.ts', 'test/pooled.test.ts', '--iterations', '2');
+    const byFile = Object.fromEntries(owned.manifest.files.map((f: { file: string }) => [f.file, f]));
+    expect(byFile['test/pooled.test.ts']).toMatchObject({ status: 'not-stressed', reason: expect.stringContaining('owning pooled job in .github/workflows/persistence-validation.yml') });
+    expect(byFile['test/orphan-pooled.test.ts']).toMatchObject({ status: 'fail' });
+    expect(owned.code, owned.out).toBe(1);
+  });
+
+  test('a pooled file whose owning job picks it in a CI script under scripts/ is not stressed', () => {
+    const root = tree({
+      'test/script-pooled.test.ts': "import { test } from 'bun:test';\nconst pooled = process.env.GBRAIN_PGBOUNCER_URL;\ntest.skipIf(!pooled)('pooled', () => {});\n",
+      '.github/workflows/e2e.yml': 'jobs:\n  e2e:\n    steps:\n      - run: bash scripts/run-e2e.sh\n',
+      'scripts/run-e2e.sh': 'if [ "$f" = "test/script-pooled.test.ts" ] && [ "${GBRAIN_CI_REQUIRE_PGBOUNCER:-0}" = "1" ]; then exit 1; fi\n',
+    });
+    const r = stress(root, 'test/script-pooled.test.ts', '--iterations', '2');
+    expect(r.code, r.out).toBe(0);
+    expect(r.manifest.files[0]).toMatchObject({ status: 'not-stressed', reason: expect.stringContaining('owning pooled runner scripts/run-e2e.sh') });
+  });
+
+  test('the pooled owner must name the file in the step or statement that requires the pooler, not anywhere in the same file (#8702)', () => {
+    const body = "import { test } from 'bun:test';\nconst pooled = process.env.GBRAIN_PGBOUNCER_URL;\ntest.skipIf(!pooled)('pooled', () => {});\n";
+    const root = tree({
+      'test/other-step.test.ts': body,
+      'test/far-script.test.ts': body,
+      '.github/workflows/e2e.yml': "jobs:\n  matrix:\n    steps:\n      - name: pooled matrix\n        env:\n          GBRAIN_CI_REQUIRE_PGBOUNCER: '1'\n        run: bash scripts/run-e2e.sh\n  graduation:\n    steps:\n      - name: graduation\n        run: bun test test/other-step.test.ts\n",
+      'scripts/run-e2e.sh': 'if [ "${GBRAIN_CI_REQUIRE_PGBOUNCER:-0}" = "1" ]; then echo pooled; fi\n' + '#\n'.repeat(10) + 'for f in test/far-script.test.ts; do bun test "$f"; done\n',
+    });
+    const r = stress(root, 'test/other-step.test.ts', 'test/far-script.test.ts', '--iterations', '2');
+    const byFile = Object.fromEntries(r.manifest.files.map((f: { file: string }) => [f.file, f]));
+    expect(byFile['test/other-step.test.ts']).toMatchObject({ status: 'fail' });
+    expect(byFile['test/far-script.test.ts']).toMatchObject({ status: 'fail' });
+    expect(r.code, r.out).toBe(1);
+  });
+
+  test('test/e2e/graduation-cli-topologies.test.ts is not pooler-owned: the job that runs it does not require the pooler (#8702)', async () => {
+    const reason = await withEnv({ GBRAIN_PGBOUNCER_URL: undefined }, () => skipReason('test/e2e/graduation-cli-topologies.test.ts'));
+    expect(reason).toBeNull();
+  });
+
+  test('test/e2e/pgbouncer-teardown.test.ts is pooler-owned in this repository', async () => {
+    const reason = await withEnv({ GBRAIN_PGBOUNCER_URL: undefined }, () => skipReason('test/e2e/pgbouncer-teardown.test.ts'));
+    expect(reason).toContain('PgBouncer fixture');
+  });
+
+  test('a file that skips without an external Supavisor URL no CI job holds is not stressed', () => {
+    const root = tree({ 'test/supavisor.test.ts': "import { test } from 'bun:test';\nconst url = process.env.GBRAIN_SUPAVISOR_URL;\ntest.skipIf(!url)('through supavisor', () => {});\n" });
+    const r = stress(root, 'test/supavisor.test.ts', '--iterations', '2');
+    expect(r.code, r.out).toBe(0);
+    expect(r.manifest.files[0]).toMatchObject({ status: 'not-stressed', reason: expect.stringContaining('GBRAIN_SUPAVISOR_URL (a credentialed external service no CI job holds)') });
   });
 
   test('a test that ran in the first iteration and skips later is an unexpected skip', () => {

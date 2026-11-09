@@ -103,7 +103,14 @@ gbrain jobs list --status waiting --limit 50
 
 # What's wrong with a specific job?
 gbrain jobs get <id>
+
+# Which queues hold the work? One line per queue (`by_queue` in --json);
+# the per-run dream-inline-* queues share one `dream-inline (N queues)` line.
+gbrain jobs stats
 ```
+
+`gbrain jobs stats --queue dream-inline-<ms>-<id>` still scopes the wedge and
+ABANDONED PRIVATE QUEUE lines to one per-run queue.
 
 ## Rescue actions (in order of escalation)
 

@@ -1,7 +1,7 @@
 import type { BrainEngine } from './engine.ts';
 import { embed, getEmbeddingDimensions, getEmbeddingModel } from './ai/gateway.ts';
 import { withAIInvocationGuard } from './ai/invocation-guard.ts';
-import { BudgetTracker, loadPricingOverrides } from './budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from './budget/budget-tracker.ts';
 import { assertEmbeddingEnabled, readFactsEmbeddingDim } from './embedding-dim-check.ts';
 import type { GBrainConfig } from './config.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
@@ -16,11 +16,13 @@ import { validateEmbedFactsOptions, type EmbedFactsOptions } from './embed-facts
 import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
 import { estimateTokens } from './chunkers/token-estimate.ts';
-import { eligibleFactEmbedding, staleFactEmbedding } from './facts/embedding-identity.ts';
+import { eligibleFactEmbedding, staleFactEmbedding, readOversizedStaleFacts, oversizedFactLine, OVERSIZED_FACT_FIX } from './facts/embedding-identity.ts';
 
 export interface EmbedFactsOpts extends EmbedFactsOptions {
   signal?: AbortSignal;
   assertOwned?: (tx: BrainEngine) => Promise<void>;
+  /** Internal full migration: drain the finite census under the migration's lease and signal, with no wall-clock budget. */
+  migrationDrain?: { signal: AbortSignal; assertOwned: (tx: BrainEngine) => Promise<void> };
 }
 
 export interface EmbedFactsResult {
@@ -35,7 +37,11 @@ export interface EmbedFactsResult {
   failure_samples: string[];
   cost_usd: number;
   cost_estimated: boolean;
-  stopped: 'preview' | 'complete' | 'limit' | 'aborted' | 'failed';
+  stopped: 'preview' | 'complete' | 'limit' | 'time_budget' | 'aborted' | 'failed';
+  /** #7211: stale facts over the embedding input limit; skipped, never sent or truncated, and not counted in `remaining`. */
+  refused_oversized: number;
+  refused_samples: string[];
+  refused_fix?: string;
 }
 
 interface PendingFact {
@@ -46,12 +52,18 @@ interface PendingFact {
 
 const eligible = `f.source_id = $1 AND ${eligibleFactEmbedding} AND ${staleFactEmbedding}`;
 
+/** #7211: the stderr line a fact run prints when it skipped facts over the embedding input limit. */
+export function refusedFactsLine(result: Pick<EmbedFactsResult, 'refused_oversized' | 'refused_samples' | 'refused_fix'>): string | null {
+  if (!result.refused_oversized) return null;
+  return `[embed] ${result.refused_oversized} fact(s) are longer than the embedding input limit and were skipped, not truncated (first: ${result.refused_samples[0]}). ${result.refused_fix}`;
+}
+
 export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts, selectedConfig: GBrainConfig | null = null): Promise<EmbedFactsResult> {
-  const { signal: externalSignal, assertOwned, ...wireOptions } = opts;
-  opts = { ...validateEmbedFactsOptions(wireOptions), signal: externalSignal, assertOwned };
-  const maxFacts = opts.maxFacts ?? 100;
+  const { signal: externalSignal, assertOwned, migrationDrain, ...wireOptions } = opts;
+  opts = { ...validateEmbedFactsOptions(wireOptions), signal: migrationDrain?.signal ?? externalSignal,
+    assertOwned: migrationDrain?.assertOwned ?? assertOwned };
   const batchSize = opts.batchSize ?? 100;
-  const budgetMs = opts.budgetMs ?? 60_000;
+  const budgetMs = migrationDrain ? undefined : opts.budgetMs ?? 60_000;
   const dryRun = opts.dryRun === true || opts.yes !== true;
   const verified = currentVerifiedLocalWriter();
   if (verified && (verified.remote || verified.principal.kind !== 'local_cli' || verified.grant.slugPrefixes !== null
@@ -85,13 +97,27 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     return { count: Number(row.count), lastId: row.last_id };
   };
   const initial = await census();
+  const maxFacts = migrationDrain ? initial.count : opts.maxFacts ?? 100;
+  const maxTokens = resolveMaxChunkTokens();
+  const refused = async () => {
+    const rows = await readOversizedStaleFacts(engine, { sourceId: opts.sourceId, model, dims, maxTokens });
+    result.refused_oversized = rows.length;
+    result.refused_samples = rows.slice(0, 5).map(row => oversizedFactLine(row, maxTokens));
+    if (rows.length) result.refused_fix = OVERSIZED_FACT_FIX;
+    else delete result.refused_fix;
+    return rows.length;
+  };
   const result: EmbedFactsResult = {
-    source_id: opts.sourceId, dryRun, total_stale: initial.count,
-    would_embed: dryRun ? Math.min(initial.count, maxFacts) : 0,
+    source_id: opts.sourceId, dryRun, total_stale: initial.count, would_embed: 0,
     attempted: 0, embedded: 0, remaining: initial.count, failures: 0,
     failure_samples: [], cost_usd: 0, cost_estimated: false, stopped: dryRun ? 'preview' : 'complete',
+    refused_oversized: 0, refused_samples: [],
   };
-  if (dryRun) return result;
+  if (dryRun) {
+    result.remaining = initial.count - await refused();
+    result.would_embed = Math.min(result.remaining, maxFacts);
+    return result;
+  }
   const assertEnabled = async (target: BrainEngine) => {
     assertEmbeddingEnabled(selectedConfig);
     const disabled = await target.getConfig('embedding_disabled');
@@ -116,23 +142,26 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     label: 'embed.facts', maxCostUsd: opts.maxCostUsd, maxRuntimeMs: budgetMs,
     pricingOverrides: await loadPricingOverrides(engine),
   });
-  const signal = AbortSignal.any([AbortSignal.timeout(budgetMs), ...(opts.signal ? [opts.signal] : [])]);
-  const maxTokens = resolveMaxChunkTokens();
+  const budgetTimer = budgetMs === undefined ? null : AbortSignal.timeout(budgetMs);
+  const signal = AbortSignal.any([...(budgetTimer ? [budgetTimer] : []), ...(opts.signal ? [opts.signal] : [])]);
+  const budgetStop = (error?: unknown) => opts.signal?.aborted !== true
+    && (budgetTimer?.aborted === true || error instanceof BudgetExhausted && error.reason === 'runtime');
   let afterId = '0';
   while (result.attempted < maxFacts) {
+    if (budgetStop()) { result.stopped = 'time_budget'; break; }
     if (signal.aborted) { result.stopped = 'aborted'; result.failures++; break; }
     const batch = await engine.executeRaw<PendingFact>(
       `SELECT f.id::text, f.fact, f.xmin::text AS version FROM facts f
        WHERE ${eligible} AND f.id > $5::bigint AND f.id <= $6::bigint
        ORDER BY f.id LIMIT $7`, [...params, afterId, initial.lastId, Math.min(batchSize, maxFacts - result.attempted)]);
     if (!batch.length) break;
-    result.attempted += batch.length;
+    const lastId = batch[batch.length - 1].id;
+    const fitting = batch.filter(row => estimateTokens(row.fact) <= maxTokens);
+    if (!fitting.length) { afterId = lastId; continue; }
+    result.attempted += fitting.length;
     try {
-      if (batch.some(row => estimateTokens(row.fact) > maxTokens)) {
-        throw new Error('A fact exceeds the embedding input limit; no batch was sent');
-      }
       signal.throwIfAborted();
-      const inputCeiling = batch.reduce((sum, row) => sum + Math.max(1, Buffer.byteLength(row.fact, 'utf8')), 0);
+      const inputCeiling = fitting.reduce((sum, row) => sum + Math.max(1, Buffer.byteLength(row.fact, 'utf8')), 0);
       const vectors = await withAIInvocationGuard(async call => {
         signal.throwIfAborted();
         if (call.kind !== 'embedding') throw new Error('Fact backfill permits embedding calls only');
@@ -149,11 +178,11 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
           if (!usage) result.cost_estimated = true;
           tracker.record({ modelId: call.model, reservation, kind: 'embed', inputTokens: usage?.inputTokens ?? inputCeiling, outputTokens: 0 });
         } };
-      }, () => embed(batch.map(row => row.fact), {
+      }, () => embed(fitting.map(row => row.fact), {
         abortSignal: signal, embeddingModel: model, dimensions: dims, inputType: 'document',
       }), { inherit: true });
       signal.throwIfAborted();
-      if (vectors.length !== batch.length || vectors.some(vector =>
+      if (vectors.length !== fitting.length || vectors.some(vector =>
         vector.length !== dims || !vector.every(Number.isFinite))) {
         throw new Error('Embedding provider returned an incomplete or invalid fact batch');
       }
@@ -169,28 +198,29 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
           throw new Error('Embedding model changed during fact backfill; rerun the scoped preview');
         }
         let count = 0;
-        for (let i = 0; i < batch.length; i++) {
+        for (let i = 0; i < fitting.length; i++) {
           signal.throwIfAborted();
           const rows = await tx.executeRaw(
             `UPDATE facts f SET embedding=$7::${shape.columnType}, embedded_at=now(),
              embedding_model=$3,embedded_text_hash=md5(f.fact)
              WHERE ${eligible} AND f.id=$5::bigint AND f.xmin::text=$6 RETURNING f.id::text`,
-            [...params, batch[i].id, batch[i].version, `[${Array.from(vectors[i]).join(',')}]`]);
+            [...params, fitting[i].id, fitting[i].version, `[${Array.from(vectors[i]).join(',')}]`]);
           count += rows.length;
         }
         signal.throwIfAborted();
         return count;
       });
       result.embedded += installed;
-      if (installed !== batch.length) {
-        result.failures += batch.length - installed;
+      if (installed !== fitting.length) {
+        result.failures += fitting.length - installed;
         result.failure_samples.push('Fact state changed during embedding; changed rows were not overwritten. Rerun the scoped preview.');
         result.stopped = 'failed';
         break;
       }
-      afterId = batch[batch.length - 1].id;
+      afterId = lastId;
     } catch (error) {
-      result.failures += batch.length;
+      if (budgetStop(error)) { result.stopped = 'time_budget'; break; }
+      result.failures += fitting.length;
       result.failure_samples.push(redactUrlsInText(redactConnectionInfo(
         redactFindings(error instanceof Error ? error.message : String(error), { highEntropy: true }).text,
       )).replace(/\s+/g, ' ').slice(0, 500));
@@ -199,7 +229,7 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     }
   }
   result.cost_usd = tracker.totalSpent;
-  result.remaining = (await census()).count;
+  result.remaining = (await census()).count - await refused();
   if (result.stopped === 'complete' && result.remaining > 0) result.stopped = 'limit';
   return result;
 }

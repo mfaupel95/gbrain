@@ -81,7 +81,7 @@ export async function rerankViaDecide(input: RerankInput, deps: RerankViaDecideD
     await runBatches(plan.length, async (i) => {
       const batch = plan[i]!;
       const response = await invokeAI(
-        { operation: 'gateway.rerank', kind: 'rerank', model: deps.model, maxInputTokens: batch.estimatedInputTokens },
+        { operation: 'gateway.rerank', kind: 'rerank', model: deps.model, maxInputTokens: batch.estimatedInputTokens, estimatedInputTokens: batch.estimatedInputTokens },
         () => deps.transport(deps.url, { method: 'POST', headers: deps.headers, body: bodies[i]!, signal: ctrl.signal }),
         responseInvocationUsage,
       );
@@ -120,7 +120,7 @@ export async function rerankViaDecide(input: RerankInput, deps: RerankViaDecideD
     if (isAIInvocationPolicyError(error) || error instanceof RerankError) throw error;
     if (error instanceof DecideError) throw new RerankError(`TypeSafe rerank: ${error.message}`, error.reason === 'rate_limited' ? 'rate_limit' : 'unknown', error.status);
     if (ctrl.signal.aborted) throw new RerankError('TypeSafe rerank: request aborted', input.signal?.aborted ? 'unknown' : 'timeout');
-    throw new RerankError('TypeSafe rerank: transport failed', 'network');
+    throw new RerankError('TypeSafe rerank: transport failed', 'unreachable');
   } finally {
     clearTimeout(timer);
     input.signal?.removeEventListener('abort', callerAbort);

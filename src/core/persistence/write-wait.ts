@@ -11,6 +11,7 @@ import { OperationError } from '../ops/contract.ts';
 import { pinRouting, type FixRouting } from '../fix-routing.ts';
 import { admittedPendingReceipt, type WriteReceipt } from './types.ts';
 import { WIRE_WRITE_WAIT_MAX_MS } from './params.ts';
+import { shellQuote } from '../shell-quote.ts';
 
 /** Agent and server callers keep the historical bounded wait. */
 export const AGENT_WRITE_WAIT_MS = 5_000;
@@ -112,13 +113,24 @@ export function pendingReceiptOf(error: unknown): WriteReceipt | null {
 }
 
 /**
+ * GBRA-248: `--accept-pending` covers a write that will commit on its own, not
+ * one queued for an owner host that runs no consumer and has been quiet past
+ * the stale window (a moved or restored brain, a replaced container home).
+ */
+export function acceptPendingCovers(receipt: WriteReceipt | null | undefined): boolean {
+  return !receipt?.diagnostic?.owner;
+}
+
+/**
  * The one CLI exit verdict for a failed write (O-DX-1/O-ENG-1): an admitted
- * pending receipt exits PENDING_WRITE_EXIT_CODE (0 with the opt-in); every
- * other error, including a pre-admission `unavailable`, exits 1.
+ * pending receipt exits PENDING_WRITE_EXIT_CODE (0 with the opt-in, unless the
+ * receipt names a stale owner); every other error, including a pre-admission
+ * `unavailable`, exits 1.
  */
 export function writeErrorExitCode(error: unknown, acceptPending: boolean): number {
-  if (!pendingReceiptOf(error)) return 1;
-  return acceptPending ? 0 : PENDING_WRITE_EXIT_CODE;
+  const receipt = pendingReceiptOf(error);
+  if (!receipt) return 1;
+  return acceptPending && acceptPendingCovers(receipt) ? 0 : PENDING_WRITE_EXIT_CODE;
 }
 
 /**
@@ -126,11 +138,12 @@ export function writeErrorExitCode(error: unknown, acceptPending: boolean): numb
  * `gbrain write-request [--brain <id>] -- <request_id>` argv the error
  * envelope's `fix` carries. A `fix.argv` that reads this receipt wins, so the
  * two never disagree; otherwise the receipt command is pinned to `routing`.
+ * Each argument is shell-quoted, so the line pastes as the argv it names.
  */
 export function pollCommand(requestId: string, fix?: { argv?: readonly string[] }, routing?: FixRouting): string {
   const argv = fix?.argv?.[0] === 'gbrain' && fix.argv[1] === 'write-request' && fix.argv.includes(requestId)
     ? fix.argv : pinRouting(['gbrain', 'write-request', '--', requestId], routing);
-  return argv.join(' ');
+  return argv.map(shellQuote).join(' ');
 }
 
 /**

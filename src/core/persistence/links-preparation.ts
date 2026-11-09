@@ -1,14 +1,27 @@
 import type { BrainEngine } from '../engine.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 import type { ParsedPage } from '../import-file.ts';
-import { buildBasenameIndex, extractPageLinks, isGlobalBasenameEnabled, makeResolver, resolvedLinkCandidate } from '../link-extraction.ts';
+import { buildBasenameIndex, extractPageLinks, isGlobalBasenameEnabled, makeResolver, type ExtractPageLinksOptions,
+  type PageLinksResult } from '../link-extraction.ts';
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
 import { DerivedLinkEndpointChangedError } from '../derived-links.ts';
-import { capturedLinkEndpoints, indexLinkSources, loadLinkSourcePolicy, resolveCandidateSources } from '../link-reconciliation.ts';
+import { capturedLinkEndpoints, indexLinkSources, loadLinkSourcePolicy, makeLinkSourceResolver } from '../link-reconciliation.ts';
 import { collectWantedLinks, isWantedPagesEnabled, possibleWantedRows } from '../wanted-links.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { readLineGrammarSettings, type LineGrammarSettings } from '../line-grammar.ts';
 import { primeRelationSemantics } from '../link-semantics-pack.ts';
+import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
+import { extractSegmentedPageLinks, openSegmentedLinkSession, segmentedRoleText } from '../page-body/segment-links.ts';
+import { SegmentDerivationRaced } from '../page-body/segment-derive.ts';
+import { temporalBodyOf, type TemporalBody } from '../link-temporal-apply.ts';
+import { linksFenceProjectionRows, projectLinksFence } from '../links-fence-projection.ts';
+import { isQuarantined } from '../quarantine.ts';
+
+/** A body that moved under an incremental read: null, so the caller takes the full pass. */
+const raced = (error: unknown): null => {
+  if (error instanceof SegmentDerivationRaced) return null;
+  throw error;
+};
 
 async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: string[]): Promise<Map<string, string>> {
   if (!targets.length) return new Map();
@@ -19,7 +32,7 @@ async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: s
         AND EXISTS (SELECT 1 FROM pages c WHERE c.source_id=a.source_id AND c.slug=a.canonical_slug AND c.deleted_at IS NULL)`, [sourceId, [...new Set(targets)]]);
     return new Map(rows.map(row => [row.alias_slug, row.canonical_slug]));
   } catch (error) {
-    if (isUndefinedTableError(error)) return new Map();
+    if (isMissingSchemaObject(error, 'table', 'slug_aliases')) return new Map();
     throw error;
   }
 }
@@ -76,9 +89,12 @@ export const LINK_ENDPOINTS_SQL = `WITH own AS (
 /**
  * `primeSemantics`: install the pack relation semantics now, during preparation, so apply's
  * replacement does not read them again inside the publication transaction.
+ * A stored segmented page (its body unread) is extracted block by block (page-body/segment-links.ts), incrementally:
+ * only the runs whose inputs changed are read, the rest come from their page_segment_derivations rows; a body that moves
+ * during the read falls back to the full pass. Its temporal inputs are collected here; publication never reads a segmented body.
  */
 export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
-  page: Pick<ParsedPage, 'type' | 'compiled_truth' | 'timeline' | 'frontmatter'>, sourceId: string, primeSemantics = false) {
+  page: Pick<ParsedPage, 'type' | 'compiled_truth' | 'timeline' | 'frontmatter'> & { id?: number }, sourceId: string, primeSemantics = false) {
   if (primeSemantics) await primeRelationSemantics(engine);
   const resolver = makeResolver(engine, { mode: 'live', sourceId, basenameIndex: () => sourceBasenameIndex(engine, sourceId) });
   // One settings snapshot for the whole extraction; publication validates it (derived-links.ts). An unreadable
@@ -89,10 +105,22 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
     pack: (await loadActivePackForLocalEngine(engine, { sourceId }))?.manifest ?? null };
   if (!opts.pack || !settings) return { pageKeys: [{ sourceId, slug }], attendanceComplete: true, settings,
     apply: async () => ({ created: 0, removed: 0, errors: 1, unresolved_count: 1 }) };
-  const content = `${page.compiled_truth}\n${page.timeline}`;
+  const segmented = bodyUnread(page) ? { id: Number(page.id), slug, source_id: sourceId, type: page.type, frontmatter: page.frontmatter } : null;
+  // G5: re-derivation also restores the page's links fence edges (a body with no readable fence leaves them alone).
+  const fenceLinks = segmented || isQuarantined(page.frontmatter) ? null : await linksFenceProjectionRows(engine, sourceId, page);
+  let session = segmented ? await openSegmentedLinkSession(engine, segmented, resolver, opts).catch(raced) : null;
+  let roleText: string | undefined;
+  const extract = async (o: ExtractPageLinksOptions & { temporal?: boolean }): Promise<PageLinksResult & { temporalBody?: TemporalBody }> => {
+    if (!segmented) return extractPageLinks(slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter, page.type, resolver, o);
+    const targetType = o.targetType;
+    const incremental = session && await (targetType ? session.finish({ ...o, targetType }) : session.targets(o)).catch(raced);
+    if (incremental) return incremental;
+    session = null;
+    roleText ??= await segmentedRoleText(engine, segmented);
+    return extractSegmentedPageLinks(engine, segmented, resolver, { ...o, roleText });
+  };
   const referenced = new Set([slug]);
-  const initial = await extractPageLinks(slug, content, page.frontmatter, page.type, resolver,
-    { ...opts, onResolvedFrontmatterTarget: target => referenced.add(target) });
+  const initial = await extract({ ...opts, onResolvedFrontmatterTarget: target => referenced.add(target) });
   // A link written against a renamed page's old slug follows its slug alias, like get_page does.
   const aliases = await liveSlugAliases(engine, sourceId, initial.candidates.map(c => c.targetSlug));
   const retarget = <T extends { targetSlug: string; targetSourceId?: string }>(c: T): T =>
@@ -106,24 +134,25 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
   const metadata = new Map(endpointRows.map(row => [`${row.source_id}\0${row.slug}`, row]));
   endpoints.allSlugs.add(slug);
   endpoints.slugToSources.set(slug, [...new Set([sourceId, ...(endpoints.slugToSources.get(slug) ?? [])])]);
-  const resolve = (candidate: Parameters<typeof resolveCandidateSources>[0]) => resolveCandidateSources(candidate, slug,
-    sourceId, endpoints.allSlugs, endpoints.slugToSources, policy.allowCrossSource, policy);
-  const { candidates, unresolved, attendanceComplete } = await extractPageLinks(slug, content, page.frontmatter, page.type, resolver,
-    { ...opts, targetType: (targetSlug, targetSourceId) => {
-      const resolved = resolve({ targetSlug, targetSourceId, linkType: '', context: '' });
+  // #4680: the source policy decides the target's source (shared with the reconciliation sweep).
+  const sources = makeLinkSourceResolver(slug, sourceId, endpoints, policy);
+  const { candidates, unresolved, attendanceComplete, temporalBody } = await extract(
+    { ...opts, temporal: true, targetType: (targetSlug, targetSourceId) => {
+      const resolved = sources.resolve({ targetSlug, targetSourceId, linkType: '', context: '' });
       return resolved.ok ? (targetSlug === slug && resolved.toSourceId === sourceId ? page.type
         : metadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type) : undefined;
     } });
   // The rows the store keeps (#6228/#6225), so the receipt's wanted preview never names a target no page can have.
   const wanted = { producers: ['body', 'frontmatter'] as const, rows: await isWantedPagesEnabled(engine)
     ? await possibleWantedRows(engine, sourceId, collectWantedLinks({ candidates: candidates.map(retarget), frontmatterUnresolved: unresolved,
-      originSourceId: sourceId, crossSourceAllowed: policy.allowCrossSource || policy.crossSource, resolve }))
+      originSourceId: sourceId, crossSourceAllowed: sources.crossSourceAllowed, resolve: sources.resolve }))
     : [] };
+  let skippedCrossSource = 0;
   const rows = candidates.map(retarget).flatMap(candidate => {
-    const resolved = resolve(candidate);
-    if (!resolved.ok) return [];
-    if (!candidate.canonicalAttendance && (resolved.fromSourceId !== sourceId || resolved.toSourceId !== sourceId)) return [];
-    return [resolvedLinkCandidate(candidate, slug, sourceId, resolved)];
+    const admitted = sources.admit(candidate);
+    if (admitted.ok) return [admitted.row];
+    if (admitted.reason === 'cross_source') skippedCrossSource++;
+    return [];
   });
   return { attendanceComplete, settings, pageKeys: [{ sourceId, slug }, ...rows.flatMap(row => [
     { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
@@ -131,13 +160,18 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
     if (!attendanceComplete) return { created: 0, removed: 0, errors: 1, unresolved_count: Math.max(1, unresolved.length) };
     const snapshot = await tx.readPageSnapshot(slug, { sourceId });
     if (!snapshot) throw new Error('Automatic link origin disappeared');
+    // A page stored in segments is never read here: its temporal inputs come from preparation.
+    const stored = isSegmentedPage(snapshot.page) ? { temporalBody: temporalBody ?? temporalBodyOf(page) } : {};
     try {
       const result = await tx.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,
         sourceIncarnation: snapshot.sourceIncarnation, snapshot }, rows, { preserveExisting: true, semanticsPrimed: primeSemantics, lineGrammar: settings, wanted: { ...wanted, producers: [...wanted.producers] },
-        expectedEndpoints: capturedLinkEndpoints(rows, new Map([...metadata,
-          [`${sourceId}\0${slug}`, { slug, source_id: sourceId, type: page.type, knowledge_revision: snapshot.revision }]]))
-          .filter(endpoint => endpoint.slug !== slug || endpoint.sourceId !== sourceId) });
-      return { ...result, errors: 0, unresolved_count: unresolved.length, wanted_count: wanted.rows.length,
+        expectedEndpoints: capturedLinkEndpoints(rows, metadata, { slug, sourceId }), ...stored });
+      if (fenceLinks) {
+        const fence = await projectLinksFence(tx, snapshot.page, fenceLinks);
+        result.created += fence.created;
+        result.removed += fence.removed;
+      }
+      return { ...result, errors: 0, unresolved_count: unresolved.length, skipped_cross_source: skippedCrossSource, wanted_count: wanted.rows.length,
         ...(wanted.rows.length ? { wanted: wanted.rows.slice(0, 10).map(row => ({ slug: row.target_ref, source_id: row.target_source_id })),
           wanted_message: 'These link targets have no page yet; each edge is created when its page is. Create the page if it is real, or fix the link if it is a typo.',
           fix: readFix(`Lists every link target in source ${sourceId} that has no page yet, with the pages that link to it, read-only.`,

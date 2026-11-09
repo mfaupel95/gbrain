@@ -20,6 +20,11 @@ export const BUNDLED_PACK_NAMES = [
 
 export type BundledPackName = typeof BUNDLED_PACK_NAMES[number];
 
+/** A pack name that is safe to join under the packs directory (mutate.ts and the active-pack loader share it). */
+export function isValidPackName(name: string): boolean {
+  return name.length > 0 && name.length <= 128 && /^[a-z0-9][a-z0-9._-]*$/.test(name);
+}
+
 export function isBundledPackName(name: string): name is BundledPackName {
   return (BUNDLED_PACK_NAMES as readonly string[]).includes(name);
 }

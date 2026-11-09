@@ -8,16 +8,16 @@ export function chatInvocation(operation: string, model: string, maxOutputTokens
 }
 
 /** Each SDK attempt has its own durable hold; local calls keep SDK retries. */
-export function createGuardedGeneration(defaultMaxOutputTokens: () => number) {
+export function createGuardedGeneration(defaultMaxOutputTokens: () => number, operation = 'gateway.generate') {
   return async function guardedGeneration<T>(model: string, transport: (opts: any) => Promise<T>, opts: any): Promise<T> {
     if (!hasAIInvocationGuard()) {
       if (!hasAIInvocationObservers()) return transport(opts);
       // Observed but unguarded: the transport sees the caller's options unchanged (SDK retries, token defaults).
-      return invokeAI({ ...chatInvocation('gateway.generate', model, opts.maxOutputTokens ?? defaultMaxOutputTokens()) },
+      return invokeAI({ ...chatInvocation(operation, model, opts.maxOutputTokens ?? defaultMaxOutputTokens()) },
         () => transport(opts), sdkInvocationUsage);
     }
     const maxOutputTokens = opts.maxOutputTokens ?? defaultMaxOutputTokens();
-    return invokeAI({ ...chatInvocation('gateway.generate', model, maxOutputTokens),
+    return invokeAI({ ...chatInvocation(operation, model, maxOutputTokens),
       cacheWriteTtl: opts.providerOptions?.anthropic?.cacheControl?.ttl ?? '5m' },
       () => transport({ ...opts, maxOutputTokens, maxRetries: 0 }), sdkInvocationUsage);
   };

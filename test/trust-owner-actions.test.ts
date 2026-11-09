@@ -16,7 +16,9 @@
  * insufficient_scope, a stale approval applies, or the listing drifts.
  * Runs on PGLite, and on Postgres when DATABASE_URL is set.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import * as cliForceExit from '../src/core/cli-force-exit.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
@@ -271,22 +273,26 @@ describe('trust proposals through the owner (ENG-4, CEO-12)', () => {
     const { id } = await engine.transaction(tx => insertTrustProposal(tx, { action: 'supersede_fact', sourceId: b.sourceId,
       target: { table: 'facts', id: oldId }, related: { table: 'facts', id: newId }, before: { prior_tier: 'user_confirmed' }, after: { tier: 'agent_written' }, proposer: 'remember.replaces' }));
     const calls: unknown[] = [];
-    registerTrustProposalHandler('supersede_fact', {
+    // The handler registry is process-global: the real supersede_fact handler comes back after this test, or every
+    // later file in the same `bun test` process (shard order decides which) accepts supersessions without applying them.
+    const restoreHandler = registerTrustProposalHandler('supersede_fact', {
       async accept(e, proposal, ctx) {
         calls.push(ctx.confirmation);
         await transitionTrustProposal(e, proposal.id, 'pending', 'accepted');
         return decisionResult(proposal, 'accept', 'accepted');
       },
     });
-    nonTty();
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
-    expect(calls).toHaveLength(0);
-    tty('wrong');
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
-    tty(`tp${id}`);
-    expect(await ownerDo(b, { action: 'confirm', ref: `tp${id}` })).toMatchObject({ status: 'accepted' });
-    expect(calls).toEqual([{ via: 'tty' }]);
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('invalid_params');
+    try {
+      nonTty();
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
+      expect(calls).toHaveLength(0);
+      tty('wrong');
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
+      tty(`tp${id}`);
+      expect(await ownerDo(b, { action: 'confirm', ref: `tp${id}` })).toMatchObject({ status: 'accepted' });
+      expect(calls).toEqual([{ via: 'tty' }]);
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('invalid_params');
+    } finally { restoreHandler(); }
   }), 60_000);
 });
 
@@ -448,7 +454,7 @@ describe('review, explain and accept-all (CEO-2, DX-10, DX-15, DX-16)', () => {
       nonTty();
       await runTrustOwnerCommand(localTrustBackend(engine), 'review', ['--accept-all']);
       await runTrustOwnerCommand(localTrustBackend(engine), 'review', ['--accept-all', '--from', b.sourceId]);
-    } finally { process.stderr.write = original; process.exitCode = 0; }
+    } finally { process.stderr.write = original; process.exitCode = 0; _resetCliExitVerdictForTests(); }
     expect(errors.join('\n')).toContain('needs at least one filter');
     expect(errors.join('\n')).toContain('confirmation_required');
     expect((await pageRow(b, 'notes/bulk-example')).trust_tier).toBe('agent_written');
@@ -473,6 +479,70 @@ describe('review, explain and accept-all (CEO-2, DX-10, DX-15, DX-16)', () => {
     for (const slug of ['notes/bulk-a-example', 'notes/bulk-b-example']) expect((await pageRow(b, slug)).trust_tier).toBe('user_confirmed');
   }), 90_000);
 
+  // Value: protects=accept-all lists a release still pending in the door as pending with its poll command, never as
+  // "not applied"; a failure beside it exits 1; --accept-pending (GBRAIN_ACCEPT_PENDING) exits 0;
+  // fails_when=the pending/failed split or its exit precedence is dropped (red at e24695d43^: 'h7: not applied', exit 1);
+  // why_new=releases became journaled door writes that can outlive the door's wait; seam=a stub TrustBackend; no_claim=the --json envelope
+  test('accept-all reports a release still pending in the door as pending with its poll command; a failure beside it exits 1; --accept-pending exits 0', async () => {
+    const requestId = randomUUID();
+    const pending = Object.assign(new OperationError('write_pending', 'The write is accepted and is still pending.'),
+      { writeRequest: { request_id: requestId, state: 'queued', retry_after_ms: 1000 } });
+    const cases = [
+      { name: 'pending beside accepted', h8: 'released', env: {}, exit: 10 },
+      { name: 'pending beside failed', h8: 'fails', env: {}, exit: 1 },
+      { name: 'pending with --accept-pending', h8: 'released', env: { GBRAIN_ACCEPT_PENDING: '1' }, exit: 0 },
+    ] as const;
+    for (const c of cases) {
+      const backend = {
+        review: async () => ({ items: [{ kind: 'hold', ref: 'h7', source_id: 'default' }, { kind: 'hold', ref: 'h8', source_id: 'default' }] }),
+        explain: async () => [],
+        preview: async (input: OwnerActionInput) => ({ action: 'release', ref: input.ref, token: input.ref, command: `gbrain trust release ${input.ref}`, raises: true, binding: `b-${input.ref}`, summary: `Release held fact ${input.ref}` }),
+        apply: async (input: OwnerActionInput) => {
+          if (input.ref === 'h7') throw pending;
+          if (c.h8 === 'fails') throw new OperationError('page_not_found', 'The page is deleted; nothing was changed.');
+          return { action: 'release', ref: 'h8', status: 'released', tier: 'user_confirmed' };
+        },
+      } as unknown as Parameters<typeof runTrustOwnerCommand>[0];
+      const lines: string[] = [];
+      const exit = await withEnv({ GBRAIN_HOME: home, ...c.env }, async () => {
+        typesToken();
+        const original = console.log;
+        console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
+        try { await runTrustOwnerCommand(backend, 'review', ['--accept-all', '--from', 'default']); return currentExitCode(); }
+        finally { console.log = original; process.exitCode = 0; _resetCliExitVerdictForTests(); }
+      });
+      expect({ name: c.name, exit, notApplied: lines.some(l => l.startsWith('h7: not applied')) }).toEqual({ name: c.name, exit: c.exit, notApplied: false });
+      expect(lines.find(l => l.startsWith('h7:'))).toContain(requestId);
+      expect(lines.find(l => l.startsWith('h8:'))).toContain(c.h8 === 'fails' ? 'not applied' : 'released');
+    }
+
+    // Generated by gstack /ship Step 7 coverage audit (#7511 run 3).
+    // Value: protects=accept-all --json lists a release still pending in the door under `pending` (ref, request_id, poll), not under accepted or failed, and exits 10;
+    // fails_when=the JSON document drops `pending` (the pending item vanishes from the agent's view) or files it under failed; why_new=the cases above read the text lines only;
+    // seam=none (the same stub TrustBackend; a test spy captures writeStdoutFinal's document); no_claim=a real door write outliving its wait (the pending OperationError is hand-built)
+    const backend = {
+      review: async () => ({ items: [{ kind: 'hold', ref: 'h7', source_id: 'default' }, { kind: 'hold', ref: 'h8', source_id: 'default' }] }),
+      explain: async () => [],
+      preview: async (input: OwnerActionInput) => ({ action: 'release', ref: input.ref, token: input.ref, command: `gbrain trust release ${input.ref}`, raises: true, binding: `b-${input.ref}`, summary: `Release held fact ${input.ref}` }),
+      apply: async (input: OwnerActionInput) => {
+        if (input.ref === 'h7') throw pending;
+        return { action: 'release', ref: 'h8', status: 'released', tier: 'user_confirmed' };
+      },
+    } as unknown as Parameters<typeof runTrustOwnerCommand>[0];
+    const docs: string[] = [];
+    const exit = await withEnv({ GBRAIN_HOME: home }, async () => {
+      typesToken();
+      const final = spyOn(cliForceExit, 'writeStdoutFinal').mockImplementation(async (doc: string) => { docs.push(doc); });
+      try { await runTrustOwnerCommand(backend, 'review', ['--accept-all', '--from', 'default', '--json']); return currentExitCode(); }
+      finally { final.mockRestore(); process.exitCode = 0; _resetCliExitVerdictForTests(); }
+    });
+    expect(docs).toHaveLength(1);
+    const doc = JSON.parse(docs[0]!);
+    expect({ exit, accepted: doc.accepted.map((a: { ref: string }) => a.ref), pending: doc.pending.map((p: { ref: string; request_id: string }) => [p.ref, p.request_id]), failed: doc.failed })
+      .toEqual({ exit: 10, accepted: ['h8'], pending: [['h7', requestId]], failed: [] });
+    expect(doc.pending[0].poll).toContain(requestId);
+  }, 60_000);
+
   test('the review listing is pinned (DX-16) and explain names tier, origin, receipts and activation', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const engine = engines[0]!;
     const b = await brain(engine);
@@ -487,7 +557,7 @@ describe('review, explain and accept-all (CEO-2, DX-10, DX-15, DX-16)', () => {
     tty(`allow-${b.sourceId}`);
     await ownerDo(b, { action: 'allow', source: b.sourceId, uri_prefix: 'https://mail.acme-example.com/', reason: 'newsletters' });
     const review = await buildTrustReview(engine, { sourceId: b.sourceId });
-    expect(review.counts).toEqual({ proposal: 0, lowered_page: 1, preference: 0, hold: 1 });
+    expect(review.counts).toEqual({ proposal: 0, lowered_page: 1, preference: 0, hold: 1, contradiction: 0 });
     const tp = edit.trust_lowered.proposal_ref as string;
     // Pin the shape: stable placeholders for the per-run source, ids and dates.
     const text = renderTrustReview({ ...review, items: review.items.map(i => ({ ...i, day: i.kind === 'hold' ? i.day : '2026-10-03' })),
@@ -536,7 +606,7 @@ describe('aliases (DX-7)', () => {
     const error = console.error;
     process.stderr.write = ((chunk: string | Uint8Array) => { out.push(String(chunk)); return true; }) as typeof process.stderr.write;
     console.error = (...args: unknown[]) => { out.push(args.join(' ')); };
-    try { return { result: await fn(), stderr: out.join('\n') }; } finally { process.stderr.write = write; console.error = error; process.exitCode = 0; }
+    try { return { result: await fn(), stderr: out.join('\n') }; } finally { process.stderr.write = write; console.error = error; process.exitCode = 0; _resetCliExitVerdictForTests(); }
   };
 
   test('quarantine release|drop print the canonical trust form and run the same checks', async () => withEnv({ GBRAIN_HOME: home }, async () => {

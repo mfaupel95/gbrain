@@ -8,7 +8,9 @@
  * tables in `planner_stats_deltas`, transactionally and durably. A table is
  * stale when the rows modified since its last ANALYZE exceed
  * max(500, 10% of pg_class.reltuples), or when it has rows but no pg_stats
- * row. `maybeRefreshPlannerStats` ANALYZEs the stale tables and publishes a
+ * row. Maintenance passes (every reason but a search's first read) also
+ * analyze a table with an expression index that has no statistics.
+ * `maybeRefreshPlannerStats` ANALYZEs the stale tables and publishes a
  * per-table watermark: the highest delta id it read before the ANALYZE, so a
  * modification committed between that read and the publication stays pending.
  *
@@ -20,9 +22,12 @@
  * ANALYZE, then watermarks for every table). `planner.auto_analyze=false`
  * (env GBRAIN_PLANNER_AUTO_ANALYZE) disables all of them; doctor
  * `planner_stats_stale` and `gbrain repair planner-stats` keep working.
- * Postgres: every function here is a no-op (autovacuum owns statistics).
+ * Postgres: every refresh here is a no-op (autovacuum owns statistics);
+ * doctor and repair read autovacuum's counters and the expression-index probe,
+ * and an operator runs `gbrain repair planner-stats --apply`.
  */
 import type { BrainEngine } from './engine.ts';
+import { lockTableForAnalyze } from './analyze-lock.ts';
 import { PLANNER_STATS_TABLES, type PlannerStatsTable } from './planner-stats-schema.ts';
 
 export const PLANNER_STATS_MIN_PENDING = 500;
@@ -129,6 +134,36 @@ export async function readPlannerStatsState(engine: BrainEngine): Promise<Planne
   });
 }
 
+/** An index on an expression of a hot table whose expression has no pg_stats row (lhf wave 2 item 6). */
+export interface ExpressionIndexGap { index: string; table: PlannerStatsTable }
+
+/**
+ * Expression indexes on the hot tables with entries (pg_class.reltuples > 0)
+ * but no pg_stats row under the index's own name: built after the table's last
+ * whole-table ANALYZE (the v240 name-lookup indexes on an upgraded brain; a
+ * column-list ANALYZE skips index expressions), so the planner
+ * prices their lookups with default selectivity. ANALYZE of the whole table
+ * clears it; an all-null expression still gets a row (null_frac 1), and an
+ * empty table or a partial index matching no rows has reltuples 0, so neither
+ * stays flagged. Statistics this role cannot see (another owner's index) are
+ * unknown, not absent, and are left out. Both engines; maintenance, doctor and
+ * repair only, never a search's first read.
+ */
+export async function readExpressionIndexesWithoutStats(engine: BrainEngine): Promise<ExpressionIndexGap[]> {
+  const rows = await engine.executeRaw<{ index_name: string; table_name: PlannerStatsTable }>(
+    `SELECT ix.relname AS index_name, t.relname AS table_name
+       FROM pg_index i
+       JOIN pg_class t ON t.oid = i.indrelid
+       JOIN pg_class ix ON ix.oid = i.indexrelid
+      WHERE t.relnamespace = to_regnamespace(current_schema()) AND t.relname = ANY($1::text[])
+        AND i.indexprs IS NOT NULL AND i.indisvalid AND ix.reltuples > 0
+        AND has_table_privilege(ix.oid, 'SELECT')
+        AND NOT EXISTS (SELECT 1 FROM pg_stats s WHERE s.schemaname = current_schema() AND s.tablename = ix.relname)
+      ORDER BY array_position($1::text[], t.relname::text), ix.relname`,
+    [[...PLANNER_STATS_TABLES]]);
+  return rows.map(row => ({ index: row.index_name, table: row.table_name }));
+}
+
 /**
  * Postgres variant for doctor and repair: autovacuum's own counters. A table
  * is stale when `n_mod_since_analyze` exceeds the same threshold and neither
@@ -158,7 +193,11 @@ export async function readPlannerTableStates(engine: BrainEngine): Promise<Plann
   return engine.kind === 'pglite' ? readPlannerStatsState(engine) : readPostgresPlannerStats(engine);
 }
 
-/** `gbrain repair planner-stats --apply`: one bounded ANALYZE on the brain host (Postgres: 60 s statement, 2 s lock timeout). */
+/**
+ * `gbrain repair planner-stats --apply`: one bounded ANALYZE on the brain host (Postgres: 60 s statement; a table
+ * another session holds, such as a running autovacuum, throws `lockTableForAnalyze`'s 55P03 at once instead of
+ * waiting and cancelling the vacuum, #7083).
+ */
 export async function repairPlannerTable(engine: BrainEngine, table: PlannerStatsTable): Promise<void> {
   if (!PLANNER_STATS_TABLES.includes(table)) throw new Error(`Not a planner statistics table: ${table}`);
   if (engine.kind === 'pglite') {
@@ -168,8 +207,45 @@ export async function repairPlannerTable(engine: BrainEngine, table: PlannerStat
   await engine.transaction(async tx => {
     await tx.executeRaw("SET LOCAL statement_timeout = '60s'");
     await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
+    await lockTableForAnalyze(tx, table);
     await tx.executeRaw(`ANALYZE ${table}`);
   });
+}
+
+/** Below this many rows a hot table's vacuum finishes in seconds, so its dead rows are never reported as starved. */
+export const VACUUM_STARVATION_MIN_ROWS = 100_000;
+/** A hot table past autovacuum's vacuum threshold with no completed vacuum for this long is starved. */
+export const VACUUM_STARVATION_HOURS = 24;
+
+/** A hot Postgres table whose dead rows passed autovacuum's vacuum threshold while no vacuum completed for a day. */
+export interface VacuumStarvation { table: PlannerStatsTable; dead_rows: number; threshold: number; vacuumed_at: string | null; vacuum_running: boolean }
+
+/**
+ * #7083 (Postgres; [] on PGLite): hot tables of at least VACUUM_STARVATION_MIN_ROWS rows holding more dead rows than
+ * autovacuum's vacuum threshold (`autovacuum_vacuum_threshold` + `autovacuum_vacuum_scale_factor` x rows, the server
+ * settings) whose last completed VACUUM or autovacuum is over VACUUM_STARVATION_HOURS old or unrecorded. Postgres
+ * cancels an autovacuum whenever another session waits a second for a lock it holds (an ANALYZE, an index build, a
+ * LOCK), so a table one of them keeps meeting is never vacuumed, and its dead rows stay in every index.
+ * `vacuum_running`: an autovacuum worker holds a lock on the table now (pg_locks, which every role can read).
+ */
+export async function readVacuumStarvation(engine: BrainEngine): Promise<VacuumStarvation[]> {
+  if (engine.kind !== 'postgres') return [];
+  const rows = await engine.executeRaw<{ table_name: PlannerStatsTable; dead_rows: string | number; threshold: number;
+    vacuumed_at: string | Date | null; vacuum_running: boolean }>(
+    `SELECT s.relname AS table_name, s.n_dead_tup AS dead_rows, v.threshold,
+            GREATEST(s.last_vacuum, s.last_autovacuum) AS vacuumed_at,
+            EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                     WHERE l.relation = s.relid AND l.granted AND a.backend_type = 'autovacuum worker') AS vacuum_running
+       FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+       CROSS JOIN LATERAL (SELECT current_setting('autovacuum_vacuum_threshold')::float8
+         + current_setting('autovacuum_vacuum_scale_factor')::float8 * GREATEST(c.reltuples, 0) AS threshold) v
+      WHERE s.schemaname = current_schema() AND s.relname = ANY($1::text[])
+        AND c.reltuples >= $2 AND s.n_dead_tup > v.threshold
+        AND COALESCE(GREATEST(s.last_vacuum, s.last_autovacuum) < now() - make_interval(hours => $3::int), true)
+      ORDER BY array_position($1::text[], s.relname::text)`,
+    [[...PLANNER_STATS_TABLES], VACUUM_STARVATION_MIN_ROWS, VACUUM_STARVATION_HOURS]);
+  return rows.map(row => ({ table: row.table_name, dead_rows: Number(row.dead_rows), threshold: Math.round(Number(row.threshold)),
+    vacuumed_at: row.vacuumed_at == null ? null : new Date(row.vacuumed_at).toISOString(), vacuum_running: !!row.vacuum_running }));
 }
 
 async function readWatermarks(engine: BrainEngine, tables: readonly PlannerStatsTable[]): Promise<Map<PlannerStatsTable, number>> {
@@ -234,7 +310,9 @@ export async function beginFullAnalyze(engine: BrainEngine): Promise<() => Promi
 
 /**
  * Check the hot tables and ANALYZE the stale ones (PGLite, when
- * `planner.auto_analyze` is on). Checks are throttled to one per 2 s per
+ * `planner.auto_analyze` is on). Every reason but `first_read` also analyzes a
+ * table carrying an expression index without statistics
+ * (`readExpressionIndexesWithoutStats`), so a search never pays that probe. Checks are throttled to one per 2 s per
  * engine unless `throttle: false` (the page-count cadence of import and
  * managed sync). With `budgetMs`, a stale table whose last ANALYZE took longer
  * is returned in `deferred` instead of being analyzed now.
@@ -254,7 +332,8 @@ export async function maybeRefreshPlannerStats(engine: BrainEngine, reason: Plan
   const run = (async (): Promise<PlannerRefreshResult> => {
     const tables = await readPlannerStatsState(engine);
     if (!tables) return { ...result, skipped: 'unavailable' };
-    const stale = tables.filter(t => t.stale);
+    const gaps = reason === 'first_read' ? [] : await readExpressionIndexesWithoutStats(engine);
+    const stale = tables.filter(t => t.stale || gaps.some(g => g.table === t.table));
     const now = stale.filter(t => opts.budgetMs === undefined || (t.last_analyze_ms ?? 0) <= opts.budgetMs);
     result.deferred = stale.filter(t => !now.includes(t)).map(t => t.table);
     result.analyzed = await analyzePlannerTables(engine, now.map(t => t.table), reason, new Map(stale.map(t => [t.table, t.pending])));

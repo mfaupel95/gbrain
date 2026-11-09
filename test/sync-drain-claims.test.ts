@@ -212,6 +212,10 @@ describe('drainClaimOf', () => {
     // The ceiling caps the allowance.
     expect(drainClaimOf({ head_state: 'running', head_claim_phase: stamp(), head_token: 't', head_lapsed: false, head_kind: 'managed_sync_import' }, { ...budgets, ceilingMs: 60_000 }, now)!.allowance_ms).toBe(60_000 + STALL_GRACE_MS);
   });
+  test('#6650: an undispatched group follower\'s stamp (owner, no phase) is unstamped for the stall window and still names its owner', () => {
+    expect(drainClaimOf({ head_state: 'running', head_claim_phase: { token: 't', owner: { kind: 'sync', pid: 9, version: 'v', nonce: 'n9' } }, head_token: 't', head_lapsed: false, head_kind: 'managed_sync_import' }, budgets, now))
+      .toMatchObject({ phase: null, step: null, owner_pid: 9, owner_nonce: 'n9' });
+  });
 
   test('an older owner\'s stamp, a stamp of another claim, or no stamp read as null/unknown, never inferred; a lapsed lease is reported', () => {
     expect(drainClaimOf({ head_state: 'running', head_claim_phase: stamp({ token: 'other' }), head_token: 't', head_lapsed: false, head_kind: null }, budgets, now))
@@ -319,6 +323,49 @@ describe('live stall line during a pass (B6)', () => {
       err.lines.length = 0;
       await runDrain({ announce: true, progressMs: PROGRESS, probe: headProbe(async () => null), pass: async () => { await new Promise(r => setTimeout(r, 4 * PROGRESS)); return done(); } });
       expect(err.stalled()).toEqual([]);
+    } finally { err.restore(); }
+  });
+
+  // The convergence nightly's owner-kill stall: after a serve died, the drain's one entry queued behind the dead serve's
+  // 40-odd in-flight writes, which this process's consumer committed one group after another. The head moved every few
+  // seconds, but the line counted from the drain's own last commit and printed "stalled 140s on queued".
+  test('a queued head that keeps moving is not a stall: the age counts from when this head became the head', async () => {
+    const err = captureStderr();
+    try {
+      let now = 0, reads = 0;
+      const t0 = Date.now();
+      const head: StallProbe['head'] = async () => { reads++; now += 10_000; return { head_state: 'queued', claim: null, request_id: `r${Math.min(reads, 4)}` }; };
+      await runDrain({ announce: true, progressMs: PROGRESS, governMs: 60_000, clock: () => now + (Date.now() - t0) / 10, probe: headProbe(head), pass: async () => {
+        expect(await until(() => err.stalled().length >= 6, 20 * PROGRESS)).toBe(true);
+        return done();
+      } });
+      const ages = err.stalled().slice(0, 6).map(line => Number(/stalled (\d+)s on queued/.exec(line)?.[1]));
+      expect(ages).toEqual([10, 10, 10, 10, 20, 30]);
+    } finally { err.restore(); }
+  });
+
+  // The next night's owner-kill stall: between two queued heads the head was claimed (the consumer publishing the dead
+  // serve's writes) for two minutes. Claimed reads print the claim's own age and never moved the queued-head clock, so the
+  // next queued head counted from the last queued read and printed "stalled 150s on queued".
+  test('a claimed head between two queued heads is progress: the next queued head counts from the read before it', async () => {
+    const err = captureStderr();
+    try {
+      let now = 0, reads = 0;
+      const t0 = Date.now();
+      const publishing: DrainClaim = { phase: 'publishing', step: null, waiting_on: null, step_age_ms: 2_000, claim_age_ms: 2_000, lapsed: false,
+        owner_pid: null, owner_kind: null, owner_nonce: null, last_sql: null, allowance_ms: 150_000, ceiling_ms: 600_000 };
+      const head: StallProbe['head'] = async () => {
+        reads++; now += 10_000;
+        if (reads === 1) return { head_state: 'queued', claim: null, request_id: 'r1' };
+        if (reads <= 7) return { head_state: 'claimed', claim: publishing, request_id: `c${reads}` };
+        return { head_state: 'queued', claim: null, request_id: 'r2' };
+      };
+      await runDrain({ announce: true, progressMs: PROGRESS, governMs: 60_000, clock: () => now + (Date.now() - t0) / 10, probe: headProbe(head), pass: async () => {
+        expect(await until(() => err.stalled().length >= 9, 30 * PROGRESS)).toBe(true);
+        return done();
+      } });
+      const ages = err.stalled().slice(0, 9).map(line => Number(/stalled (\d+)s on (?:queued|publishing)/.exec(line)?.[1]));
+      expect(ages).toEqual([10, 2, 2, 2, 2, 2, 2, 10, 20]);
     } finally { err.restore(); }
   });
 

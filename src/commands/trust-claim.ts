@@ -10,6 +10,8 @@
  *   --source <id>          ask only about this source (repeatable)
  *   --resume               finish the lift of sources already claimed (asks nothing)
  *   --batch-size N         lift batch size
+ *   --relower [--dry-run]  lower-only repair (#6533): rows a claim lifted whose own signals now say lower
+ *                          (legacy extract_atoms atoms) go back down; --dry-run previews, asks nothing
  */
 import type { BrainEngine } from '../core/engine.ts';
 import { jsonRequested, writeStdoutFinal } from '../core/cli-force-exit.ts';
@@ -20,17 +22,20 @@ import {
 } from '../core/trust/claim.ts';
 import { promptTypedConfirmation } from '../core/trust/confirm.ts';
 import { TRUST_TIERS, trustLabel } from '../core/trust/tier.ts';
-import type { TierCounts } from '../core/trust/backfill.ts';
+import { relowerClaimedRows, TRUST_RELOWER_COMMAND, type TierCounts } from '../core/trust/backfill.ts';
 import { reportTrustCliError } from './trust.ts';
 
 export const TRUST_CLAIM_USAGE = [
   'Usage: gbrain trust claim-sources [--dry-run] [--source <id>]... [--resume] [--batch-size N] [--json]',
+  '       gbrain trust claim-sources --relower [--dry-run] [--source <id>]... [--json]',
   '  Claim your own sources once, after upgrading: each source shows its local path or remote, page count and',
   '  the trust mix now and after claiming, and you type its id to claim it. A claimed source syncs as "your notes"',
   '  and its rows from before trust tiers move from "unverified origin" to "your notes", except rows that say',
   '  they were captured, clipped, imported, extracted or written by an agent (they keep their lower tier).',
   '  Nothing becomes "confirmed by you". Connector sources (Google, GitHub) cannot be claimed. --dry-run lists',
   '  without writing; --resume finishes an interrupted claim. Needs you at a terminal; --yes never claims.',
+  '  --relower only lowers: rows a claim lifted whose own signals now say they were written by an agent (atoms',
+  '  extracted before gbrain recorded that) go back to that tier. --relower --dry-run lists them first.',
 ].join('\n');
 
 const mix = (counts: TierCounts | undefined) =>
@@ -72,6 +77,22 @@ export async function runTrustClaimSources(engine: BrainEngine, args: string[], 
       throw opError('invalid_params', '--batch-size must be an integer from 1 to 100000.', 'Run gbrain trust claim-sources --batch-size 500, or omit --batch-size.');
     }
     const sized = batchSize ? { batchSize } : {};
+    if (args.includes('--relower')) {
+      const named = flagValues(args, '--source');
+      const dryRun = args.includes('--dry-run');
+      if (!dryRun) await opts.completeStartup?.(engine);
+      const report = await relowerClaimedRows(engine, { dryRun, ...(named.length ? { sources: named } : {}) });
+      if (json) { await writeStdoutFinal(`${JSON.stringify(report, null, 2)}\n`); return; }
+      if (report.rows === 0) { console.log('No claimed row needs lowering.'); return; }
+      console.log([
+        dryRun ? `Would lower ${report.rows} row(s) a claim lifted above what they say they are (dry run, nothing written):`
+          : `Lowered ${report.rows} row(s) a claim lifted above what they say they are:`,
+        ...report.tables.filter(t => t.rows > 0).map(t => `  ${t.table}: ${mix(t.to)}`),
+        ...report.sample.map(r => `  ${r.source_id}/${r.slug}: ${trustLabel(r.from)} -> ${trustLabel(r.to)}`),
+        ...(dryRun ? [`Apply with: ${TRUST_RELOWER_COMMAND.join(' ')}${named.map(id => ` --source ${id}`).join('')}`] : []),
+      ].join('\n'));
+      return;
+    }
     if (args.includes('--dry-run')) {
       const listing = await listClaimSources(engine, sized);
       if (json) await writeStdoutFinal(`${JSON.stringify({ mode: 'dry_run', ...listing }, null, 2)}\n`);

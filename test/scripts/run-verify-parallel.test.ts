@@ -72,8 +72,6 @@ describe("guard registration ⇒ execution coverage", () => {
   const EXECUTION_EXEMPT: Record<string, string> = {
     "check-bun-test-timeout.sh":
       "runs directly as a test.yml verify-job step (not via CHECKS — avoids a package.json edit)",
-    "check-admin-embedded.sh":
-      "duplicates check:admin-build's vite+tsc build; embed freshness covered there",
     "check-bash32.sh":
       "needs Docker or a native bash 3.2: runs as a test.yml verify-job step (bash:3.2 image) and in macos-validation.yml (/bin/bash), never in verify",
     "check-test-discriminates.sh":
@@ -397,7 +395,8 @@ exit 0
     expect(readFileSync(SCRIPT, "utf8")).not.toContain("TYPECHECK_COVERED_BY");
     expect(readFileSync(SCRIPT, "utf8")).toContain('TIMEOUT="${GBRAIN_VERIFY_TIMEOUT:-120}"');
     const testYml = read("test.yml");
-    const verifyJob = testYml.slice(testYml.indexOf("\n  verify:\n"), testYml.indexOf("\n  verify:\n") + 4000);
+    const verifyStart = testYml.indexOf("\n  verify:\n");
+    const verifyJob = testYml.slice(verifyStart, testYml.indexOf("\n  serial-tests:\n", verifyStart));
     expect(verifyJob).toContain("- run: bun run verify");
     expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
     const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");

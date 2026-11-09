@@ -184,6 +184,8 @@ describe('phaseBFenceFacts — happy path backfill', () => {
       '---\ntype: person\ntitle: Alice\nslug: people/alice\n---\n\n# Alice\n\nNotes about Alice.\n',
       'utf-8',
     );
+    // #6982: the page's database body is the file's, as an import leaves it; a differing body is held, not overwritten.
+    await engine.putPage('people/alice', { type: 'person', title: 'Alice', compiled_truth: '# Alice\n\nNotes about Alice.', frontmatter: {} });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
 
     await __testing.phaseBFenceFacts(engine, OPTS);
@@ -533,6 +535,38 @@ describe('phaseCVerify', () => {
     const r = await __testing.phaseCVerify(engine, OPTS);
     expect(r.status).toBe('complete');
     expect(r.detail).toContain('pages_checked=1');
+  });
+
+  // #6685: rows that stay fenced in the index after their page was deleted.
+  // Every row expired: nothing is left to compare, so the page is skipped (like
+  // the backfill's skipped_no_page), not drift. A live row is still drift.
+  async function seedFencedRowOfDeletedPage(slug: string, rowNum: number, expired: boolean): Promise<void> {
+    await engine.executeRaw(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence, row_num, source_markdown_slug, expired_at)
+       VALUES ('default', $1, $2, 'fact', 'private', 'medium', now(), 'manual', 1.0, $3, $1,
+               CASE WHEN $4::boolean THEN now() ELSE NULL END)`,
+      [slug, `Claim ${rowNum}`, rowNum, expired],
+    );
+  }
+
+  test('skips a deleted page whose fenced rows are all expired (#6685)', async () => {
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 1, true);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 2, true);
+
+    expect(await __testing.phaseCVerify(engine, OPTS))
+      .toMatchObject({ status: 'complete', detail: 'pages_checked=1 skipped_expired_no_page=1' });
+  });
+
+  test('still reports a deleted page that keeps a live fenced row (#6685)', async () => {
+    await seedFencedRowOfDeletedPage('projects/gone-example', 1, true);
+    await seedFencedRowOfDeletedPage('projects/gone-example', 2, false);
+
+    const r = await __testing.phaseCVerify(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toBe('1 pages drifted: projects/gone-example (file missing)');
   });
 
   // #5814: extract_facts indexes a duplicate ACTIVE fence row (same claim and

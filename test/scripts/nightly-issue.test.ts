@@ -14,7 +14,8 @@ import { load as loadYaml } from 'js-yaml';
 import { loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
 import { buildManifest, checkManifest, failureSignature, junitMessages, MANIFEST_ARTIFACT, MANIFEST_SCHEMA, type CiManifest } from '../../scripts/ci-manifest.ts';
 import { failureSignature as gateSignature, parseExemptionBlocks } from '../fixtures/nightly-watch/stress-exemption-contract.ts';
-import { inert, jsonBlock, labelNames, readJsonBlock, readZipEntry, type GitHubClient, type Issue } from '../../scripts/lib/gh-issue.ts';
+import { GET_RETRY_DELAYS_MS, inert, jsonBlock, labelNames, readJsonBlock, readZipEntry, restClient, type GitHubClient, type Issue } from '../../scripts/lib/gh-issue.ts';
+import { pagedJobs } from '../../scripts/lib/ci-run.ts';
 import { FLAKE_MARKER, MR_MARKER, PUSH_ALLOWLIST, type FlakeRecord, type MasterRedState } from '../../scripts/lib/master-red.ts';
 import {
   JSON_MARKER, parseKnownRed, resolveTarget, routeRun, validateKnownRed, watch, watchRun, type IncidentRecord, type JobInfo, type KnownRow, type RunInfo,
@@ -282,6 +283,10 @@ class World {
   jobs = new Map<string, { jobs: JobInfo[]; total_count: number }>();
   annotations = new Map<number, unknown[]>();
   manifests = new Map<string, unknown>();
+  /** Raw reuse.json text of a push run's `reused-full-suite` artifact, by run id. */
+  reuse = new Map<number, string>();
+  attempts = new Map<string, RunInfo>();
+  trees = new Map<string, string>();
   issues: WorldIssue[] = [];
   timeline = new Map<number, unknown[]>();
   compares = new Map<string, unknown>();
@@ -293,6 +298,7 @@ class World {
 
   addRun(run: RunInfo, jobsFile?: string, manifest: unknown | null = completeManifest(run)) {
     this.runs.set(run.id, run);
+    this.attempts.set(`${run.id}/${run.run_attempt}`, run);
     const jobs = jobsFile ? mr<{ jobs: JobInfo[]; total_count: number }>(jobsFile) : { total_count: 1, jobs: [{ id: run.id + 1, name: 'test (1)', conclusion: run.conclusion === 'success' ? 'success' : 'failure', steps: [] }] };
     this.jobs.set(`${run.id}/${run.run_attempt}`, jobs);
     for (const j of jobs.jobs) {
@@ -337,6 +343,12 @@ class World {
           return world.issues.filter(i => labelNames(i).includes(label) && (m![2] === 'all' || i.state === m![2])).sort((x, y) => y.number - x.number).map(i => ({ ...i })) as R;
         }
         if ((m = /^repos\/\{repo\}\/actions\/runs\/(\d+)$/.exec(path))) { const r = world.runs.get(Number(m[1])); if (!r) throw Object.assign(new Error('404'), { status: 404 }); return r as R; }
+        if ((m = /^repos\/\{repo\}\/actions\/runs\/(\d+)\/attempts\/(\d+)$/.exec(path))) { const r = world.attempts.get(`${m[1]}/${m[2]}`); if (!r) throw Object.assign(new Error('404'), { status: 404 }); return r as R; }
+        if ((m = /^repos\/\{repo\}\/git\/commits\/(\w+)$/.exec(path))) return { tree: { sha: world.trees.get(m[1]!) ?? `tree-of-${m[1]}` } } as R;
+        if ((m = /^repos\/\{repo\}\/actions\/runs\/(\d+)\/artifacts\?name=reused-full-suite/.exec(path))) {
+          const id = Number(m[1]);
+          return { artifacts: world.reuse.has(id) ? [{ id: id * 10, name: 'reused-full-suite', expired: false }] : [] } as R;
+        }
         if ((m = /^repos\/\{repo\}\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs/.exec(path))) return (world.jobs.get(`${m[1]}/${m[2]}`) ?? { jobs: [], total_count: 0 }) as R;
         if ((m = /^repos\/\{repo\}\/check-runs\/(\d+)\/annotations/.exec(path))) return (world.annotations.get(Number(m[1])) ?? []) as R;
         if ((m = /^repos\/\{repo\}\/actions\/runs\/(\d+)\/artifacts\?name=ci-manifest/.exec(path))) {
@@ -359,6 +371,7 @@ class World {
       async download(path: string): Promise<Uint8Array> {
         world.calls.push({ method: 'DOWNLOAD', path });
         const id = Number(/artifacts\/(\d+)\/zip/.exec(path)![1]);
+        if (id % 10 === 0) return zipOf('reuse.json', world.reuse.get(id / 10)!);
         const run = world.runs.get(Math.floor(id / 10))!;
         return zipOf('ci-manifest.json', JSON.stringify(world.manifests.get(`${run.id}/${id % 10}`)));
       },
@@ -488,6 +501,137 @@ describe('master-red: push-to-master runs', () => {
     expect(masterIssue(w)!.state).toBe('closed');
   });
 
+  // Recorded API JSON from Test push runs on 2026-10-18/19 (#7020, #7056): run 10213 green (ac1ba4c9) ->
+  // run 10222 (39170624583, 4fb9c4c7) attempt 1 red in "Unit-lane PostgreSQL arms 2/19 / Bun 1.4.0" ->
+  // attempt 2 green after "re-run failed jobs", whose rebuilt ci-manifest flags every carried-over receipt
+  // as attempt 1 (incomplete, trimmed to 3 of 1242 problems) -> run 10289 (39252817766, 99be3927) green
+  // with the full suite reused (persistence-validation skipped, no ci-manifest). The attempt-1 manifest was
+  // replaced by attempt 2's, so it is rebuilt from the #7020 body.
+  const rerunRuns = mr<{ workflow_runs: RunInfo[] }>('runs-test-rerun.json').workflow_runs;
+  const run = (n: number, attempt = 1) => rerunRuns.find(r => r.run_number === n && r.run_attempt === attempt)!;
+  const RR = { g10213: run(10213), r10222: run(10222), g10222: run(10222, 2), g10289: run(10289) };
+  const PG_JOB = 'persistence-validation / Unit-lane PostgreSQL arms 2/19 / Bun 1.4.0';
+  const SEGMENTED = 'test/large-pages/segmented-prior-view.test.ts';
+  const redManifest = (r: RunInfo) => completeManifest(r, {
+    files: [{ file: SEGMENTED, lane: 'pg-arms-bun-1.4.0', arm: 'postgres', executed: 4, failed: 1, skipped: 0 }],
+    failures: [{ lane: 'pg-arms-bun-1.4.0', file: SEGMENTED, arm: 'postgres', test: 'prior view of a segmented page (postgres) > while the prior view is alive the heap holds no copy of the prior timeline', signature: 'expect(received).toBeLessThan(expected) Expected: < N Received: N' }],
+  });
+  const rerunIncident = async () => {
+    const w = new World();
+    w.addRun(RR.g10213).addRun(RR.r10222, `jobs-${RR.r10222.id}.json`, redManifest(RR.r10222));
+    expect((await go(w, RR.r10222)).masterRed!.action).toBe('create');
+    w.addRun(RR.g10222, `jobs-${RR.g10222.id}-attempt-2.json`, mr('ci-manifest-39170624583-attempt-2.json'));
+    const rerun = await go(w, RR.g10222);
+    expect(rerun.masterRed!.reason).toBe('green but failing jobs not re-run');
+    const incident = masterIssue(w)!;
+    expect(mrState(incident)).toMatchObject({ status: 'red', blocked: [PG_JOB], evidence: { run_id: RR.g10222.id, complete: false } });
+    incident.state = 'closed';
+    incident.comments.push('Master is green; the original red is fixed by a repair PR.');
+    w.addRun(RR.g10289, `jobs-${RR.g10289.id}.json`, null);
+    return { w, incident };
+  };
+
+  test('an incident closed by hand never comes back on a green run: run 39170624583 red on attempt 1, green on attempt 2 (#7020 closed, false #7056)', async () => {
+    const { w, incident } = await rerunIncident();
+    const r = await go(w, RR.g10289);
+    expect(r.masterRed!.evaluated).toEqual([RR.g10289.id]);
+    expect(r.masterRed!.action).not.toBe('create');
+    expect(w.labeled('master-red').map(i => i.number)).toEqual([incident.number]);
+    expect(incident.state).toBe('closed');
+    const state = mrState(incident);
+    expect(state).toMatchObject({ status: 'green', open_jobs: [], open_files: [], blocked: [], evaluated: { run_id: RR.g10289.id, run_attempt: 1 } });
+    expect(incident.body).not.toContain('State rebuilt');
+    expect(incident.body).toContain(`None: #${incident.number} was closed by hand while red`);
+    expect(incident.body).not.toContain('every previously failing job ran and passed');
+    const again = await go(w, RR.g10289);
+    expect(again.masterRed!.action).toBe('none');
+    expect(w.labeled('master-red')).toHaveLength(1);
+  });
+
+  test('after a hand close, a run whose latest attempt is red still opens a new incident from the last green run', async () => {
+    const { w, incident } = await rerunIncident();
+    const red: RunInfo = { ...RR.r10222, id: 39260000001, run_number: 10290, run_attempt: 2, head_sha: 'b'.repeat(40) };
+    w.addRun(red, `jobs-${RR.r10222.id}.json`, redManifest(red));
+    const r = await go(w, red);
+    expect(r.masterRed!.evaluated).toEqual([RR.g10289.id, red.id]);
+    expect(r.masterRed!.action).toBe('create');
+    const opened = masterIssue(w)!;
+    expect(opened.number).not.toBe(incident.number);
+    expect(opened.state).toBe('open');
+    expect(incident.state).toBe('closed');
+    const state = mrState(opened);
+    expect(state).toMatchObject({ status: 'red', first_red: { run_id: red.id, run_attempt: 2 }, latest_red: { run_id: red.id }, suspect: { from_sha: RR.g10289.head_sha, to_sha: red.head_sha } });
+    expect(state.open_jobs.map(j => j.job)).toEqual([PG_JOB]);
+    expect(state.tests.map(t => t.file)).toEqual([SEGMENTED]);
+    expect(opened.body).not.toContain('State rebuilt');
+  });
+
+  test('the rebuild judges each run by its latest attempt: a red attempt 1 cleared by a green re-run opens nothing, with or without a prior issue', async () => {
+    const fresh = () => new World()
+      .addRun(RR.g10213)
+      .addRun(RR.g10222, `jobs-${RR.g10222.id}-attempt-2.json`, mr('ci-manifest-39170624583-attempt-2.json'))
+      .addRun(RR.g10289, `jobs-${RR.g10289.id}.json`, null);
+    const none = fresh();
+    expect((await go(none, RR.g10289)).masterRed!.action).toBe('none');
+    expect(none.issues).toHaveLength(0);
+
+    const blind = fresh();
+    blind.issues.push({ number: 90, title: 'Master red: Test', state: 'closed', labels: [{ name: 'master-red' }], body: 'closed by hand; no state block', created: 0, comments: [] });
+    const r = await go(blind, RR.g10289);
+    expect(r.masterRed!.action).toBe('update');
+    expect(blind.labeled('master-red').map(i => [i.number, i.state])).toEqual([[90, 'closed']]);
+    expect(mrState(blind.issue(90))).toMatchObject({ status: 'green', first_red: null, open_jobs: [], evaluated: { run_id: RR.g10289.id } });
+  });
+
+  // Recorded API JSON: push run 10229 (39174731800, f1d90931) reused the Test full suite of the
+  // workflow_dispatch 39170735990 (13366cde, the merged PR head; same tree 5d6ec794). Its jobs are the cheap
+  // tier plus a succeeded `reused-full-suite` job, it has no ci-manifest, and its reuse.json is verbatim.
+  // The dispatch's ci-manifest is complete (trimmed to the segmented-prior-view rows of 5034 files).
+  const reuseRuns = mr<{ workflow_runs: RunInfo[] }>('runs-test-reuse.json').workflow_runs;
+  const RU = { push10229: reuseRuns.find(r => r.run_number === 10229)!, dispatch10224: reuseRuns.find(r => r.run_number === 10224)! };
+  const REUSED_TREE = '5d6ec794768a1d240bfc0b79deb74b938b8894f2';
+  const reuseWatch = async (tweak: (w: World) => void = () => {}) => {
+    const w = new World();
+    w.addRun(RR.g10213).addRun(RR.r10222, `jobs-${RR.r10222.id}.json`, redManifest(RR.r10222));
+    expect((await go(w, RR.r10222)).masterRed!.action).toBe('create');
+    w.addRun(RU.dispatch10224, `jobs-${RU.dispatch10224.id}.json`, mr('ci-manifest-39170735990.json'));
+    w.addRun(RU.push10229, `jobs-${RU.push10229.id}.json`, null);
+    w.reuse.set(RU.push10229.id, readFileSync(join(MR, 'reuse-39174731800.json'), 'utf8'));
+    w.trees.set(RU.push10229.head_sha, REUSED_TREE).set(RU.dispatch10224.head_sha, REUSED_TREE);
+    tweak(w);
+    const incident = masterIssue(w)!;
+    return { incident, r: await go(w, RU.push10229) };
+  };
+
+  test('a push run that reused a full-suite run is judged by that run: run 10229 reused complete green dispatch 39170735990 (same tree) and closes the incident', async () => {
+    const { incident, r } = await reuseWatch();
+    expect(r.masterRed!.evaluated).toEqual([RU.push10229.id]);
+    expect(r.masterRed!.action).toBe('close');
+    expect(incident.state).toBe('closed');
+    expect(mrState(incident)).toMatchObject({ status: 'green', open_jobs: [], blocked: [], last_green: { run_id: RU.push10229.id }, evidence: { run_id: RU.push10229.id, complete: true, problems: [] } });
+    expect(incident.comments.at(-1)).toContain('Green:');
+  });
+
+  test('a reused run that cannot prove its source keeps the incident open: tree mismatch, incomplete or missing source manifest, unreadable or missing reuse.json', async () => {
+    const cases: Array<[string, (w: World) => void, string]> = [
+      ['tree mismatch', w => { w.trees.set(RU.dispatch10224.head_sha, 'f'.repeat(40)); }, `but push ${RU.push10229.head_sha.slice(0, 12)} has tree ${REUSED_TREE}`],
+      ['incomplete source manifest', w => { w.manifests.set(`${RU.dispatch10224.id}/1`, { ...mr<CiManifest>('ci-manifest-39170735990.json'), complete: false, problems: ['receipts-unit-3 is missing'] }); }, 'the ci-manifest artifact is incomplete: receipts-unit-3 is missing'],
+      ['source without a manifest', w => { w.manifests.delete(`${RU.dispatch10224.id}/1`); }, `run ${RU.dispatch10224.id} has no 'ci-manifest' artifact`],
+      ['unreadable reuse.json', w => { w.reuse.set(RU.push10229.id, '{"reuse": true, "workflow"'); }, `reading run ${RU.push10229.id}'s 'reused-full-suite' artifact failed`],
+      ['missing reuse artifact', w => { w.reuse.delete(RU.push10229.id); }, `run ${RU.push10229.id} has no 'reused-full-suite' artifact`],
+      ['record for another push', w => { w.reuse.set(RU.push10229.id, JSON.stringify({ ...mr<Record<string, unknown>>('reuse-39174731800.json'), push_sha: 'e'.repeat(40) })); }, `reuse.json is for push ${'e'.repeat(40)}`],
+    ];
+    for (const [name, tweak, problem] of cases) {
+      const { incident, r } = await reuseWatch(tweak);
+      expect([name, r.masterRed!.action]).toEqual([name, 'update']);
+      expect([name, incident.state]).toEqual([name, 'open']);
+      const state = mrState(incident);
+      expect([name, state.status, state.blocked]).toEqual([name, 'red', [PG_JOB]]);
+      expect([name, state.evidence!.complete]).toEqual([name, false]);
+      expect([name, state.evidence!.problems.join(' | ')]).toEqual([name, expect.stringContaining(problem)]);
+    }
+  });
+
   test('a green run where a previously failing job did not run keeps the issue open and names the manual-close step', async () => {
     const w = testWorld(T.g8315, T.r8320);
     await go(w, T.r8320);
@@ -613,6 +757,113 @@ describe('master-red: push-to-master runs', () => {
     await expect(go(blind, T.g8352)).rejects.toThrow('HTTP 502');
     expect(writes()).toBe(before);
     expect(masterIssue(blind)!.state).toBe('open');
+  });
+
+  test('a historic run whose jobs list keeps returning 502 is skipped with a warning; the watch evaluates the newer runs and the triggering run still fails loudly', async () => {
+    const w = testWorld(T.g8315, T.r8320);
+    await go(w, T.r8320);
+    for (const r of [T.c8331, T.r8336, T.r8343, T.g8352]) w.addRun(r, existsSync(join(MR, `jobs-${r.id}.json`)) ? `jobs-${r.id}.json` : undefined);
+    const poison = `/actions/runs/${T.r8336.id}/attempts/${T.r8336.run_attempt}/jobs`;
+    w.failGet = p => p.includes(poison);
+    const logs: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+    let r: Awaited<ReturnType<typeof go>>;
+    try { r = await go(w, T.g8352); } finally { console.log = log; }
+    expect(r.masterRed!.evaluated).toEqual([T.r8343.id, T.g8352.id]);
+    expect(mrState(masterIssue(w)!).evaluated).toMatchObject({ run_id: T.g8352.id });
+    expect(logs.filter(l => l.startsWith('::warning::'))).toEqual([expect.stringContaining(`run ${T.r8336.id} attempt ${T.r8336.run_attempt}`)]);
+
+    const own = testWorld(T.g8315, T.r8320);
+    own.failGet = p => p.includes(`/actions/runs/${T.r8320.id}/attempts/`);
+    await expect(go(own, T.r8320)).rejects.toThrow('HTTP 502');
+  });
+
+  test('restClient retries a GET that returns 5xx and succeeds on a later 200; a persistent 502 throws after the bounded retries; writes are never retried', async () => {
+    const real = globalThis.fetch;
+    const calls: string[] = [];
+    let script: number[] = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      const status = script.shift() ?? 200;
+      return new Response(status === 200 ? JSON.stringify({ jobs: [], total_count: 0 }) : 'bad gateway', { status });
+    }) as typeof fetch;
+    const slept: number[] = [];
+    const client = restClient('o/r', 'token', async ms => { slept.push(ms); });
+    const statusOf = (p: Promise<unknown>) => p.then(() => 0, e => (e as { status?: number }).status);
+    try {
+      script = [502, 200];
+      expect(await client.request<unknown>('GET', 'repos/{repo}/actions/runs/1/attempts/2/jobs')).toEqual({ jobs: [], total_count: 0 });
+      expect(calls).toEqual(['GET https://api.github.com/repos/o/r/actions/runs/1/attempts/2/jobs', 'GET https://api.github.com/repos/o/r/actions/runs/1/attempts/2/jobs']);
+      expect(slept).toEqual([GET_RETRY_DELAYS_MS[0]!]);
+
+      calls.length = 0; slept.length = 0;
+      script = [502, 502, 502, 502];
+      expect(await statusOf(client.request('GET', 'repos/{repo}/actions/runs/1/attempts/2/jobs'))).toBe(502);
+      expect(calls).toHaveLength(GET_RETRY_DELAYS_MS.length + 1);
+      expect(slept).toEqual(GET_RETRY_DELAYS_MS);
+
+      calls.length = 0;
+      script = [404];
+      expect(await statusOf(client.request('GET', 'repos/{repo}/actions/runs/9'))).toBe(404);
+      expect(calls).toHaveLength(1);
+
+      calls.length = 0;
+      script = [502];
+      expect(await statusOf(client.request('POST', 'repos/{repo}/issues', { title: 't' }))).toBe(502);
+      expect(calls).toHaveLength(1);
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+
+  test('restClient retries a GET whose connection dropped (no response), and a 4xx after a network blip still fails without more retries', async () => {
+    const real = globalThis.fetch;
+    let script: Array<number | 'drop'> = [];
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      const next = script.shift() ?? 200;
+      if (next === 'drop') throw new TypeError('fetch failed');
+      return new Response(next === 200 ? JSON.stringify({ ok: true }) : 'nope', { status: next });
+    }) as unknown as typeof fetch;
+    const slept: number[] = [];
+    const client = restClient('o/r', 'token', async ms => { slept.push(ms); });
+    try {
+      script = ['drop', 200];
+      expect(await client.request<unknown>('GET', 'repos/{repo}/actions/runs/1')).toEqual({ ok: true });
+      expect({ calls, slept }).toEqual({ calls: 2, slept: [GET_RETRY_DELAYS_MS[0]!] });
+
+      calls = 0; slept.length = 0;
+      script = ['drop', 404];
+      expect(await client.request('GET', 'repos/{repo}/actions/runs/9').then(() => 0, e => (e as { status?: number }).status)).toBe(404);
+      expect(calls).toBe(2);
+
+      calls = 0;
+      script = ['drop'];
+      expect(await client.request('POST', 'repos/{repo}/issues', { title: 't' }).then(() => 'ok', e => (e as { network?: boolean }).network)).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+
+  test('pagedJobs lists a 98-job attempt GitHub refuses to render 100 jobs at a time (a 502 on every per_page=100 page, runs 39059772114 / 39103163273)', async () => {
+    const all = Array.from({ length: 98 }, (_, i) => ({ id: i + 1, name: `job ${i + 1}`, conclusion: 'success' }));
+    const seen: string[] = [];
+    const client: GitHubClient = {
+      async request<T>(_method: string, path: string): Promise<T> {
+        seen.push(path);
+        const q = new URLSearchParams(path.split('?')[1]);
+        const perPage = Number(q.get('per_page')), page = Number(q.get('page'));
+        if (perPage > 50) throw Object.assign(new Error('GitHub API GET -> 502: server error'), { status: 502 });
+        return { jobs: all.slice((page - 1) * perPage, page * perPage), total_count: all.length } as T;
+      },
+    };
+    const run = { id: 39052886222, run_attempt: 2 } as RunInfo;
+    const { jobs, complete } = await pagedJobs(client, run);
+    expect({ count: jobs.length, complete }).toEqual({ count: 98, complete: true });
+    expect(seen.every(p => p.startsWith('repos/{repo}/actions/runs/39052886222/attempts/2/jobs?'))).toBe(true);
   });
 
   test('more than three failures are all listed; a database URL in run text is redacted and never reaches a reproduce command', async () => {

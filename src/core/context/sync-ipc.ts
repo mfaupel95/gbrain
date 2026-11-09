@@ -24,6 +24,8 @@
  */
 
 import { isValidSourceId } from '../source-id.ts';
+import { syncWireFields, type SyncWireType } from '../sync-flags.ts';
+import { retiredWireFields } from '../wire-skew.ts';
 import type { SyncResult } from '../../commands/sync.ts';
 import type { DrainNext, DrainReport } from '../persistence/sync-drain.ts';
 
@@ -41,26 +43,17 @@ import type { DrainNext, DrainReport } from '../persistence/sync-drain.ts';
  * drain (absent → the serve sweep drains them later).
  */
 export const DELEGATED_SYNC_OPTION_FIELDS = {
+  // The flags the one sync flag table forwards through the serve (src/core/sync-flags.ts) ...
+  ...syncWireFields('serve'),
+  // ... and the fields the client derives rather than parses.
   sourceId: 'string',
-  dryRun: 'boolean',
-  full: 'boolean',
-  noPull: 'boolean',
-  noEmbed: 'boolean',
-  noExtract: 'boolean',
-  noSchemaPack: 'boolean',
-  skipFailed: 'boolean',
-  retryFailed: 'boolean',
-  includeGitignored: 'boolean',
-  noBulk: 'boolean',
-  lanes: 'number',
-  explicitProcessing: 'string[]',
+  embedDeferred: 'boolean',
   timeoutSeconds: 'number',
-} as const;
+  origin: 'string',
+} as const satisfies Record<string, SyncWireType>;
 
 /** `--lanes N` bounds (`src/commands/sync/args.ts`). */
 export const DELEGATED_SYNC_LANES_MAX = 16;
-/** The processing keys an unfinished managed cursor supplies unless the caller set them (#5632). */
-export const DELEGATED_SYNC_PROCESSING_KEYS = ['noEmbed', 'noExtract', 'noSchemaPack'] as const;
 
 export type DelegatedSyncOptionField = keyof typeof DELEGATED_SYNC_OPTION_FIELDS;
 
@@ -84,8 +77,10 @@ export interface DelegatedSyncOptions {
   noBulk?: boolean;
   /** #6317: `--lanes N` / `--no-lanes` (1..DELEGATED_SYNC_LANES_MAX) for the managed catch-up. */
   lanes?: number;
-  /** #6317: the processing options the caller set itself; the managed cursor supplies the rest. */
-  explicitProcessing?: Array<typeof DELEGATED_SYNC_PROCESSING_KEYS[number]>;
+  /** #6696 (A5): who the run's writes are for; the operator's CLI sends `interactive`, absent is `background`. */
+  origin?: 'interactive' | 'background';
+  /** #6696: the client's cost gate deferred this run's embedding; cursor adoption never lifts it. Sent only when true. */
+  embedDeferred?: boolean;
   /**
    * REQUIRED — the client always sends its resolved hard deadline so a job
    * whose client died stays bounded. `0` is the single unbounded encoding
@@ -96,7 +91,8 @@ export interface DelegatedSyncOptions {
 }
 
 export type DelegatedSyncValidation =
-  | { ok: true; options: DelegatedSyncOptions }
+  /** `ignored`: retired fields an older client sent (src/core/wire-skew.ts), accepted and dropped. */
+  | { ok: true; options: DelegatedSyncOptions; ignored?: string[] }
   | { ok: false; error: string };
 
 /**
@@ -111,13 +107,22 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
     return { ok: false, error: 'invalid_options:options' };
   }
   const rec = raw as Record<string, unknown>;
+  const retired = retiredWireFields('serve');
+  const ignored: string[] = [];
   for (const key of Object.keys(rec)) {
+    const window = retired.get(key);
+    if (window) {
+      // Accepted from an older client and ignored until its window in src/core/wire-skew.ts closes.
+      if (rec[key] !== undefined && !window.accepts(rec[key])) return { ok: false, error: `invalid_options:${key}` };
+      ignored.push(key);
+      continue;
+    }
     if (!(key in DELEGATED_SYNC_OPTION_FIELDS)) {
       return { ok: false, error: `invalid_options:${key}` };
     }
   }
   const out: Record<string, unknown> = {};
-  for (const [key, type] of Object.entries(DELEGATED_SYNC_OPTION_FIELDS)) {
+  for (const [key, type] of Object.entries(DELEGATED_SYNC_OPTION_FIELDS) as Array<[string, SyncWireType]>) {
     const v = rec[key];
     if (v === undefined) continue;
     if (type === 'string[]') {
@@ -131,11 +136,8 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
   if (out.lanes !== undefined && (!Number.isInteger(out.lanes) || (out.lanes as number) < 1 || (out.lanes as number) > DELEGATED_SYNC_LANES_MAX)) {
     return { ok: false, error: 'invalid_options:lanes' };
   }
-  if (out.explicitProcessing !== undefined) {
-    const keys = out.explicitProcessing as string[];
-    if (keys.length > DELEGATED_SYNC_PROCESSING_KEYS.length || keys.some(key => !(DELEGATED_SYNC_PROCESSING_KEYS as readonly string[]).includes(key))) {
-      return { ok: false, error: 'invalid_options:explicitProcessing' };
-    }
+  if (out.origin !== undefined && out.origin !== 'interactive' && out.origin !== 'background') {
+    return { ok: false, error: 'invalid_options:origin' };
   }
   const timeout = out.timeoutSeconds;
   if (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 0) {
@@ -145,7 +147,7 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
   if (out.sourceId !== undefined && !isValidSourceId(out.sourceId as string)) {
     return { ok: false, error: 'invalid_options:sourceId' };
   }
-  return { ok: true, options: out as unknown as DelegatedSyncOptions };
+  return { ok: true, options: out as unknown as DelegatedSyncOptions, ...(ignored.length ? { ignored } : {}) };
 }
 
 // ── Progress + result shapes ───────────────────────────────────────────────
@@ -292,5 +294,37 @@ export interface SyncAbortResponse {
   ok: boolean;
   protocol: 2;
   state?: DelegatedSyncState;
+  error?: string;
+}
+
+/**
+ * GBRA-133 PR 2a: sync_nudge (secret-gated, protocol 2, versioned by `version`). A client that cannot sync now (
+ * `gbrain sync trigger`, or a delegated sync the serve answered `busy`) records what it wants as a wanted marker
+ * through the serve that holds the PGLite brain, which acknowledges with the marker and nudges its notifier. An
+ * absent `intent` lets the serve pick (managed: freshness, classic: pull); a freshness marker with no `wantedHead`
+ * takes the checkout's HEAD as the serve reads it. An older serve answers unknown_kind:sync_nudge.
+ */
+export const SYNC_NUDGE_VERSION = 1;
+
+export interface SyncNudgeRequest {
+  kind: 'sync_nudge';
+  protocol: 2;
+  version: number;
+  secret: string;
+  sourceId: string;
+  intent?: 'freshness' | 'pull' | 'full';
+  wantedHead?: string | null;
+  requestedBy: 'sync_trigger' | 'delegated_sync';
+}
+
+export interface SyncNudgeResponse {
+  ok: boolean;
+  protocol: 2;
+  version?: number;
+  acked?: boolean;
+  marker?: { source_id: string; intent: 'freshness' | 'pull' | 'full'; generation: number; wanted_head: string | null; first_due_at: string };
+  /** Whether a notifier runs in that serve (false: GBRAIN_NOTIFIER=0 there; the marker waits for a resident). */
+  notifier?: boolean;
+  resident?: string | null;
   error?: string;
 }

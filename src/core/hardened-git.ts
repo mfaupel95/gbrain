@@ -15,49 +15,266 @@
  * (`assertHardenedGitArgs`, wave 12 W4.3), and `hardenedPathDirty` answers
  * "is this file changed from HEAD" without `git status`.
  */
-import { spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from './spawn.ts';
+import { promisify } from 'node:util';
 import { lstatSync } from 'node:fs';
+import { once } from 'node:events';
+import type { Writable } from 'node:stream';
 import { join } from 'node:path';
+import { envSafeDirectories, gitChildEnv, safeDirectoryEnv } from './git-env.ts';
 
 export const HARDENED_GIT_ARGS: readonly string[] = ['--no-pager', '--no-optional-locks', '--no-replace-objects',
   '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
   '-c', 'submodule.recurse=false', '-c', 'protocol.allow=never', '-c', 'credential.helper=',
   '-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
 
-export function hardenedGitEnvironment(): NodeJS.ProcessEnv {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
-  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0',
-    GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', GIT_LFS_SKIP_SMUDGE: '1', LC_ALL: 'C' };
+const OPERATOR_CONFIG_TTL_MS = 30_000;
+let operatorConfig: { key: string; at: number; values: string[] } | null = null;
+
+/**
+ * #7584: the `safe.directory` entries in the operator's system and global Git config, in Git's order, read from `/` so no
+ * repository's config takes part. Re-read every 30 s, so a running server picks up an edit without a restart.
+ */
+function operatorConfigSafeDirectories(): string[] {
+  const key = operatorConfigKey();
+  const known = freshOperatorConfig(key);
+  if (known) return known;
+  const run = spawnSync('git', OPERATOR_CONFIG_ARGS, { ...operatorConfigOptions(), env: { ...gitChildEnv(), LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] });
+  return rememberOperatorConfig(key, run.status === 0 ? run.stdout : null);
 }
 
-export type HardenedGitResult = { ok: true; stdout: Buffer } | { ok: false; reason: 'exit' | 'timeout' | 'too_large' | 'unavailable'; status?: number };
+/** GBRA-133: the same read without blocking, for `hardenedGitStream`, so an asynchronous Git read spawns no synchronous Git. */
+async function operatorConfigSafeDirectoriesAsync(): Promise<string[]> {
+  const key = operatorConfigKey();
+  const known = freshOperatorConfig(key);
+  if (known) return known;
+  const stdout = await promisify(execFile)('git', OPERATOR_CONFIG_ARGS, { ...operatorConfigOptions(), env: { ...gitChildEnv(), LC_ALL: 'C' }, encoding: 'buffer' }).then(run => run.stdout, () => null);
+  return rememberOperatorConfig(key, stdout);
+}
 
-const CONVERTING_OPTIONS = new Set(['--filters', '--textconv', '--ext-diff', '-p', '--patch', '-u', '--stat', '--word-diff']);
-const ALLOWED_SUBCOMMANDS = new Set(['rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'hash-object', 'check-attr', 'diff-index']);
+const OPERATOR_CONFIG_ARGS = ['config', '--includes', '--show-scope', '-z', '--get-all', 'safe.directory'];
+const operatorConfigOptions = () => ({ cwd: '/', timeout: 10_000, maxBuffer: 1024 * 1024, killSignal: 'SIGKILL' as const });
+const operatorConfigKey = () => ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'PATH'].map(name => process.env[name] ?? '').join('\0');
+const freshOperatorConfig = (key: string) => operatorConfig?.key === key && Date.now() - operatorConfig.at < OPERATOR_CONFIG_TTL_MS ? operatorConfig.values : null;
+
+/** Git's `-z --show-scope` output (null when the read failed) as the system and global entries, cached under `key`. */
+function rememberOperatorConfig(key: string, stdout: Buffer | null): string[] {
+  const fields = stdout ? stdout.toString('utf8').split('\0') : [];
+  const values: string[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) if (fields[i] === 'system' || fields[i] === 'global') values.push(fields[i + 1]!);
+  operatorConfig = { key, at: Date.now(), values };
+  return values;
+}
+
+export function __resetOperatorGitConfigForTests(): void { operatorConfig = null; }
+
+/**
+ * System and global config stay off and every `GIT_*` variable is dropped, except the operator's `safe.directory` entries
+ * (system, global, then environment, as Git orders them), carried as environment config (#7584). They relax only Git's
+ * ownership check for a repository owned by another user, which the operator allowed for their own `git` too.
+ */
+export function hardenedGitEnvironment(operatorSafeDirectories: string[] = operatorConfigSafeDirectories()): NodeJS.ProcessEnv {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0',
+    GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', GIT_LFS_SKIP_SMUDGE: '1', LC_ALL: 'C',
+    ...safeDirectoryEnv([...operatorSafeDirectories, ...envSafeDirectories()]) };
+}
+
+export type HardenedGitResult = { ok: true; stdout: Buffer } | { ok: false; reason: 'exit' | 'timeout' | 'too_large' | 'unavailable'; status?: number; stderr?: string };
+
+/**
+ * GBRA-217: the one `git log` gbrain runs in an untrusted checkout, the reason-trailer read (`reason-trailers.ts`). A
+ * name-only listing of the first-parent line with no renames compares tree entries only, so no filter, textconv or
+ * external diff runs; signatures are not verified (no gpg). Every option is required, so no other `log` passes.
+ */
+export const REASON_LOG_OPTIONS: readonly string[] = ['-z', '--first-parent', '--diff-merges=first-parent', '--root', '--name-only', '--no-renames', '--no-relative',
+  '--no-ext-diff', '--no-textconv', '--no-show-signature', '--format=%x00%H%x00%(trailers:key=gbrain-reason,valueonly,unfold)'];
+
+/**
+ * The second `git log` gbrain runs in an untrusted checkout, the direction-evidence history read (persistence/git-gap.ts
+ * `readPathHistory`): a raw listing (modes and full blob ids, no patch) of every commit, merges against their first
+ * parent, with no renames, so only tree entries are compared and no filter, textconv or external diff runs. Every option
+ * is required.
+ */
+export const HISTORY_LOG_OPTIONS: readonly string[] = ['-z', '--raw', '--no-abbrev', '--full-history', '--root', '--diff-merges=first-parent', '--no-renames', '--no-relative',
+  '--no-ext-diff', '--no-textconv', '--no-show-signature', '--format=%x1e%H%x1f%ct'];
+/** Each `log` shape allowed: its options exactly, all of them. */
+const LOG_SHAPES: ReadonlyArray<readonly string[]> = [REASON_LOG_OPTIONS, HISTORY_LOG_OPTIONS];
+
+/**
+ * The exact options each allowed plumbing subcommand may take; anything not
+ * listed here refuses.
+ */
+const ALLOWED_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['rev-parse', new Set(['--show-toplevel', '--absolute-git-dir', '--verify', '--quiet', '--show-object-format'])],
+  ['ls-files', new Set(['-s', '--stage', '--eol', '-z', '--cached', '--others', '--exclude-standard'])],
+  ['ls-tree', new Set(['-r', '-l', '-z', '--full-tree'])],
+  ['cat-file', new Set(['--batch', '--batch-check'])],
+  ['hash-object', new Set(['--no-filters', '--stdin-paths'])],
+  ['check-attr', new Set(['-z', '--stdin'])],
+  ['check-ignore', new Set(['-z', '--stdin'])],
+  ['diff-index', new Set(['--cached', '--quiet'])],
+  ['diff-tree', new Set(['-r', '-z', '--no-renames'])],
+  ['log', new Set(LOG_SHAPES.flat())],
+]);
+
+/** Options a subcommand must carry, so its output stays raw and machine-readable. */
+const REQUIRED_OPTIONS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['hash-object', ['--no-filters']],
+  ['diff-index', ['--cached']],
+  ['diff-tree', ['-r', '-z', '--no-renames']],
+]);
 
 /**
  * Refuses (throws) any Git invocation that could run a repository-configured
- * clean/process filter or textconv: only the allow-listed plumbing, with
- * `hash-object` only under `--no-filters` and `diff-index` only `--cached`.
+ * clean/process filter or textconv: only the allow-listed plumbing with its
+ * exact options before `--`/`--end-of-options`, `hash-object` only under
+ * `--no-filters`, `diff-index` only `--cached` and `diff-tree` only as
+ * `-r -z --no-renames` (a raw listing: no patch, textconv or rename scoring).
  */
 export function assertHardenedGitArgs(args: readonly string[]): void {
   const sub = args[0] ?? '';
-  const ok = ALLOWED_SUBCOMMANDS.has(sub) && !args.some(arg => CONVERTING_OPTIONS.has(arg) || arg.startsWith('--textconv') || arg.startsWith('--filters'))
-    && (sub !== 'hash-object' || args.includes('--no-filters')) && (sub !== 'diff-index' || args.includes('--cached'));
+  const allowed = ALLOWED_OPTIONS.get(sub);
+  const end = args.findIndex(arg => arg === '--' || arg === '--end-of-options');
+  const options = args.slice(1, end < 0 ? undefined : end).filter(arg => arg.startsWith('-'));
+  const ok = allowed !== undefined && options.every(arg => allowed.has(arg))
+    && (REQUIRED_OPTIONS.get(sub) ?? []).every(arg => options.includes(arg))
+    && (sub !== 'log' || LOG_SHAPES.some(shape => shape.every(arg => options.includes(arg)) && options.every(arg => shape.includes(arg))));
   if (!ok) throw new Error(`hardened git refuses \`git ${args.slice(0, 2).join(' ')}\`: only filter-free plumbing may run in an untrusted checkout (see src/core/hardened-git.ts)`);
 }
 
-/** Runs `git -C <root> <args>` synchronously under the hardening above, within `timeoutMs` and `maxBytes` of stdout. */
-export function hardenedGitSync(root: string, args: string[], limits: { timeoutMs: number; maxBytes: number }): HardenedGitResult {
+/**
+ * Runs `git -C <root> <args>` synchronously under the hardening above, within `timeoutMs` and `maxBytes` of stdout. With
+ * `stderr`, a nonzero exit carries Git's message, so a caller can tell one failure from another.
+ */
+export function hardenedGitSync(root: string, args: string[], limits: { timeoutMs: number; maxBytes: number; stderr?: boolean }): HardenedGitResult {
   assertHardenedGitArgs(args);
   const run = spawnSync('git', [...HARDENED_GIT_ARGS, '-C', root, ...args],
-    { env: hardenedGitEnvironment(), stdio: ['ignore', 'pipe', 'ignore'], timeout: limits.timeoutMs, maxBuffer: limits.maxBytes, killSignal: 'SIGKILL' });
+    { env: hardenedGitEnvironment(), stdio: ['ignore', 'pipe', limits.stderr ? 'pipe' : 'ignore'], timeout: limits.timeoutMs, maxBuffer: limits.maxBytes, killSignal: 'SIGKILL' });
   const code = (run.error as NodeJS.ErrnoException | undefined)?.code;
   if (code === 'ETIMEDOUT') return { ok: false, reason: 'timeout' };
   if (code === 'ENOBUFS') return { ok: false, reason: 'too_large' };
   if (run.error) return { ok: false, reason: 'unavailable' };
-  if (run.status !== 0) return { ok: false, reason: 'exit', ...(run.status === null ? {} : { status: run.status }) };
+  if (run.status !== 0) return { ok: false, reason: 'exit', ...(run.status === null ? {} : { status: run.status }), ...(limits.stderr && run.stderr ? { stderr: run.stderr.toString('utf8') } : {}) };
   return { ok: true, stdout: run.stdout };
+}
+
+export type HardenedGitStreamResult = { ok: true; exitCode: 0; signal: null; bytes: number; endsWithNul: boolean }
+  | { ok: false; reason: 'exit' | 'signal' | 'timeout' | 'too_large' | 'unavailable' | 'stalled'; status?: number; signal?: NodeJS.Signals };
+
+/**
+ * How long stdout may sit idle after Git exited while it is being read (not held by `onChunk`). Bun can lose the readiness
+ * of a child's stdout that turns readable as the child exits (#7053: the one-shot poll fired and was never re-armed, the
+ * output and EOF left unread), so `close` never comes; such a run fails as `stalled` instead of waiting forever.
+ */
+const EXITED_STDOUT_IDLE_MS = 5_000;
+export type HardenedGitInput = string | Buffer | Iterable<Buffer | string> | AsyncIterable<Buffer | string>;
+
+/**
+ * Runs `git -C <root> <args>` asynchronously under the same hardening and
+ * allow-list as `hardenedGitSync`, streaming stdout to `onChunk` (nothing is
+ * buffered here) and feeding `stdin` with backpressure. The process is killed
+ * with SIGKILL past `timeoutMs` or `maxBytes` of stdout. A throw from
+ * `onChunk` or from a `stdin` iterable kills the process and rejects, so a
+ * caller never mistakes a run cut short for a finished one. An `onChunk` that
+ * returns a promise holds stdout until it settles (a large read yields to the
+ * event loop between chunks); a rejection fails the run like a throw. The operator's `safe.directory` read it needs runs
+ * asynchronously too (GBRA-133), so the whole read spawns no synchronous Git.
+ */
+export function hardenedGitStream(root: string, args: string[],
+  opts: { stdin?: HardenedGitInput; timeoutMs: number; maxBytes?: number; onChunk?: (chunk: Buffer) => void | Promise<void> }): Promise<HardenedGitStreamResult> {
+  try { assertHardenedGitArgs(args); } catch (error) { return Promise.reject(error); }
+  // GBRA-133: not an async function and no callback below names `opts`, so no timer or listener closes over the caller's
+  // options, and the chunk handler is dropped once the read settled. Before, an async function's parameters were captured by
+  // every callback here: the exited-stdout idle timer kept the caller's `onChunk` (and through it the whole pass that read)
+  // reachable for seconds after the read had ended.
+  const { stdin, timeoutMs, maxBytes } = opts;
+  let onChunk = opts.onChunk;
+  return operatorConfigSafeDirectoriesAsync().then(operator => new Promise<HardenedGitStreamResult>((accept, reject) => {
+    const child = spawn('git', [...HARDENED_GIT_ARGS, '-C', root, ...args],
+      { env: hardenedGitEnvironment(operator), stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'] });
+    let bytes = 0;
+    let last = -1;
+    let stopped: 'timeout' | 'too_large' | undefined;
+    let failure: { error: unknown } | undefined;
+    let settled = false;
+    let exited = false;
+    let holding = false;
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    const settle = (outcome: () => void): void => { if (settled) return; settled = true; onChunk = undefined; clearTimeout(timer); clearTimeout(idle); outcome(); };
+    const fail = (error: unknown): void => { failure ??= { error }; child.kill('SIGKILL'); };
+    const timer = setTimeout(() => { stopped ??= 'timeout'; child.kill('SIGKILL'); }, timeoutMs);
+    const watchIdle = (): void => {
+      clearTimeout(idle);
+      if (exited && !holding) idle = setTimeout(() => settle(() => failure ? reject(failure.error) : accept({ ok: false, reason: stopped ?? 'stalled' })), EXITED_STDOUT_IDLE_MS);
+    };
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (settled || stopped || failure) return;
+      bytes += chunk.length;
+      if (maxBytes !== undefined && bytes > maxBytes) { stopped = 'too_large'; child.kill('SIGKILL'); return; }
+      last = chunk[chunk.length - 1] ?? last;
+      let held: void | Promise<void>;
+      try { held = onChunk?.(chunk); } catch (error) { fail(error); return; }
+      if (held) { holding = true; child.stdout?.pause(); held.then(() => { holding = false; watchIdle(); child.stdout?.resume(); }, fail); }
+      watchIdle();
+    });
+    child.on('exit', () => { exited = true; watchIdle(); });
+    child.on('error', () => { if (child.pid === undefined) settle(() => accept({ ok: false, reason: 'unavailable' })); });
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => settle(() => {
+      if (failure) reject(failure.error);
+      else if (stopped) accept({ ok: false, reason: stopped });
+      else if (signal) accept({ ok: false, reason: 'signal', signal });
+      else if (code !== 0) accept({ ok: false, reason: 'exit', ...(code === null ? {} : { status: code }) });
+      else accept({ ok: true, exitCode: 0, signal: null, bytes, endsWithNul: last === 0 });
+    }));
+    if (stdin !== undefined && child.stdin) void feedStdin(child.stdin, stdin, fail);
+  }));
+}
+
+async function feedStdin(stdin: Writable, input: HardenedGitInput, fail: (error: unknown) => void): Promise<void> {
+  stdin.on('error', () => {});
+  if (typeof input === 'string' || Buffer.isBuffer(input)) { stdin.end(input); return; }
+  try {
+    for await (const piece of input) {
+      if (stdin.destroyed) return;
+      if (!stdin.write(piece)) await once(stdin, 'drain');
+    }
+    stdin.end();
+  } catch (error) {
+    if (stdin.destroyed) return;
+    fail(error);
+  }
+}
+
+/**
+ * Splits a NUL-terminated record stream (`-z` output) into complete records
+ * across chunk boundaries; bytes after the last NUL wait for the next chunk.
+ */
+export class NulRecordSplitter {
+  private pending: Buffer[] = [];
+  push(chunk: Buffer): Buffer[] {
+    const records: Buffer[] = [];
+    let start = 0;
+    for (let end = chunk.indexOf(0); end >= 0; end = chunk.indexOf(0, start)) {
+      const piece = chunk.subarray(start, end);
+      records.push(this.pending.length === 0 ? piece : Buffer.concat([...this.pending, piece]));
+      this.pending = [];
+      start = end + 1;
+    }
+    if (start < chunk.length) this.pending.push(chunk.subarray(start));
+    return records;
+  }
+  /** Whether every byte pushed so far belongs to a NUL-terminated record (true before any byte). */
+  get atRecordBoundary(): boolean { return this.pending.length === 0; }
+}
+
+/**
+ * The completeness rule for a `-z` read: Git exited 0, was not signalled,
+ * and its output ended exactly at a NUL (an empty output is complete). Any
+ * other read may be truncated and must not be trusted for absence.
+ */
+export function hardenedStreamComplete(result: HardenedGitStreamResult): boolean {
+  return result.ok && (result.bytes === 0 || result.endsWithNul);
 }
 
 const PATH_LIMITS = { timeoutMs: 10_000, maxBytes: 1024 * 1024 };
@@ -74,11 +291,12 @@ const PATH_LIMITS = { timeoutMs: 10_000, maxBytes: 1024 * 1024 };
  * any Git failure.
  */
 export function hardenedPathDirty(root: string, rel: string): boolean | null {
-  const indexed = hardenedGitSync(root, ['ls-files', '-s', '--eol', '-z', '--', rel], PATH_LIMITS);
+  const pathspec = `:(literal)${rel}`;
+  const indexed = hardenedGitSync(root, ['ls-files', '-s', '--eol', '-z', '--', pathspec], PATH_LIMITS);
   if (!indexed.ok) return null;
   const entry = indexed.stdout.toString('utf8').split('\0')[0];
   if (!entry) {
-    const untracked = hardenedGitSync(root, ['ls-files', '-z', '--others', '--exclude-standard', '--', rel], PATH_LIMITS);
+    const untracked = hardenedGitSync(root, ['ls-files', '-z', '--others', '--exclude-standard', '--', pathspec], PATH_LIMITS);
     return untracked.ok ? untracked.stdout.length > 0 : null;
   }
   const [meta = '', eolInfo = ''] = entry.split('\t');
@@ -89,7 +307,7 @@ export function hardenedPathDirty(root: string, rel: string): boolean | null {
   if (mode !== '100644' && mode !== '100755') return null;
   const head = hardenedGitSync(root, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], PATH_LIMITS);
   if (!head.ok) return head.reason === 'exit' && head.status === 1 ? true : null;
-  const staged = hardenedGitSync(root, ['diff-index', '--cached', '--quiet', 'HEAD', '--', rel], PATH_LIMITS);
+  const staged = hardenedGitSync(root, ['diff-index', '--cached', '--quiet', 'HEAD', '--', pathspec], PATH_LIMITS);
   if (!staged.ok) return staged.reason === 'exit' && staged.status === 1 ? true : null;
   const hashed = hardenedGitSync(root, ['hash-object', '--no-filters', '--', rel], PATH_LIMITS);
   if (!hashed.ok) return null;

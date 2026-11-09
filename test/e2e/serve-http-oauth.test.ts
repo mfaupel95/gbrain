@@ -752,8 +752,11 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(data.page_count).toBeUndefined();
     expect(data.chunk_count).toBeUndefined();
     expect(data.embedded_count).toBeUndefined();
-    // Body shape is exactly {status, version, engine}.
-    expect(Object.keys(data).sort()).toEqual(['engine', 'status', 'version']);
+    // Body shape is exactly {status, version, engine, build}; #7245's build carries versions only, never a path.
+    expect(Object.keys(data).sort()).toEqual(['build', 'engine', 'status', 'version']);
+    expect(Object.keys(data.build).sort()).toEqual(['installed_version', 'restart_pending', 'version']);
+    expect(data.build.version).toBe(data.version);
+    expect(typeof data.build.restart_pending).toBe('boolean');
   });
 
   test('v0.28.10: /admin/api/full-stats without admin cookie returns 401', async () => {
@@ -1659,9 +1662,9 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     const warnings = warned._meta?.warnings;
     expect(Array.isArray(warnings)).toBe(true);
     expect(warnings.some((w: any) => w.code === 'unknown_param' && w.param === 'bogus_unknown_param')).toBe(true);
-    // The model-visible warn notice rides as an extra content block (D8).
-    expect(warned.content.some((c: any) => typeof c.text === 'string'
-      && c.text.includes('unknown parameter "bogus_unknown_param"'))).toBe(true);
+    // HARN-15: the warning lives in _meta.warnings only; no content block names it.
+    expect(JSON.stringify(warned.content)).not.toContain('bogus_unknown_param');
+    expect(JSON.stringify(warned.content)).not.toContain('unknown_param');
 
     // Control (anti-vacuity): same op with only declared params.
     const clean = await mcpToolResult(token, 'tools/call', {

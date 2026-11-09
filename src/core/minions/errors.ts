@@ -20,3 +20,24 @@ export class JobDeferredError extends Error {
     this.name = 'JobDeferredError';
   }
 }
+
+/**
+ * #7239: a deterministic refusal, recorded on the job's result as `refusal` (job_outcome `refused`). `fix` is the
+ * error's rendered next step and `docs_cmd` explains the code offline; the suggestion prose is never kept, because job
+ * rows are served to remote callers and a suggestion may name an account or a local path.
+ */
+export interface JobRefusal {
+  code: string;
+  reason?: string;
+  message: string;
+  fix?: unknown;
+  docs_cmd: string[];
+}
+
+/** A refusal rebuilt on the worker side of a per-job child (job-isolation.ts); terminal like any UnrecoverableError. */
+export class JobRefusedError extends UnrecoverableError {
+  constructor(readonly refusal: JobRefusal) {
+    super(refusal.message);
+    this.name = 'JobRefusedError';
+  }
+}

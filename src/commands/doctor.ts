@@ -135,8 +135,10 @@ export {
   buildMemoryVerbsCheck,
   buildRetrievalReflexCheck,
 } from './doctor/checks/verbs-reflex.ts';
-import type { DoctorContext } from './doctor/context.ts';
-import { runDoctorRegistry, parseOnlyChecks } from './doctor/registry.ts';
+import type { DoctorContext, DoctorTier } from './doctor/context.ts';
+import { doctorRunSummary, parseDoctorTier, scoredChecks, startDoctorDeadline, tierFields, type DoctorDeadline, type DoctorRunSummary, type ScoreCategory } from './doctor/budget.ts';
+export { doctorRunSummary, type DoctorRunSummary } from './doctor/budget.ts';
+import { runDoctorRegistry, parseOnlyChecks, doctorRefreshRegistry } from './doctor/registry.ts';
 import { finalizeCheckFixes, fixLine, unknownScoreCategories, type CheckAgentFields } from './doctor/check-fix.ts';
 import { throttleDoctorHeartbeat } from './doctor/heartbeat.ts';
 import type { RenderContext } from '../core/agent-output.ts';
@@ -173,6 +175,10 @@ export interface Check extends CheckAgentFields {
    * Source of truth: `src/core/doctor-categories.ts`.
    */
   category?: CheckCategory;
+  /** #6696 B1: wall time of the registry entry that produced this check. */
+  elapsed_ms?: number;
+  /** Wave B decision #10: pages stored in segments this whole-body check did not read; only when > 0 (`withSkippedSegmented`). */
+  skipped_segmented?: number;
 }
 
 /**
@@ -236,7 +242,17 @@ export interface DoctorReport {
   /** E2: capabilities off by choice that bound what this brain can do (e.g. `embeddings_disabled`). Additive. */
   capped_by?: string[];
   /** E10: category scores that are not evidence because their checks did not run (e.g. `brain` when the DB was unreachable). */
-  unknown_scores?: Array<'brain'>;
+  unknown_scores?: ScoreCategory[];
+  /** #7276: checks not finished within the budget; the scores skip them. */
+  unknown_count?: number;
+  /** #6696 B1, only with `--tier` / `--budget-ms`: the tier, whether every check is known, the unknown ones, wall time, budget (null: none). */
+  tier?: DoctorTier;
+  complete?: boolean;
+  unknown_sections?: string[];
+  /** #7142: checks reported from their last known result (with its age in `details.last_known`), not measured by this run. */
+  last_known_sections?: string[];
+  elapsed_ms?: number;
+  budget_ms?: number | null;
 }
 
 function _penaltyScore(checks: Check[]): number {
@@ -264,7 +280,7 @@ function _penaltyScore(checks: Check[]): number {
  */
 export function computeDoctorReport(
   checks: Check[],
-  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null; render?: RenderContext },
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null; render?: RenderContext; run?: DoctorRunSummary },
 ): DoctorReport {
   const tagged = finalizeCheckFixes(checks, extras?.render).map((c) =>
     c.category ? c : { ...c, category: categorizeCheck(c.name) },
@@ -274,11 +290,13 @@ export function computeDoctorReport(
   const hasFail = tagged.some((c) => c.status === 'fail');
   const hasWarn = tagged.some((c) => c.status === 'warn');
 
-  const health_score = _penaltyScore(tagged);
-  const brain = tagged.filter((c) => c.category === 'brain');
-  const skill = tagged.filter((c) => c.category === 'skill');
-  const ops = tagged.filter((c) => c.category === 'ops');
-  const meta = tagged.filter((c) => c.category === 'meta');
+  const { known, unknown_count, unknown_categories } = scoredChecks(tagged);
+  const unknown_scores = [...new Set([...unknownScoreCategories(tagged), ...unknown_categories])];
+  const health_score = _penaltyScore(known);
+  const brain = known.filter((c) => c.category === 'brain');
+  const skill = known.filter((c) => c.category === 'skill');
+  const ops = known.filter((c) => c.category === 'ops');
+  const meta = known.filter((c) => c.category === 'meta');
 
   const status: DoctorReport['status'] = hasFail ? 'unhealthy' : hasWarn ? 'warnings' : 'healthy';
   return {
@@ -297,7 +315,9 @@ export function computeDoctorReport(
     ...(extras?.engine ? { engine: extras.engine } : {}),
     ...(extras?.db_url_source !== undefined ? { db_url_source: extras.db_url_source } : {}),
     ...(capped_by.length ? { capped_by } : {}),
-    ...(unknownScoreCategories(tagged).length ? { unknown_scores: unknownScoreCategories(tagged) } : {}),
+    ...(unknown_scores.length ? { unknown_scores } : {}),
+    ...(unknown_count ? { unknown_count } : {}),
+    ...(extras?.run ? tierFields(tagged, extras.run) : {}),
   };
 }
 
@@ -381,6 +401,9 @@ export async function buildChecks(
   // `connection` check — without it, a total outage produced NO connection
   // entry at all, which is exactly the field smoke-test branches on.
   connectError?: unknown,
+  // #6696: the run's deadline (started by the CLI before connecting) and a remote caller's readable sources.
+  deadline: DoctorDeadline = startDoctorDeadline(args),
+  remoteScope: { sourceIds?: string[]; remote?: boolean; lastKnown?: 'cli' | 'refresh'; entryBudgetOverrideMs?: number; refreshOnly?: boolean } = {},
 ): Promise<Check[]> {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
@@ -455,9 +478,14 @@ export async function buildChecks(
     schemaVersion: 0,
     connectionFailed: false,
     only: parseOnlyChecks(args),
+    tier: parseDoctorTier(args),
+    deadline,
+    ...(remoteScope.sourceIds ? { sourceIds: remoteScope.sourceIds } : {}), ...(remoteScope.remote ? { remote: true } : {}),
+    ...(remoteScope.lastKnown ? { lastKnown: remoteScope.lastKnown } : {}),
+    ...(remoteScope.entryBudgetOverrideMs ? { entryBudgetOverrideMs: remoteScope.entryBudgetOverrideMs } : {}),
   };
 
-  return runDoctorRegistry(ctx);
+  return runDoctorRegistry(ctx, remoteScope.refreshOnly ? doctorRefreshRegistry() : undefined);
 }
 
 /**
@@ -484,6 +512,7 @@ export async function runDoctor(
   // db-availability loop: the connect error from the CLI's dead-DB fallback,
   // threaded to buildChecks for the synthesized `connection` check (2c-bis).
   connectError?: unknown,
+  deadline: DoctorDeadline = startDoctorDeadline(args),
 ) {
   const jsonOutput = args.includes('--json');
   const locksMode = args.includes('--locks');
@@ -497,11 +526,12 @@ export async function runDoctor(
   }
 
   if (args.includes('--probe') && !(await (await import('./doctor/probe-consent.ts')).authorizeProviderProbe(engine, args, jsonOutput))) return;
-  const checks = await buildChecks(engine, args, dbSource, connectError);
-  const hasFail = outputResults(checks, jsonOutput, { engine: engine?.kind, db_url_source: dbSource ?? null });
+  const checks = await buildChecks(engine, args, dbSource, connectError, deadline, { lastKnown: 'cli' });
+  const run = doctorRunSummary(args, deadline);
+  const hasFail = outputResults(checks, jsonOutput, { engine: engine?.kind, db_url_source: dbSource ?? null, run });
 
-  // Features teaser (non-JSON, non-failing only)
-  if (!jsonOutput && !hasFail && engine) {
+  // Features teaser (non-JSON, non-failing only; never under the ops deadline)
+  if (!jsonOutput && !hasFail && engine && run?.tier !== 'ops') {
     try {
       const { featuresTeaserForDoctor } = await import('./features.ts');
       const teaser = await featuresTeaserForDoctor(engine);
@@ -530,7 +560,7 @@ export function doctorProgressOptions(jsonOutput: boolean) {
 function outputResults(
   checks: Check[],
   json: boolean,
-  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null },
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null; run?: DoctorRunSummary },
 ): boolean {
   // v0.41.19.0 — render goes through computeDoctorReport so the human
   // output, JSON output, and remote MCP envelope all share one shape.
@@ -589,11 +619,15 @@ function outputResults(
     : null;
 
   console.log('');
-  console.log(`Brain checks:  ${report.unknown_scores?.includes('brain') ? 'unknown (database checks did not run)' : `${report.brain_checks_score}/100  (category penalty)`}`);
-  console.log(`Skill checks:  ${report.category_scores.skill}/100`);
-  console.log(`Ops checks:    ${report.category_scores.ops}/100`);
-  console.log(`Meta checks:   ${report.category_scores.meta}/100`);
+  const catLine = (cat: ScoreCategory, scored: string) => report.unknown_scores?.includes(cat)
+    ? `unknown (${cat === 'brain' && unknownScoreCategories(report.checks).length ? 'database checks did not run' : 'no check finished within the budget'})` : scored;
+  console.log(`Brain checks:  ${catLine('brain', `${report.brain_checks_score}/100  (category penalty)`)}`);
+  console.log(`Skill checks:  ${catLine('skill', `${report.category_scores.skill}/100`)}`);
+  console.log(`Ops checks:    ${catLine('ops', `${report.category_scores.ops}/100`)}`);
+  console.log(`Meta checks:   ${catLine('meta', `${report.category_scores.meta}/100`)}`);
+  if (report.unknown_count) console.log(`Unknown:       ${report.unknown_count} check(s) did not finish within the budget; the scores count only the checks that finished.`);
   if (brainScoreLine) console.log(brainScoreLine);
+  if (report.tier) console.log(`Tier: ${report.tier}, ${report.complete ? 'complete' : `incomplete (${[report.unknown_sections!.length ? `unknown: ${report.unknown_sections!.join(', ')}` : '', report.last_known_sections?.length ? `${report.last_known_sections.length} from last known results` : ''].filter(Boolean).join('; ')})`}, ${report.elapsed_ms} ms${report.budget_ms ? ` of ${report.budget_ms} ms` : ''}`);
   console.log('');
 
   if (hasFail) {

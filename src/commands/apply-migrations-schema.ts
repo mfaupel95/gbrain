@@ -22,7 +22,10 @@ import type { BrainEngine } from '../core/engine.ts';
 import type { Action } from '../core/agent-output.ts';
 import { opError, type OperationError } from '../core/ops/contract.ts';
 import { PgliteBusyError } from '../core/pglite-lock.ts';
+import { connectMigrationEngine } from './migrations/run-engine.ts';
 import { DB_ACCESS_MARKER_PREFIX, shouldEmitDbAccessMarker } from '../core/pg-access-classify.ts';
+import { readMigrationTimeout, type MigrationTimeoutRecord } from '../core/migration-timeout.ts';
+import { migrationTimeoutAdvice } from '../core/migration-timeout-advice.ts';
 
 export type SchemaPendingReason = 'not_applied' | 'still_behind' | 'schema_unreadable';
 
@@ -35,6 +38,8 @@ export interface SchemaPending {
   pending: number[];
   /** Redacted read error (`schema_unreadable` only). */
   read_error?: string;
+  /** #7108: the pending migration that last ran out of its statement budget (`still_behind` only). */
+  timeout?: MigrationTimeoutRecord;
 }
 
 /** Connect the configured brain and read its schema version. The caller disconnects; a failed read disconnects here. */
@@ -65,8 +70,8 @@ async function pendingAbove(version: number | null): Promise<{ latest: number; p
 }
 
 /** The pre-flight's finding when it saw the schema behind and did not bring it to head. */
-export async function schemaBehindAtPreflight(version: number, authorized: boolean): Promise<SchemaPending> {
-  return { reason: authorized ? 'still_behind' : 'not_applied', current: version, ...(await pendingAbove(version)) };
+export async function schemaBehindAtPreflight(version: number, authorized: boolean, timeout?: MigrationTimeoutRecord): Promise<SchemaPending> {
+  return { reason: authorized ? 'still_behind' : 'not_applied', current: version, ...(await pendingAbove(version)), ...(authorized && timeout ? { timeout } : {}) };
 }
 
 /**
@@ -87,22 +92,25 @@ export async function checkSchemaAfterOrchestrators(opts: {
   if (pglite ? !cfg.database_path || !existsSync(cfg.database_path) : opts.preflightVersion === null) return null;
   let lastRead = opts.preflightVersion;
   try {
-    const { engine, version } = await connectAtSchemaVersion(cfg);
-    let current = version;
+    const { engine, close } = await connectMigrationEngine(cfg);
+    let current: number;
+    let timeout: MigrationTimeoutRecord | null = null;
     try {
+      current = parseInt(await engine.getConfig('version') || '1', 10);
       const { latest } = await pendingAbove(current);
       if (pglite && authorized && current < latest) {
         console.error(`Schema v${current} is behind v${latest}; applying schema migrations in-process...`);
         try { await opts.apply(engine, current); } catch (err) { console.error(`Schema migration failed: ${await redactDbError(err)}`); }
         current = parseInt(await engine.getConfig('version') || '1', 10);
       }
+      if (authorized && current < latest) timeout = await readMigrationTimeout(engine, current);
     } finally {
-      await engine.disconnect();
+      await close();
     }
     lastRead = current;
     const { latest, pending } = await pendingAbove(current);
     if (current >= latest) return null;
-    return { reason: authorized ? 'still_behind' : 'not_applied', current, latest, pending };
+    return { reason: authorized ? 'still_behind' : 'not_applied', current, latest, pending, ...(timeout ? { timeout } : {}) };
   } catch (err) {
     if (err instanceof PgliteBusyError) throw err;
     // A PGLite datastore without the config table was never initialized: `gbrain init` creates a brain, not this run.
@@ -130,6 +138,13 @@ export function schemaPendingError(p: SchemaPending, rerunWithYes: Action): Oper
     return opError('migrations_pending', `Schema migrations are behind (${where}); this run did not apply them.`,
       'Apply them with `gbrain apply-migrations --yes` (or `--force-schema`).',
       { reason: p.reason, fix: rerunWithYes });
+  }
+  if (p.reason === 'still_behind' && p.timeout) {
+    const advice = migrationTimeoutAdvice(p.timeout, { argv: ['gbrain', 'doctor', '--only', 'schema_version', '--json'] });
+    return opError('migrations_pending', `Schema migrations are still behind after an authorized run (${where}). ${advice.message}`,
+      advice.fix.user_message ?? advice.fix.why,
+      { reason: p.reason, why: 'A schema migration ran out of its statement budget, so the run stopped below it; what helps depends on the release that ran it and on whether a session was blocking it.',
+        fix: advice.fix });
   }
   if (p.reason === 'still_behind') {
     return opError('migrations_pending', `Schema migrations are still behind after an authorized run (${where}); the schema migration did not apply, and running --yes again repeats that.`,

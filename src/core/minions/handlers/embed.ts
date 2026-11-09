@@ -62,6 +62,7 @@ export function makeEmbedHandler(engine: BrainEngine): MinionHandler {
       dry_run: !!embedResult.dryRun,
       would_embed: embedResult.would_embed,
       failures: embedResult.failures,
+      ...(embedResult.content_drift && { content_drift: embedResult.content_drift }),
     };
   };
 }

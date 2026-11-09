@@ -1,6 +1,6 @@
 /**
  * `gbrain trust`: the memory-trust noun (#5575, DX-7). This module dispatches
- * `backfill` (A8, DX-5), `scan` (DX-6) and `claim-sources` (legacy content, trust/claim.ts),
+ * `backfill` (A8, DX-5; `--repair-unknown-markers`, #6550 trust/marker-repair.ts), `scan` (DX-6) and `claim-sources` (legacy content, trust/claim.ts),
  * and hands the owner subcommands (review, confirm,
  * release, drop, revert, explain, allow, disable) to src/commands/trust.ts.
  * The record is startup: 'observational', so `backfill --dry-run` and `claim-sources --dry-run` run on a
@@ -23,6 +23,13 @@ export const TRUST_BACKFILL_USAGE = [
   '  the journaled request that wrote the row. Rows with no signal stay "unverified origin"; nothing becomes',
   '  "confirmed by you". --dry-run is read-only (no migrations, no writes) and works before the trust migration;',
   '  it reports the projected count per table and tier. --resume continues an interrupted run.',
+  '',
+  'Usage: gbrain trust backfill --repair-unknown-markers [--source ID] [--slug SLUG ... --expect HASH] [--json]',
+  '  Lists pages whose trust_tier frontmatter marker is "unknown" while their stored tier is higher (an agent edit',
+  '  before v0.60.249.0 stamped it), with the evidence for each, and ends with the exact apply command. Nothing is',
+  '  classified for you: apply rewrites only the pages you name with --slug (repeatable), at the revisions of the',
+  '  preview whose hash you pass to --expect. The marker becomes the stored tier (none at owner tiers); the tier',
+  '  stays. Local CLI only. Docs: docs/guides/memory-trust.md#repair-unknown-markers',
   '',
   'Usage: gbrain trust scan [--batch-size N] [--json]',
   '  Runs the write gate\'s deterministic detector over agent-written and lower rows written before the gate,',
@@ -49,6 +56,32 @@ function render(report: TrustBackfillReport): string {
 async function refuse(args: string[], message: string, suggestion: string): Promise<void> {
   const { opError } = await import('../../core/ops/contract.ts');
   await reportTrustCliError(opError('invalid_params', message, suggestion), jsonRequested(args));
+}
+
+/** `trust backfill --repair-unknown-markers` (#6550): preview by default; `--slug ... --expect HASH` applies. */
+async function runMarkerRepair(engine: BrainEngine, rest: string[], args: string[]): Promise<void> {
+  const value = (flag: string) => { const at = rest.indexOf(flag); return at >= 0 ? rest[at + 1] : undefined; };
+  const slugs = rest.flatMap((arg, i) => arg === '--slug' && rest[i + 1] && !rest[i + 1]!.startsWith('--') ? [rest[i + 1]!] : []);
+  const expect = value('--expect');
+  const sourceId = value('--source') ?? null;
+  if ((slugs.length > 0) !== (expect !== undefined) || (expect !== undefined && (!expect || expect.startsWith('--')))) {
+    await refuse(args, 'Applying the marker repair needs both the pages (--slug, repeatable) and the preview hash (--expect).',
+      'Run gbrain trust backfill --repair-unknown-markers to preview, then run the command it prints after "Apply with:", naming only the pages you judge accidental.');
+    return;
+  }
+  const { applyMarkerRepair, previewMarkerRepair, renderMarkerRepairPreview } = await import('../../core/trust/marker-repair.ts');
+  try {
+    const result = expect !== undefined && !rest.includes('--dry-run')
+      ? await applyMarkerRepair(engine, { slugs, expect, sourceId })
+      : await previewMarkerRepair(engine, { sourceId });
+    if (jsonRequested(args)) await writeStdoutFinal(`${JSON.stringify(result, null, 2)}\n`);
+    else if (result.mode === 'preview') console.log(renderMarkerRepairPreview(result));
+    else console.log([...result.repaired.map(r => `Repaired ${r.page}: marker unknown -> ${r.marker_after ?? 'removed'} (tier stays ${r.tier}).`),
+      `Verify with: ${result.verify.join(' ')}`].join('\n'));
+  } catch (error) {
+    if (await reportTrustCliError(error, jsonRequested(args))) return;
+    throw error;
+  }
 }
 
 export async function run(engine: BrainEngine, args: string[], ctx: CliDispatchContext): Promise<void> {
@@ -96,6 +129,11 @@ export async function run(engine: BrainEngine, args: string[], ctx: CliDispatchC
     else console.log([`Trust scan (detector v${scan.detector_version}):`,
       ...scan.tables.map(t => `  ${t.table}: ${t.scanned} row(s) scanned, ${t.flagged} flagged${t.done ? '' : ' (more to scan)'}`),
       scan.complete ? '  Complete. Flagged rows carry their flag wherever they are read (and stay out of proactive context under trust.agent_activation suppress) until confirmed (gbrain trust review).' : `  Continue with: ${scan.resume_command}`].join('\n'));
+    return;
+  }
+  if (rest.includes('--repair-unknown-markers')) {
+    await ctx.completeStartup?.(engine);
+    await runMarkerRepair(engine, rest, args);
     return;
   }
   if (!dryRun) await ctx.completeStartup?.(engine);

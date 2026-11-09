@@ -36,6 +36,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { ownConsumerForcedReason, resetOwnConsumerForTest } from '../src/core/persistence/consumer-election.ts';
 import { registerLocalWriter, revokeLocalWriter } from '../src/core/persistence/identity.ts';
 import { startResolveIpcServer, type IpcHandlers } from '../src/core/context/resolve-ipc.ts';
 import { localIpcSocketPath } from '../src/core/context/ipc-path.ts';
@@ -46,6 +47,7 @@ import {
   startDelegatedSync,
 } from '../src/core/serve-sync-runner.ts';
 import { maybeDelegateManagedSyncToServe, type ManagedDelegationDeps } from '../src/commands/sync-delegate.ts';
+import { implyManagedNoPull } from '../src/commands/sync/managed-no-pull.ts';
 import type { ConsumerRow } from '../src/core/persistence/consumer-heartbeat.ts';
 import type { SyncOpts } from '../src/commands/sync.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -205,7 +207,7 @@ describe('sync_start authorization hand-off (serve half)', () => {
   test('a verified cli registration runs the managed drain inside the serve; sync_status carries its lines, the DrainReport and next', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const f = await fixture(4);
     const local = await registerLocalWriter(engine, 'cli');
-    const start = await startDelegatedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, explicitProcessing: ['noEmbed'], timeoutSeconds: 120 }, randomUUID(),
+    const start = await startDelegatedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, timeoutSeconds: 120 }, randomUUID(),
       { registration: { id: local.id, credential: local.credential, lane: 'cli' } });
     expect(start.ok).toBe(true);
     const done = await waitTerminal(start.jobId!);
@@ -225,16 +227,33 @@ describe('sync_start authorization hand-off (serve half)', () => {
       'SELECT principal_id, count(*)::int AS n FROM persistence_requests WHERE source_id=$1 GROUP BY principal_id', [f.id]);
     expect(rows.map(r => r.principal_id)).toEqual([local.id]);
   }), 180_000);
+
+  test('#6712: an older CLI\'s retired field is dropped and its notice reaches that CLI as the first job line', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    const local = await registerLocalWriter(engine, 'cli');
+    const start = await startDelegatedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, explicitProcessing: ['noEmbed'], timeoutSeconds: 120 }, randomUUID(),
+      { registration: { id: local.id, credential: local.credential, lane: 'cli' } });
+    expect(start.ok).toBe(true);
+    const done = await waitTerminal(start.jobId!);
+    expect(done.state).toBe('done');
+    const first = done.lines?.[0]?.text ?? '';
+    expect(first).toStartWith('[gbrain notice]');
+    expect(first).toContain('`explicitProcessing`');
+  }), 180_000);
 });
 
 describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', () => {
-  const baseOpts = (sourceId: string): SyncOpts => ({ sourceId, noPull: true, noEmbed: true, explicitProcessing: ['noEmbed'], drain: true });
+  const baseOpts = (sourceId: string): SyncOpts => ({ sourceId, noPull: true, noEmbed: true, drain: true });
 
   test('--no-delegate and GBRAIN_SYNC_NO_DELEGATE=1 bypass the ladder before anything is probed', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const f = await fixture(1);
     let probed = 0;
     const d = { ...deps({}), probe: async () => { probed++; return serveRow(); } };
+    resetOwnConsumerForTest();
     expect(await maybeDelegateManagedSyncToServe(engine, ['--no-delegate', '--repo', '/x'], baseOpts(f.id), d)).toEqual({ kind: 'own_consumer', reason: 'opted_out', line: null });
+    // #6543: the opt-out makes this process a full consumer even under persistence.single_consumer.
+    expect(ownConsumerForcedReason()).toBe('opted_out');
+    resetOwnConsumerForTest();
     expect(await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), { ...d, env: { GBRAIN_SYNC_NO_DELEGATE: '1' } })).toEqual({ kind: 'own_consumer', reason: 'opted_out', line: null });
     expect(probed).toBe(0);
   }), 120_000);
@@ -252,37 +271,101 @@ describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', (
 
   test('an unsupported flag, the kill switch and a missing socket each fall back with one actionable line, never a refusal', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const f = await fixture(1);
+    resetOwnConsumerForTest();
     captureStderr();
     const flag = await maybeDelegateManagedSyncToServe(engine, ['--exclude', 'x'], baseOpts(f.id), deps({ sock: await serveSocket() }));
     const kill = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), { ...deps({ sock: await serveSocket() }), env: { GBRAIN_SERVE_SYNC_IPC: '0' } });
     const noSock = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: null }));
     releaseStderr();
     expect(flag).toMatchObject({ kind: 'own_consumer', reason: 'unsupported_flag' });
-    expect(flag.kind === 'own_consumer' && flag.line).toMatch(/`--exclude` isn't supported through serve-delegated sync; this run uses its own consumer beside the serve \(PID 4242\)/);
+    expect(flag.kind === 'own_consumer' && flag.line).toMatch(/`--exclude` isn't supported through serve-delegated sync; this run does not delegate to the serve \(PID 4242\): it admits its own writes, and with persistence.single_consumer on the serve's consumer publishes them/);
     expect(kill).toMatchObject({ kind: 'own_consumer', reason: 'kill_switch' });
-    expect(kill.kind === 'own_consumer' && kill.line).toMatch(/GBRAIN_SERVE_SYNC_IPC=0.*own consumer beside the serve \(PID 4242\)/);
+    expect(kill.kind === 'own_consumer' && kill.line).toMatch(/GBRAIN_SERVE_SYNC_IPC=0.*does not delegate to the serve \(PID 4242\)/);
+    expect(kill.kind === 'own_consumer' && kill.line).not.toContain('own consumer beside');
     expect(noSock).toMatchObject({ kind: 'own_consumer', reason: 'no_socket' });
     expect(noSock.kind === 'own_consumer' && noSock.line).toMatch(/exposes no sync IPC socket.*Restart that serve on this gbrain version/);
     expect(captured).toHaveLength(3);
+    // #6543: none of these rungs forces this process's own consumer beside the serve.
+    expect(ownConsumerForcedReason()).toBeNull();
   }), 120_000);
 
-  test('skew (T1c): an older serve answering unknown_kind, a stale serve without the protocol echo, and unsupported_kind each fall back with one line', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  test('#7167: a dry run that is not delegated says it previews in this process and writes nothing, and never forces a consumer of its own', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const f = await fixture(1);
-    // An older base server has no sync handlers at all: `unknown_kind:sync_start` without a protocol echo → stale_serve on the client.
-    const older = await serveSocket({ sync_start: undefined, sync_status: undefined, sync_abort: undefined });
-    // A serve of this family with the kinds disabled (GBRAIN_SERVE_SYNC_IPC=0 on the serve) → `unsupported_kind` with the echo.
-    const disabled = await serveSocket({ sync_start: () => ({ ok: false, protocol: 2, error: 'unsupported_kind' }) });
+    const dead = join(home, `dead-${randomUUID().slice(0, 8)}.sock`);
+    writeFileSync(dead, '');
+    resetOwnConsumerForTest();
     captureStderr();
-    const stale = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: older }));
-    const unsupported = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: disabled }));
+    const dry = { ...baseOpts(f.id), dryRun: true };
+    const noSock = await maybeDelegateManagedSyncToServe(engine, ['--dry-run'], dry, deps({ sock: null }));
+    const silent = await maybeDelegateManagedSyncToServe(engine, ['--dry-run'], dry, deps({ sock: dead }));
+    releaseStderr();
+    for (const outcome of [noSock, silent]) {
+      expect(outcome).toMatchObject({ kind: 'own_consumer', reason: 'no_socket' });
+      const line = outcome.kind === 'own_consumer' ? outcome.line ?? '' : '';
+      expect(line).toMatch(/; this dry run previews in this process instead of the serve \(PID 4242\) and writes nothing\.$/);
+      expect(line).not.toMatch(/admits|own consumer/);
+    }
+    expect(captured).toHaveLength(2);
+    expect(ownConsumerForcedReason()).toBeNull();
+  }), 120_000);
+
+  test('#6543: a serve whose IPC socket does not answer cannot take the run, so this process consumes itself (forced past single_consumer)', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    const dead = join(home, `dead-${randomUUID().slice(0, 8)}.sock`);
+    writeFileSync(dead, '');
+    resetOwnConsumerForTest();
+    captureStderr();
+    const silent = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: dead }));
+    releaseStderr();
+    expect(silent).toMatchObject({ kind: 'own_consumer', reason: 'no_socket' });
+    expect(silent.kind === 'own_consumer' && silent.line).toMatch(/not answering its IPC socket/);
+    expect(ownConsumerForcedReason()).toBe('no_socket');
+    resetOwnConsumerForTest();
+  }), 120_000);
+
+  test('skew (T1c): a stale serve without the protocol echo forces this process\'s own consumer; a current serve answering unsupported_kind (kinds absent or disabled) falls back without forcing', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    // A pre-delegation serve answers `unknown_kind:sync_start` without a protocol echo → stale_serve (degraded) on the client.
+    const legacy = await serveSocket({ sync_start: (() => ({ ok: false, error: 'unknown_kind:sync_start' })) as unknown as IpcHandlers['sync_start'] });
+    // A serve of this family without the sync kinds, or with them disabled (GBRAIN_SERVE_SYNC_IPC=0 on the serve) → `unsupported_kind` with the echo.
+    const absent = await serveSocket({ sync_start: undefined, sync_status: undefined, sync_abort: undefined });
+    const disabled = await serveSocket({ sync_start: () => ({ ok: false, protocol: 2, error: 'unsupported_kind' }) });
+    resetOwnConsumerForTest();
+    captureStderr();
+    const stale = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: legacy }));
     releaseStderr();
     expect(stale).toMatchObject({ kind: 'own_consumer', reason: 'older_serve' });
     expect(stale.kind === 'own_consumer' && stale.line).toMatch(/predates serve-delegated managed sync.*own consumer beside the serve \(PID 4242\).*Restart that serve/);
-    expect(unsupported).toMatchObject({ kind: 'own_consumer', reason: 'older_serve' });
+    // #6543: the stale serve cannot take the run, so this process consumes itself.
+    expect(ownConsumerForcedReason()).toBe('older_serve');
+    resetOwnConsumerForTest();
+    captureStderr();
+    const withoutKinds = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: absent }));
+    const unsupported = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: disabled }));
+    releaseStderr();
+    for (const outcome of [withoutKinds, unsupported]) {
+      expect(outcome).toMatchObject({ kind: 'own_consumer', reason: 'older_serve' });
+      expect(outcome.kind === 'own_consumer' && outcome.line).toMatch(/runs with serve-delegated managed sync off.*does not delegate to the serve \(PID 4242\)/);
+    }
     expect(captured).toHaveLength(2);
+    // #6543: a healthy current serve with delegation off keeps consuming, so neither fallback forces a second consumer.
+    expect(ownConsumerForcedReason()).toBeNull();
     // Nothing was admitted by the serve: the source's cursor is untouched.
     const [{ n }] = await engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1', [f.id]);
     expect(n).toBe(0);
+  }), 120_000);
+
+  test('#6696 (A5): the CLI sends origin interactive in the delegation payload', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    const origins: unknown[] = [];
+    captureStderr();
+    const result = await maybeDelegateManagedSyncToServe(engine, [], baseOpts(f.id), deps({ sock: await serveSocket({ sync_start: (req) => {
+      origins.push((req.options as { origin?: unknown }).origin);
+      return { ok: false, protocol: 2 as const, error: 'busy' };
+    } }) }));
+    releaseStderr();
+    expect(origins).toEqual(['interactive']);
+    expect(result).toMatchObject({ kind: 'own_consumer', reason: 'serve_refused' });
   }), 120_000);
 
   test('a wrong IPC secret (unauthorized) falls back; the serve bound to another source (source_mismatch) falls back', async () => withEnv({ GBRAIN_HOME: home }, async () => {
@@ -331,19 +414,35 @@ describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', (
     const f = await fixture(5);
     const sock = await serveSocket();
     captureStderr();
-    const outcome = await maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--no-pull', '--json'], { ...baseOpts(f.id), noEmbed: undefined, explicitProcessing: [] }, deps({ sock }));
+    const outcome = await maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--no-pull', '--json'], { ...baseOpts(f.id), noEmbed: undefined }, deps({ sock }));
     releaseStderr();
     expect(outcome.kind).toBe('delegated');
     if (outcome.kind !== 'delegated') throw new Error('unreachable');
     expect(outcome.pid).toBe(4242);
     expect(outcome.result).toMatchObject({ status: 'first_sync', added: 5, pagesAffected: expect.any(Array) });
     expect(outcome.result.drain).toMatchObject({ outcome: 'synced', written: 5, remaining: 0 });
-    expect(outcome.result.managedCursor).toMatchObject({ index: 5, total: 5 });
+    // #6712 PR 4b: the serve drains a live pass (no cursor); its summary rides the SyncResult back.
+    expect(outcome.result.pass).toMatchObject({ outcome: 'synced', stop_reason: null, candidates: 5, settled: 5, remaining: 0 });
+    expect(outcome.result.managedCursor).toBeUndefined();
     expect(captured.some(l => l.includes('running the managed catch-up inside it as this CLI\'s writer'))).toBe(true);
     expect(captured.some(l => l.startsWith('[sync] managed catch-up: 5 entries frozen'))).toBe(true);
     // Every request the drain admitted carries this CLI's registration, so the in-process grant and revocation checks applied.
     const local = await registerLocalWriter(engine, 'cli');
     const rows = await engine.executeRaw<{ principal_id: string }>('SELECT DISTINCT principal_id FROM persistence_requests WHERE source_id=$1', [f.id]);
     expect(rows.map(r => r.principal_id)).toEqual([local.id]);
+  }), 180_000);
+
+  test('#6543 C1: `gbrain sync --source <id>` without --no-pull on a managed brain delegates with --no-pull implied and the serve drains it', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(2);
+    const sock = await serveSocket();
+    const flags = { noPull: false, dryRun: false };
+    captureStderr();
+    await implyManagedNoPull(engine, flags, f.id);
+    const outcome = await maybeDelegateManagedSyncToServe(engine, ['--source', f.id, '--json'], { ...baseOpts(f.id), noPull: flags.noPull, noEmbed: undefined }, deps({ sock }));
+    releaseStderr();
+    expect(captured.some(l => l.includes('--no-pull is implied') && l.includes(`gbrain sources refresh ${f.id}`))).toBe(true);
+    expect(outcome.kind).toBe('delegated');
+    if (outcome.kind !== 'delegated') throw new Error('unreachable');
+    expect(outcome.result).toMatchObject({ status: 'first_sync', added: 2 });
   }), 180_000);
 });

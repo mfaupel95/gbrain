@@ -145,6 +145,8 @@ export async function buildHotCheckFixture(h: DoctorHome, sql: Sql): Promise<{ s
   git(src, 'commit', '-q', '-m', 'broken files');
   const utcDay = () => new Date().toISOString().slice(0, 10);
   const before = utcDay();
+  // The fixture keeps fm/slug-mismatch.md held for the frontmatter findings, so the sync-time stray slug: line heal (#6865) is off (written directly: a CLI call would add to the doctor disconnect-call audit).
+  await sql([['INSERT INTO config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', ['sync.slug_conflicts.auto_remove', 'false']]]);
   await runGbrain(h, ['sync', '--source', 'notes', '--no-pull', '--no-embed']);
   const syncDays: [string, string] = [before, utcDay()];
   // After the sync (a full catch-up re-imports changed pages): database-only timeline rows, one materializable and one that cannot round-trip (comment markup).
@@ -184,6 +186,47 @@ export function stampSyncDay(report: unknown, stamped: string, syncDays: readonl
     for (const trend of check.details?.trend ?? []) for (const entry of trend.by_day ?? []) {
       if (entry.day !== stamped) throw new Error(`fence_integrity trend day ${entry.day} is not the day the fixture sync stamped (${stamped})`);
       entry.day = SYNC_DAY;
+    }
+  }
+  return copy;
+}
+
+export const FIXTURE_HEAD = '<fixture-head>';
+
+/**
+ * The fixture pins its commits' dates and identity, but a host's git can still rewrite the identity or append a
+ * trailer, so the commit id differs between machines. Doctor `sync_rows_behind_checkpoint` reports the source's
+ * checkpoint, which is that commit: this replaces exactly that field, and only after checking that each non-null
+ * `details.sources[].checkpoint` equals the fixture checkout's HEAD.
+ */
+export function stampFixtureHead(report: unknown, h: DoctorHome): unknown {
+  const head = execFileSync('git', ['-C', join(h.home, 'notes-src'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const copy = structuredClone(report) as { checks?: Array<{ name: string; details?: { sources?: Array<{ checkpoint: string | null }> } }> };
+  for (const check of copy.checks ?? []) {
+    if (check.name !== 'sync_rows_behind_checkpoint') continue;
+    for (const source of check.details?.sources ?? []) {
+      if (source.checkpoint === null) continue;
+      if (source.checkpoint !== head) throw new Error(`sync_rows_behind_checkpoint checkpoint ${source.checkpoint} is not the fixture checkout's HEAD (${head})`);
+      source.checkpoint = FIXTURE_HEAD;
+    }
+  }
+  return copy;
+}
+
+export const SOAK_DAY = '<soak-day>';
+
+/**
+ * The soak counters are stamped on the real clock too (one `op_checkpoints` row per UTC day the fixture recorded an
+ * intervention), so doctor `sync_soak_counters.details.by_day[].day` is that day. This replaces exactly that field, and
+ * only after checking each entry is a day a soak row was recorded for (`recorded`, read back from the database).
+ */
+export function stampSoakDays(report: unknown, recorded: readonly string[]): unknown {
+  const copy = structuredClone(report) as { checks?: Array<{ name: string; details?: { by_day?: Array<{ day: string }> } }> };
+  for (const check of copy.checks ?? []) {
+    if (check.name !== 'sync_soak_counters') continue;
+    for (const entry of check.details?.by_day ?? []) {
+      if (!recorded.includes(entry.day)) throw new Error(`sync_soak_counters day ${entry.day} is not a day the fixture recorded soak counters (${recorded.join(', ') || 'none'})`);
+      entry.day = SOAK_DAY;
     }
   }
   return copy;

@@ -23,14 +23,15 @@
  * is done, the incremental pass caught up and the walk finished; anything
  * less is `partial`, and a partial census never reads as healthy.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { screenFenceCtx } from '../import-screen.ts';
 import { collectGitVisibleFiles, knownOutsideGitRepo, noteGitFailure } from '../git-visible-files.ts';
-import { isFrontmatterScannablePath, walkDir } from '../brain-writer.ts';
+import { frontmatterScannableUnder, walkDir } from '../brain-writer.ts';
+import { readMetafilePagesMode, type MetafilePagesMode } from '../sync.ts';
 import { sha256 } from '../persistence/digest.ts';
 import { readGitSourceHolds, type GitHoldRecord } from '../persistence/sync-holds.ts';
 import { FENCE_RULES_VERSION } from './normalize.ts';
@@ -42,8 +43,9 @@ import {
   type CandidateFinding, type CandidateLocation, type CandidateRecord, type FileFinding, type PageFinding, type ScanRecord,
 } from './census-store.ts';
 import type { FenceCtx, FencePage, FenceReason, FenceTier } from './types.ts';
+import { gitChildEnv } from '../git-env.ts';
 
-type Exec = Pick<BrainEngine, 'executeRaw'>;
+type Exec = Pick<BrainEngine, 'executeRaw' | 'getConfig'>;
 
 export const FENCE_TIERS: readonly FenceTier[] = ['deterministic', 'resolver', 'llm', 'manual'];
 /** The fence rules a stored finding was judged with; a change restarts the scans. */
@@ -93,7 +95,7 @@ async function censusSources(engine: Exec, sourceIds?: readonly string[]): Promi
     WHERE archived IS NOT TRUE AND incarnation IS NOT NULL AND ($1::text[] IS NULL OR id=ANY($1::text[])) ORDER BY id`, [sourceIds ? [...sourceIds] : null]);
 }
 
-const hasCheckout = (source: CensusSource) => !!source.local_path && existsSync(source.local_path) && statSync(source.local_path).isDirectory();
+const hasCheckout = (source: CensusSource) => !!source.local_path && isAbsolute(source.local_path) && existsSync(source.local_path) && statSync(source.local_path).isDirectory();
 
 /** Where the next incremental pass starts: this moment, or the start of the oldest writer transaction still open, minus the grace. */
 async function passHorizon(engine: Exec, graceMs: number): Promise<string> {
@@ -174,7 +176,7 @@ async function scanPages(engine: Exec, source: CensusSource, progress: ScanProgr
 function git(root: string, args: string[]): string | null {
   if (knownOutsideGitRepo(root)) return null;
   try {
-    return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    return execFileSync('git', ['-C', root, ...args], { env: gitChildEnv(), encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (error) {
     noteGitFailure(root, error);
     return null;
@@ -185,11 +187,12 @@ const gitHead = (root: string) => git(root, ['rev-parse', '--verify', '-q', 'HEA
 const nulList = (out: string) => out.split('\0').filter(Boolean).map(path => path.replace(/\\/g, '/'));
 
 /** Every file the walk judges, source-root relative and sorted (Git-visible files in a checkout, else a pruned walk). */
-function eligibleFiles(root: string): string[] {
-  const git = collectGitVisibleFiles(root, isFrontmatterScannablePath);
+function eligibleFiles(root: string, mode: MetafilePagesMode): string[] {
+  const scannable = frontmatterScannableUnder(root, mode);
+  const git = collectGitVisibleFiles(root, scannable);
   const absolute: string[] = git ?? [];
   if (!git) walkDir(root, path => { absolute.push(path); });
-  return [...new Set(absolute.map(path => relative(root, path).replace(/\\/g, '/')).filter(isFrontmatterScannablePath))].sort();
+  return [...new Set(absolute.map(path => relative(root, path).replace(/\\/g, '/')).filter(scannable))].sort();
 }
 
 const mtimeMs = (path: string): number | null => { try { return lstatSync(path).mtimeMs; } catch { return null; } };
@@ -200,7 +203,7 @@ const mtimeMs = (path: string): number | null => { try { return lstatSync(path).
  * (mtime for non-Git sources), and every stored file candidate. Null when
  * the walked commit is gone, so the caller walks everything again.
  */
-function changedFiles(root: string, walked: NonNullable<ScanRecord['files']>['walked'] & object, stored: readonly string[]): string[] | null {
+function changedFiles(root: string, walked: NonNullable<ScanRecord['files']>['walked'] & object, stored: readonly string[], mode: MetafilePagesMode): string[] | null {
   const since = Date.parse(walked.at) - MTIME_SKEW_MS;
   const fresh = (rel: string) => (mtimeMs(join(root, rel)) ?? Infinity) >= since;
   let paths: string[];
@@ -210,9 +213,9 @@ function changedFiles(root: string, walked: NonNullable<ScanRecord['files']>['wa
     const untracked = git(root, ['ls-files', '--others', '--exclude-standard', '-z']) ?? '';
     paths = [...nulList(diff), ...nulList(untracked).filter(fresh)];
   } else {
-    paths = eligibleFiles(root).filter(fresh);
+    paths = eligibleFiles(root, mode).filter(fresh);
   }
-  return [...new Set([...paths, ...stored])].filter(isFrontmatterScannablePath).sort();
+  return [...new Set([...paths, ...stored])].filter(frontmatterScannableUnder(root, mode)).sort();
 }
 
 /** Judges one working-tree file: its page slug and finding, or null when it is clean or unreadable (gone). */
@@ -237,11 +240,12 @@ function judgeFile(root: string, rel: string, at: string): { key: string | null;
 async function scanFiles(engine: Exec, source: CensusSource, progress: ScanProgress, stored: Map<string, string>, opts: { deadline: number; now: () => Date }): Promise<boolean> {
   const root = resolve(source.local_path!);
   const files = progress.record.files ??= { pass: null, walked: null };
-  const changed = files.walked && files.pass?.mode !== 'full' ? changedFiles(root, files.walked, [...stored.keys()]) : null;
+  const metafilePages = await readMetafilePagesMode(engine);
+  const changed = files.walked && files.pass?.mode !== 'full' ? changedFiles(root, files.walked, [...stored.keys()], metafilePages) : null;
   files.pass ??= { mode: changed ? 'changed' : 'full', after: null, started_at: opts.now().toISOString(), commit: gitHead(root) };
   const pass = files.pass;
   if (pass.mode === 'changed' && !changed) pass.mode = 'full';
-  const list = pass.mode === 'changed' ? changed! : eligibleFiles(root);
+  const list = pass.mode === 'changed' ? changed! : eligibleFiles(root, metafilePages);
   const ids = { sourceId: source.id, incarnation: source.incarnation };
   let since = 0;
   for (const rel of list) {

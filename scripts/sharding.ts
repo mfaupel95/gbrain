@@ -24,6 +24,15 @@
  *     Uses lane-specific weights. --fallback-on-error warns and uses uniform
  *     weights if the advisory file is malformed (serial runner compatibility).
  *
+ *   bun run scripts/sharding.ts --sum [--weights <path>]
+ *     Read-only diagnostic: reads an already-partitioned file list from
+ *     stdin and prints its predicted weight (the same per-file weights and
+ *     p75 fallback `partition` uses) as one line, e.g.
+ *     `predicted 412.3s over 401 files (37 unweighted at p75 1.2s)`.
+ *     test-shard.sh prints it beside its "(LPT-balanced)" line so a shard
+ *     whose measured time is far above the prediction points at the runner
+ *     or a process-wide slowdown, not at the partition.
+ *
  * Exit codes:
  *   0   success
  *   1   internal error (e.g., malformed weights JSON)
@@ -32,15 +41,53 @@
  * Used by: scripts/test-shard.sh (thin wrapper), test/scripts/sharding.test.ts.
  */
 
+import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
 const DEFAULT_WEIGHTS_PATH = resolve(REPO_ROOT, "scripts/test-weights.json");
 
+/**
+ * test.yml's unit matrix size, also e2e.yml's coverage-full-unit matrix;
+ * test/scripts/unit-shard-budget.test.ts pins both workflows to it.
+ */
+export const UNIT_SHARDS = 28;
+/** Unit shards each test.yml `test` job runs at once (scripts/test-shard-pack.sh); test/scripts/ci-gates.test.ts pins the matrix to it. */
+export const UNIT_SHARDS_PER_JOB = 2;
+/** test.yml's `test` job `timeout-minutes: 22`: the only bound on a unit shard, its setup steps included. */
+export const UNIT_JOB_TIMEOUT_MS = 22 * 60 * 1000;
+/** The job's steps before the shard (checkout, Bun, cache restores, install): 10-20 s measured on a warm cache. */
+export const UNIT_SETUP_ALLOWANCE_MS = 60 * 1000;
+/**
+ * A unit shard's mined weight may be at most this: on a runner twice as slow
+ * as the mined weights (master shards ran 0.8-1.4x their prediction, and one
+ * cancelled at the timeout) it still ends a minute inside the job timeout
+ * after setup.
+ */
+export const UNIT_SHARD_BUDGET_MS = (UNIT_JOB_TIMEOUT_MS - UNIT_SETUP_ALLOWANCE_MS - 60_000) / 2;
+
+/** Each unit shard's files as test.yml runs them: scripts/test-shard.sh's own discovery and partition. */
+export function unitShards(root: string, n: number = UNIT_SHARDS): string[][] {
+  return Array.from({ length: n }, (_, i) => {
+    const r = spawnSync("bash", [join(root, "scripts/test-shard.sh"), "--dry-run-list", String(i + 1), String(n)], { cwd: root, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`scripts/test-shard.sh --dry-run-list ${i + 1} ${n} ${r.signal ? `killed by ${r.signal}` : "failed"}: ${r.stderr}`);
+    return r.stdout.split("\n").filter(Boolean);
+  });
+}
+
 export type WeightMap = Map<string, number>;
+
+/**
+ * test.yml's unit partition with each shard's mined weight (`root`'s scripts/test-weights.json): the plan
+ * test/scripts/unit-shard-budget.test.ts and the ci:ubicloud gate both hold to UNIT_SHARD_BUDGET_MS.
+ */
+export function unitShardPlan(root: string): { shard: number; files: string[]; ms: number }[] {
+  const weights = loadWeights(join(root, "scripts/test-weights.json"));
+  return unitShards(root).map((files, i) => ({ shard: i + 1, files, ms: Math.round(predictedWeight(files, weights).totalMs) }));
+}
 
 export class WeightsLoadError extends Error {
   constructor(public readonly path: string, public readonly cause: unknown) {
@@ -218,6 +265,32 @@ export function imbalanceRatio(shards: string[][], weights: WeightMap, fallback:
   return max / min;
 }
 
+/**
+ * Predicted weight of an already-partitioned file list: the sum of each
+ * file's mined weight, with the same p75 fallback `partition` assigns to
+ * files absent from the map. Read-only over the weights.
+ */
+export function predictedWeight(
+  files: string[],
+  weights: WeightMap,
+): { totalMs: number; files: number; unweighted: number; fallbackMs: number } {
+  let fallbackMs = computeQuantile(Array.from(weights.values()), 0.75);
+  if (fallbackMs === 0) fallbackMs = 1;
+  let totalMs = 0;
+  let unweighted = 0;
+  for (const f of files) {
+    const w = weights.get(f);
+    if (w === undefined) unweighted++;
+    totalMs += w ?? fallbackMs;
+  }
+  return { totalMs, files: files.length, unweighted, fallbackMs };
+}
+
+export function formatPredictedWeight(p: ReturnType<typeof predictedWeight>): string {
+  const s = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  return `predicted ${s(p.totalMs)} over ${p.files} files (${p.unweighted} unweighted at p75 ${s(p.fallbackMs)})`;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // CLI
 // ──────────────────────────────────────────────────────────────────────────
@@ -241,17 +314,36 @@ async function main(): Promise<number> {
   const positional: string[] = [];
   let weightsPath: string | undefined;
   let fallbackOnError = false;
+  let sumOnly = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--weights" && argv[i + 1] && !argv[i + 1]!.startsWith("--")) weightsPath = argv[++i];
     else if (arg === "--fallback-on-error") fallbackOnError = true;
+    else if (arg === "--sum") sumOnly = true;
     else if (arg.startsWith("--")) {
       console.error(`error: unknown or incomplete option ${arg}`);
       return 2;
     } else positional.push(arg);
   }
+  if (sumOnly) {
+    if (positional.length !== 0) {
+      console.error("usage: bun run scripts/sharding.ts --sum [--weights PATH]  (reads the shard's file list from stdin)");
+      return 2;
+    }
+    let weights: WeightMap;
+    try {
+      weights = loadWeights(weightsPath);
+    } catch (e) {
+      console.error(`${fallbackOnError ? "warning" : "error"}: ${e instanceof Error ? e.message : String(e)}`);
+      if (!fallbackOnError) return 1;
+      weights = new Map();
+    }
+    process.stdout.write(`${formatPredictedWeight(predictedWeight(await readStdinLines(), weights))}\n`);
+    return 0;
+  }
   if (positional.length !== 2) {
     console.error("usage: bun run scripts/sharding.ts <shard-index> <total-shards> [--weights PATH] [--fallback-on-error]");
+    console.error("       bun run scripts/sharding.ts --sum [--weights PATH]");
     console.error("       (reads file list from stdin, one path per line)");
     return 2;
   }

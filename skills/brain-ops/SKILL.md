@@ -35,7 +35,7 @@ provenance; automatic capture is off until the user opts in. Reading this skill
 does not enable capture, delegation, or paid enrichment. A chat-only instruction
 suppresses writes for that turn, including when standing capture is enabled.
 
-> **Convention:** See `skills/conventions/brain-first.md` for the 5-step lookup protocol.
+> **Convention:** See `skills/conventions/brain-first.md` for the lookup chain and copyable retrieval filters.
 > **Convention:** See `skills/conventions/quality.md` for citation and back-link rules.
 
 > **Memory verbs (MEMORY_VERBS v1, gbrain ≥ 0.43).** Over MCP, prefer the five
@@ -64,9 +64,10 @@ suppresses writes for that turn, including when standing capture is enabled.
 > conversation is observed making the opted-in call.
 >
 > **Choose a readback path that can see the intended visibility.** Trusted local
-> CLI callers can recall and withdraw private facts. Every MCP caller, including
-> stdio, and a thin CLI connected to MCP currently have world-only fact recall
-> and withdrawal. A
+> CLI callers can recall and withdraw private facts. Every other MCP caller, including
+> stdio, and a thin CLI connected to MCP have world-only fact recall
+> and withdrawal; a credential bound to the brain owner (`gbrain access owner`)
+> also recalls private facts. A
 > request to remember does not authorize making real private information
 > world-visible. Use a trusted local write/readback path for private memory
 > when available. If only remote access is available, a successful private
@@ -125,12 +126,15 @@ Before using ANY external API to research a person, company, or topic:
 
 1. `gbrain entity "<name>"` (v0.43+) — ONE known person/company/project → full card (description, aliases, open threads, recent events, edges, backlink/fact counts). Zero LLM calls, sub-100ms. This one call replaces steps 2–6 for known-entity lookups; near-misses return suggestions.
 2. `gbrain search "name"` — exact-token lookup for existing pages (cheap hybrid, no expansion)
-3. `gbrain query "natural question about name"` — concept/landscape questions go here FIRST (expansion recovers synonym phrasings; a nonzero `search` count is not proof of completeness)
+3. `gbrain query "natural question about name"` — concept/landscape questions go here FIRST (meaning-match plus reranking recovers synonym phrasings; `--expand` adds LLM rewrites when results look thin; a nonzero `search` count is not proof of completeness)
 4. `gbrain get <slug>` — if you know the slug, read the full page
 5. Check backlinks: who references this entity?
 6. Check timeline: recent events involving this entity
 
 The brain almost always has something. External APIs fill gaps, not start from scratch.
+Search gbrain before reading, grepping or querying brain files directly; filters
+(`--types`, `--match keyword`, `query --since/--until`, `--source`, `--json`) are
+in the brain-first convention's "Which gbrain call for which lookup" table.
 
 **⚠️ NEVER scope/count a corpus with shallow `ls` — query gbrain or `find`.** Federated sources often carry MULTIPLE coexisting directory conventions — a flat legacy layer AND a date-nested `meetings/YYYY/MM/` layer. A non-recursive `ls dir/*.md` sees only one and undercounts massively. Real example: a shallow `ls` of one source's `meetings/` counted 132 files, almost all the user's, and concluded that WAS the corpus — missing thousands of transcripts nested under `meetings/YYYY/MM/`. To count/scope a brain corpus:
   - **Best:** `gbrain sources list` (shows per-source indexed page counts) + `gbrain query`. gbrain indexes ALL federated sources correctly; trust its index, not the filesystem.
@@ -273,7 +277,7 @@ Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) 
 ## Tools Used
 
 - `search` — cheap hybrid search (vector + keyword, no expansion)
-- `query` — hybrid search + LLM multi-query expansion (concept/landscape questions)
+- `query` — hybrid search for concept/landscape questions (`--expand` adds LLM multi-query expansion)
 - `get_page` — read a brain page
 - `put_page` — create/update brain pages
 - `add_link` — cross-reference entities

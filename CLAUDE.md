@@ -186,7 +186,7 @@ from recurring:
   narration. When a file's behavior changes, UPDATE its entry to the new truth.
 - **CI is the enforcement, not this prose.** `scripts/check-key-files-current-state.sh`
   (in `bun run verify`) fails on the bolded-release-clause marker in the reference
-  docs AND on size caps for CLAUDE, README, the index, and each subsystem. A written rule caused this disease; a guard
+  docs AND on size caps for CLAUDE, the index, and each subsystem. A written rule caused this disease; a guard
   cures it.
 - **After any CLAUDE.md or reference-doc edit, run `bun run build:llms`** — the
   llms bundle inlines/links these (config in `scripts/llms-config.ts`); the
@@ -197,8 +197,8 @@ from recurring:
 Confirm the user's mode choice during installation; relay the matrix in
 `INSTALL_FOR_AGENTS.md` Step 3.5. The current command-level expansion and cost
 contract lives in [search modes](docs/guides/search-modes.md), not a second knob
-table here. `query` expands in every mode unless explicitly disabled; `search`
-and memory verbs do not. Semantic result reuse is disabled.
+table here. `query` never expands by default (`search.expansion true` turns it
+on; `--expand` / `--no-expand` win); `search` and memory verbs never do. Semantic result reuse is disabled.
 
 Read `docs/eval/SEARCH_MODE_METHODOLOGY.md` for eval methodology and
 `docs/eval/METRIC_GLOSSARY.md` for metric definitions. Eval audit records stay in

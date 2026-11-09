@@ -198,6 +198,8 @@ describe('write attribution on a managed brain', () => {
     await withFixedEmbeddings(async () => {
       for (const engine of engines) {
         const brain = await managedBrain(engine, { embedding: true });
+        // Calibrate the fixed test embedder: an uncalibrated model never supersedes by cosine (supersession-threshold.ts).
+        await brain.engine.setConfig('facts.supersession_thresholds', JSON.stringify({ 'openai:text-embedding-3-small@1536': 0.95 }));
         await run(brain.local, 'put_page', { slug: 'people/alice-example', content: page('Alice', 'Profile') });
         await run(brain.local, 'put_page', { slug: 'people/charlie-example', content: page('Charlie', 'Profile') });
         const byOauth = await submitRememberMutation(brain.oauth, { fact: 'Prefers written updates', provenance: 'test', entity: 'people/alice-example', request_id: randomUUID() }, 30_000);
@@ -240,8 +242,10 @@ describe('write attribution on a managed brain', () => {
       expect(row.expired_at).not.toBeNull();
       expect(created(row)).toEqual(actor(await requestRow(brain, brain.oauth, remembered), brain.principals.oauth));
       expect(last(row)).toEqual(forgetRequest);
-      const effects = await engine.executeRaw<{ request_id: string | null }>("SELECT request_id::text FROM persistence_effects WHERE kind='withdrawal-mirror' AND source_id=$1", [brain.sourceId]);
-      expect(effects.map(effect => effect.request_id)).toEqual([forgetRequest.request]);
+      // GBRA-190 G4: the withdrawal is the forget request's own page publication (the struck fence row), never a later mirror.
+      const revision = await pageRevisionActor(brain, 'people/alice-example');
+      expect({ request: revision.request, kind: revision.kind, id: revision.id }).toEqual(forgetRequest);
+      expect(await engine.executeRaw("SELECT 1 FROM persistence_effects WHERE kind='withdrawal-mirror' AND source_id=$1", [brain.sourceId])).toEqual([]);
     }
   }, 120_000);
 

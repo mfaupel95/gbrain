@@ -14,28 +14,38 @@ import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { appendContextNote, type InferredVia } from '../facts/subject-infer.ts';
 import { inferenceNote } from '../facts/subject-infer-write.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
+import { FACT_WITHDRAWN_MESSAGE, isFactWithdrawn, withdrawnFromDetail } from '../facts/withdrawal.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { authorizeStoredRequest, authorizeWrite, submissionAuthority } from './authority.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { initializeLocalPersistence } from './page-mutations.ts';
 import { prepareFileTarget } from './page-prepare.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
 import { authorizeFactsBackstop } from './effect-facts.ts';
 import { admitWriteInTransaction, getWriteRequest, getWriteRequestById, receiptFor } from './journal.ts';
-import { assertPersistenceAccepting, persistenceConsumerConfig, waitForWrite, writeResponse } from './service.ts';
-import { maintenancePublishWaitMs } from './maintenance-wait.ts';
+import { assertPersistenceAccepting, awaitWrite, persistenceConsumerConfig, writeResponse } from './service.ts';
+import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
+import { FACTS_BATCH_INCOMPLETE_MESSAGE, isEntityMovedRefusal } from './verb-errors.ts';
 import { assertAmbientCaptureAdmissible, captureGateLaneForSource } from '../facts/capture-sources.ts';
 import { declareDerivation, type DerivationDeclaration } from '../trust/taint.ts';
 import type { TaintInput, WriteTrust } from '../trust/tier.ts';
+import { withSpeakerNote } from '../facts/speaker-context.ts';
 
 export interface ManagedFactsResult {
   inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; write_requests: WriteReceipt[];
+  /** #6506: candidates the automatic extraction skipped because the exact claim was forgotten in this source and visibility. */
+  withdrawn_skipped?: number;
+  /** #6333 shadow: same-page rewordings the managed preparer counted; nothing was dropped. */
+  would_dedup_same_page?: number;
+  /** GBRA-130 A-36: entity requests that ended refused for their own page; the other entities' facts committed. */
+  refused?: ManagedFactsRefusal[];
 }
+export interface ManagedFactsRefusal { slug: string; code: string; request_id: string }
 export interface ManagedFactOrigin { slug: string; pageId: number; revision: string; }
 export type FrozenExtractedFact = Omit<NewFact, 'embedding' | 'valid_from' | 'valid_until' | 'expired_at'> & {
   embedding: number[] | null; valid_from: string; valid_until: string | null;
@@ -49,6 +59,13 @@ export interface ManagedFactIntent extends Record<string, unknown> {
   /** Direct single-fact writes keep writeSingleFact's supersession rule. */
   supersede?: true;
   /**
+   * #6506: automatic extraction only. A candidate whose exact claim was forgotten in this source and visibility is
+   * skipped and counted (`withdrawn_skipped`) instead of refusing the entity's whole group; a purge tombstone still
+   * refuses. Explicit writers (remember, the fence writers) never set it and keep the refusal. Frozen in the stored
+   * intent, so a replay and a resumed batch decide exactly as the admission did.
+   */
+  withdrawn?: 'skip';
+  /**
    * writeSingleFact only: a `memory/unattributed` row keeps the resolver's
    * fallback slug as its entity (no row number), so dedup stays per entity.
    */
@@ -58,7 +75,15 @@ export interface ManagedFactIntent extends Record<string, unknown> {
   capture_source?: string;
   /** #5575 I2: the extraction's taint, declared at prompt-build time (trust/taint.ts). */
   derivation?: DerivationDeclaration;
+  /**
+   * #6898 follow-up: set when the entity's facts were split into parts of at most
+   * MANAGED_FACTS_PUBLICATION_MAX facts, each its own request and publication. `deferred_facts` counts
+   * the facts left to later parts and `follow_up` names their request ids; both are copied into the
+   * part's receipt, so a part never reads as the whole group (the batch's completion request does).
+   */
+  part?: ManagedFactsPart;
 }
+export interface ManagedFactsPart { index: number; of: number; deferred_facts: number; follow_up: string[] }
 export interface ManagedFactsSession {
   authority: WriteAuthority; binding: WorktreeBinding | null; config: GBrainConfig;
   batchKey: string; inputDigest: string; origin: ManagedFactOrigin | null; originalRequestId: string | null;
@@ -66,13 +91,41 @@ export interface ManagedFactsSession {
   embedding?: FactEmbeddingSignature | null;
   /** #6048: the batch is keyed by its input alone and the caller asked to re-admit facts the canonical file check refused. */
   fileRefusalRetry?: boolean;
+  /** #6506: the batch is keyed by its input alone (no request id), so a stored withdrawal refusal would replay on every run. */
+  inputKeyed?: boolean;
+  /**
+   * #7602: automatic extraction with no caller request id re-admits an entity request refused because its entity page
+   * moved, at the page's current revision. Explicit fact writers (remember, the fence writers) leave it unset and keep the refusal.
+   */
+  entityMoveRetry?: boolean;
   /** #6091: set when the facts come from an ambient capture lane. */
   captureSource?: string;
+  /**
+   * GBRA-130 A-36: automatic extraction reports an entity refused for its own page under `refused` instead of throwing,
+   * so a replay returns the committed entities' counts. Explicit fact writers leave it unset and keep the refusal.
+   */
+  reportRefusals?: boolean;
   derivation?: DerivationDeclaration;
+  /**
+   * #6778: the publish wait, one budget per session: 30 s bounded by the job's deadline
+   * (FactsBackstopCtx.deadlineAtMs), zero for later publishes once one is still pending.
+   */
+  wait: MaintenanceWriteWait;
+  /** The job's abort signal: a cancelled job stops waiting at once and its write stays pending. */
+  signal?: AbortSignal;
 }
 
-/** #6048: follow-up batches one input-keyed extraction may admit for file-check refusals. */
-const MAX_FILE_REFUSAL_RETRIES = 3;
+/** #6048: follow-up batches one extraction may admit for each followed refusal walk (file check, withdrawal, #7602 moved entity). */
+export const MAX_FILE_REFUSAL_RETRIES = 3;
+
+/**
+ * #6898 follow-up: the most facts one entity request publishes. A publication holds the brain-wide
+ * persistence_counters row from its admission check to its commit, and each fact adds a dedup check and
+ * an index insert to that window (measured ~3.5 ms per fact on Postgres; 200 facts on a 1.6 MB entity page
+ * held it 1.2 s, past the 1 s lock_timeout every other admission waits under). A larger group is admitted
+ * as parts in the same batch, published one after another in queue order.
+ */
+export const MANAGED_FACTS_PUBLICATION_MAX = 50;
 
 const receiptFix = (requestId: string): Action => readFix('Reads the fact request\'s durable receipt: its operation, state and outcome, read-only.',
   { argv: ['gbrain', 'write-request', '--', requestId], mcp: { tool: 'get_write_request', arguments: { request_id: requestId } } });
@@ -83,8 +136,8 @@ const ownerStatusFix = (sourceId: string): Action => readFix(`Shows source ${sou
 const embeddingsFix = (): Action => readFix('Reports the brain\'s embedding model, dimensions and vector columns, read-only.',
   { argv: ['gbrain', 'doctor', '--only', 'embeddings', '--json'] });
 
-function managedFactRequestId(batchKey: string, slug: string): string {
-  const hex = digest([batchKey, slug]);
+function managedFactRequestId(batchKey: string, slug: string, part = 1): string {
+  const hex = digest(part === 1 ? [batchKey, slug] : [batchKey, slug, part]);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
@@ -238,7 +291,7 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     if (binding.state !== 'active' || !binding.owner_host_id) throw opError('owner_unavailable', 'The canonical fact writer is unavailable; extraction has not started.',
       `Source ${ctx.sourceId}'s canonical worktree is ${binding.state}, not active, so facts cannot be published yet. Check writer status and extract again once the owner is active.`,
       { fix: ownerStatusFix(ctx.sourceId) });
-    if (binding.owner_host_id === localHostId()) {
+    if (binding.owner_host_id === hostIdFor(engine)) {
       if (!await probeWorktreeWriter(binding, engine)) throw opError('writer_lock_unavailable', 'The canonical fact writer is busy; extraction has not started.',
         `Another write holds source ${ctx.sourceId}'s canonical writer. Nothing was admitted, so run the extraction again once the writer is idle (the same request_id is safe).`,
         { fix: ownerStatusFix(ctx.sourceId) });
@@ -258,7 +311,12 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
-    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    // #7439: a page-triggered job keeps its write's batch identity on retry, so its retained file refusal is
+    // rechecked once the hold clears instead of replayed forever. #7402: a caller's explicit request_id keeps
+    // returning its own recorded outcome, so it never rechecks.
+    fileRefusalRetry: !ctx.requestId && (!!ctx.persistenceRequestId || ctx.reAdmitFileRefusals === true && seed === inputDigest),
+    inputKeyed: seed === inputDigest,
+    wait: new MaintenanceWriteWait(ctx.deadlineAtMs ?? null), ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
     ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
   const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
@@ -266,31 +324,73 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   return session;
 }
 
+/**
+ * GBRA-130 A-36: codes one entity request ends on for reasons of its own page (changed, segmented, fence or content
+ * refused). Automatic extraction reports them under `refused` and keeps the committed entities' counts. A file-check
+ * refusal (`source_changed`) and a withdrawal refusal are not among them: they keep the batch refused, so the
+ * follow-up walks (#6048, #6506) re-admit their retained facts once the cause clears. An automatic extraction follows a
+ * `revision_conflict` whose entity page moved (#7602, followEntityMoves) before it reports it.
+ */
+const ENTITY_REFUSAL_CODES: ReadonlySet<string> = new Set(['revision_conflict', 'invalid_fence', 'target_fence_malformed', 'page_body_segmented',
+  'invalid_params', 'page_identity_changed', 'page_not_found', 'request_too_large', 'payload_too_large']);
+
+/**
+ * Every row is awaited and collected before anything throws. A refused entity (ENTITY_REFUSAL_CODES) is reported when
+ * the session asks for it and another entity committed, and the completion receipt that only says the batch is
+ * incomplete is not a failure of its own; any other terminal row, then a still-pending one, then a refusal with
+ * nothing committed beside it, throws as its receipt.
+ */
 async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSession, rows: WriteRequest[]): Promise<ManagedFactsResult> {
   const result: ManagedFactsResult = { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [], write_requests: [] };
+  const refused: WriteRequest[] = [];
+  let pending: WriteRequest | null = null;
+  let failed: WriteRequest | null = null;
+  let committed = 0;
   for (const row of rows) {
     if ((row.intent?.inputDigest ?? row.outcome?.input_digest) !== session.inputDigest) throw opError('idempotency_conflict', 'The fact request ID was already used with different extraction input.',
       `Request ${row.request_id} in source ${row.source_id} was accepted for different extraction input, so this extraction was not merged into it. Give this extraction a new request_id; read the receipt to see the original.`,
       { fix: receiptFix(row.request_id) });
     await authorizeStoredRequest(engine, row);
-    const finished = await waitForWrite(engine, row, session.config, maintenancePublishWaitMs());
-    writeResponse(finished);
+    const finished = session.wait.observe((await awaitWrite(engine, row, session.config, { waitMs: session.wait.ms(), signal: session.signal })).row);
     result.write_requests.push(receiptFor(finished));
-    if ((row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity') {
+    if (finished.state !== 'committed') {
+      if (!isTerminal(finished)) pending ??= finished;
+      else if (isEntityRequest(finished) && ENTITY_REFUSAL_CODES.has(finished.error_code ?? '') && !withdrawalRefusal(finished)) refused.push(finished);
+      else if (isEntityRequest(finished) || !refused.length || finished.error_message !== FACTS_BATCH_INCOMPLETE_MESSAGE) failed ??= finished;
+      continue;
+    }
+    if (isEntityRequest(row)) {
+      committed++;
       const out = finished.outcome!;
       result.inserted += Number(out.inserted ?? 0);
       result.duplicate += Number(out.duplicate ?? 0);
       result.superseded += Number(out.superseded ?? 0);
       result.fact_ids.push(...(out.fact_ids as number[] ?? []));
-      if (out.inserted && out.fenced) result.entity_slugs.push(row.slug);
+      if (out.withdrawn_skipped) result.withdrawn_skipped = (result.withdrawn_skipped ?? 0) + Number(out.withdrawn_skipped);
+      if (out.would_dedup_same_page) result.would_dedup_same_page = (result.would_dedup_same_page ?? 0) + Number(out.would_dedup_same_page);
+      if (out.inserted && out.fenced && !result.entity_slugs.includes(row.slug)) result.entity_slugs.push(row.slug);
     }
   }
+  for (const row of [failed, pending]) if (row) writeResponse(row);
+  // #7602: the refusal stands after every follow-up walk, so a retry replays the same stored receipt.
+  if (refused.length && !(session.reportRefusals && committed)) {
+    try {
+      writeResponse(refused[0]);
+    } catch (error) {
+      if (error instanceof OperationError) error.retryable = false;
+      throw error;
+    }
+  }
+  if (refused.length) result.refused = refused.map(row => ({ slug: row.slug, code: row.error_code!, request_id: row.request_id }));
   return result;
 }
 
 export async function resumeManagedFacts(engine: BrainEngine, session: ManagedFactsSession): Promise<ManagedFactsResult | null> {
   const stored = await storedBatch(engine, session);
-  return stored && collectManagedFacts(engine, session, session.fileRefusalRetry ? await followFileRefusals(engine, session, stored) : stored);
+  if (!stored) return null;
+  const files = session.fileRefusalRetry ? await followFileRefusals(engine, session, stored) : stored;
+  const rows = session.inputKeyed ? await followWithdrawalRefusals(engine, session, files) : files;
+  return collectManagedFacts(engine, session, session.entityMoveRetry ? await followEntityMoves(engine, session, rows) : rows);
 }
 
 /** Every request journaled under the session's batch key, once its completion receipt validates; null when nothing was accepted. */
@@ -311,8 +411,9 @@ async function storedBatch(engine: BrainEngine, session: ManagedFactsSession): P
 const isEntityRequest = (row: WriteRequest) => (row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity';
 
 /**
- * #6048: an input-keyed batch (the sweep has no request id to give a window)
- * would replay a terminal file-check refusal forever. Walk its follow-up
+ * #6048, #7439: an input-keyed batch (the sweep has no request id to give a window)
+ * and a page-triggered job's batch (keyed by its write) would replay a terminal
+ * file-check refusal forever. Walk the follow-up
  * batches instead: while every request of the latest one is terminal and each
  * uncommitted entity request is a `source_changed` refusal that kept its facts,
  * look for the next follow-up, or admit it when every refused page now passes
@@ -320,21 +421,76 @@ const isEntityRequest = (row: WriteRequest) => (row.intent?.kind ?? row.outcome?
  * all requests of the latest one, for collectManagedFacts to report.
  */
 async function followFileRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
+  return followRefusals(engine, session, stored, 'file-refusal-retry', row => row.error_code === 'source_changed', readmitRefusedFacts);
+}
+
+/**
+ * #6506 (UC1): the same walk for an input-keyed batch whose entity request was
+ * refused because a candidate's exact claim had been forgotten. Older batches
+ * were admitted before automatic extraction skipped withdrawn candidates, so
+ * the stored refusal (`invalid_params` with the fact_withdrawn message, or the
+ * typed `error_detail.origin = 'withdrawal'`, which a withdrawal committed
+ * between preparation and locked validation also leaves) would replay on every
+ * run of the unchanged input. The follow-up re-admits the retained facts under
+ * `withdrawn: 'skip'`; no extraction runs again and the historical receipts
+ * stay as they were.
+ */
+async function followWithdrawalRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
+  return followRefusals(engine, session, stored, 'withdrawal-retry', withdrawalRefusal, readmitWithdrawnFacts);
+}
+
+/**
+ * #7602: two extractions target one entity page and the other publishes first, so this batch's entity request, admitted
+ * at the revision it read, is refused `revision_conflict` at preparation or publication. The retained facts never
+ * depended on the entity's content: the follow-up re-admits them at the page's current revision, no extraction runs
+ * again, and the historical receipt stays as it was. A page deleted or replaced since keeps the refusal. Each batch is
+ * settled first, so a follow-up that loses the race again is followed within the same run.
+ */
+async function followEntityMoves(engine: BrainEngine, session: ManagedFactsSession, rows: WriteRequest[]): Promise<WriteRequest[]> {
+  const settle = async (batch: WriteRequest[]) => {
+    const settled: WriteRequest[] = [];
+    for (const row of batch) settled.push(isTerminal(row) ? row
+      : session.wait.observe((await awaitWrite(engine, row, session.config, { waitMs: session.wait.ms(), signal: session.signal })).row));
+    return settled;
+  };
+  return followRefusals(engine, session, await settle(rows), 'entity-moved-retry', isEntityMovedRefusal, readmitMovedFacts, settle);
+}
+
+function withdrawalRefusal(row: WriteRequest): boolean {
+  return withdrawnFromDetail(row.error_detail) !== undefined || row.error_code === 'invalid_params' && row.error_message === FACT_WITHDRAWN_MESSAGE;
+}
+
+/**
+ * While every request of the latest batch is terminal and each uncommitted
+ * entity request is a `refused` refusal that kept its facts for this input,
+ * look for the next follow-up batch (`digest([batchKey, label, n])`), or admit
+ * it through `readmit`, at most MAX_FILE_REFUSAL_RETRIES times. With `settle`
+ * (partial mode), only the matching refusals are followed, each admitted batch
+ * is settled before the next look, and every other entity request of the batch,
+ * and a matching one `readmit` left out, is carried as it stands.
+ */
+async function followRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[], label: string,
+  refused: (row: WriteRequest) => boolean,
+  readmit: (engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]) => Promise<WriteRequest[] | null>,
+  settle?: (batch: WriteRequest[]) => Promise<WriteRequest[]>): Promise<WriteRequest[]> {
   const carried: WriteRequest[] = [];
   let latest = stored;
   for (let retry = 1; retry <= MAX_FILE_REFUSAL_RETRIES; retry++) {
     if (latest.some(row => !isTerminal(row))) break;
-    const refused = latest.filter(row => isEntityRequest(row) && row.state !== 'committed');
-    const retained = refused.map(row => row.intent as ManagedFactIntent | null);
-    if (!refused.length || refused.some((row, i) => row.error_code !== 'source_changed' || !retained[i]?.facts?.length
-      || retained[i]!.inputDigest !== session.inputDigest || !sameSignature(retained[i]!.embedding, retained[0]!.embedding))) break;
-    const followUpKey = digest([session.batchKey, 'file-refusal-retry', retry]);
+    const uncommitted = latest.filter(row => isEntityRequest(row) && row.state !== 'committed');
+    const followed = uncommitted.filter(row => refused(row) && (row.intent as ManagedFactIntent | null)?.facts?.length
+      && (row.intent as ManagedFactIntent).inputDigest === session.inputDigest);
+    const retained = followed.map(row => row.intent as ManagedFactIntent);
+    if (!followed.length || !settle && followed.length !== uncommitted.length
+      || retained.some(intent => !sameSignature(intent.embedding, retained[0]!.embedding))) break;
+    const followUpKey = digest([session.batchKey, label, retry]);
     const followUp: ManagedFactsSession = { ...session, batchKey: followUpKey, embedding: retained[0]!.embedding ?? null,
       completionRequestId: managedFactRequestId(followUpKey, '__managed_facts_complete__') };
-    const admitted = await storedBatch(engine, followUp) ?? await readmitRefusedFacts(engine, followUp, refused);
+    const admitted = await storedBatch(engine, followUp) ?? await readmit(engine, followUp, followed);
     if (!admitted) break;
-    carried.push(...latest.filter(row => isEntityRequest(row) && row.state === 'committed'));
-    latest = admitted;
+    carried.push(...latest.filter(row => isEntityRequest(row)
+      && (row.state === 'committed' || !followed.includes(row) || !admitted.some(next => next.slug === row.slug))));
+    latest = settle ? await settle(admitted) : admitted;
   }
   return [...carried, ...latest];
 }
@@ -371,12 +527,70 @@ async function readmitRefusedFacts(engine: BrainEngine, followUp: ManagedFactsSe
     entities.push({ slug: row.slug, pageId: page.page.id, intent: { ...kept, batchKey: followUp.batchKey, expected_revision: page.revision,
       facts: privateOnly ? facts!.map(fact => ({ ...fact, visibility: 'private' as const })) : facts } });
   }
-  return admitManagedFactsBatch(engine, followUp, entities, entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
+  return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
+}
+
+/**
+ * #6506: admit the refused requests' retained facts as `followUp` with
+ * `withdrawn: 'skip'`. Each refused request must still be authorized under
+ * its stored authority and its page under the current writer grant; facts
+ * target the entity page's current revision (the retained origin revision is
+ * re-checked at preparation) and are never wider than the current default
+ * visibility. No extraction runs again.
+ */
+async function readmitWithdrawnFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
+  const { sourceId } = followUp.authority;
+  const narrowed = await retainedVisibility(engine, sourceId);
+  const entities: ManagedFactsEntityInput[] = [];
+  for (const row of refused) {
+    await authorizeStoredRequest(engine, row);
+    await authorizeWrite(engine, followUp.authority, 'extract_facts', row.slug);
+    const page = await engine.readPageSnapshot(row.slug, { sourceId });
+    const { expected_revision: _refusedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
+    if (!page && (row.page_id !== null || facts!.some(fact => fact.entity_slug === row.slug))) return null;
+    entities.push({ slug: row.slug, pageId: page?.page.id ?? null, intent: { ...kept, batchKey: followUp.batchKey, withdrawn: 'skip',
+      ...(page ? { expected_revision: page.revision } : {}), facts: await Promise.all(facts!.map(narrowed)) } });
+  }
+  return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
+}
+
+/**
+ * Retained facts are never wider than the current default visibility. A fact forgotten at its retained visibility keeps
+ * that visibility, so preparation skips and counts it; narrowing it to private would re-save a forgotten claim under a
+ * visibility the ledger never covered.
+ */
+async function retainedVisibility(engine: BrainEngine, sourceId: string): Promise<(fact: FrozenExtractedFact) => Promise<FrozenExtractedFact>> {
+  const privateOnly = await resolveDefaultVisibility(engine) === 'private';
+  return async fact => privateOnly && fact.visibility !== 'private'
+    && !await isFactWithdrawn(engine, sourceId, fact.visibility ?? 'private', fact.fact, fact.entity_slug ?? null) ? { ...fact, visibility: 'private' } : fact;
+}
+
+/**
+ * #7602: admit the refused requests' retained facts as `followUp` at each entity page's current revision. A request whose
+ * page was deleted or replaced since admission is left out and keeps its refusal; null when none is left. Each refused request must still be authorized
+ * under its stored authority and its page under the current writer grant; the retained intent is otherwise kept as
+ * admitted. No extraction runs again.
+ */
+async function readmitMovedFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
+  const { sourceId } = followUp.authority;
+  const narrowed = await retainedVisibility(engine, sourceId);
+  const entities: ManagedFactsEntityInput[] = [];
+  for (const row of refused) {
+    await authorizeStoredRequest(engine, row);
+    await authorizeWrite(engine, followUp.authority, 'extract_facts', row.slug);
+    const page = await engine.readPageSnapshot(row.slug, { sourceId });
+    if ((page?.page.id ?? null) !== row.page_id) continue;
+    const { expected_revision: _movedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
+    entities.push({ slug: row.slug, pageId: row.page_id, intent: { ...kept, batchKey: followUp.batchKey,
+      ...(page ? { expected_revision: page.revision } : {}), facts: await Promise.all(facts!.map(narrowed)) } });
+  }
+  if (!entities.length) return null;
+  return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
 }
 
 export async function publishManagedFacts(engine: BrainEngine, session: ManagedFactsSession, ctx: FactsBackstopCtx,
   facts: ExtractedFact[], visibility: 'private' | 'world', pageSlug?: string,
-  options: { supersede?: boolean; explicitContext?: boolean; attributeFallback?: boolean } = {}): Promise<ManagedFactsResult> {
+  options: { supersede?: boolean; explicitContext?: boolean; attributeFallback?: boolean; withdrawn?: 'skip' } = {}): Promise<ManagedFactsResult> {
   const embedded = facts.some(fact => fact.embedding !== null && fact.embedding !== undefined);
   if (embedded) await assertManagedFactsEmbedding(engine, session.config, session.embedding);
   const sourceId = session.authority.sourceId;
@@ -391,7 +605,7 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
     await authorizeWrite(engine, session.authority, 'extract_facts', slug);
     await authorizePageVisibility(engine, session.authority, slug);
     const group = groups.get(slug) ?? [];
-    const context = options.explicitContext ? fact.context ?? null : ctx.sourceSlug ?? pageSlug ?? null;
+    const context = options.explicitContext ? fact.context ?? null : withSpeakerNote(ctx.speaker, ctx.sourceSlug ?? pageSlug ?? null);
     // #5836: an inferred subject carries its provenance note into the fence cell and the row.
     group.push({ ...fact, entity_slug: attributed, visibility, context: fact.entity_inferred ? appendContextNote(context, inferenceNote(fact.entity_inferred)) : context,
       embedding: fact.embedding ? Array.from(fact.embedding) : null,
@@ -404,18 +618,46 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
     if (snapshot?.page.deleted_at || group.some(fact => fact.entity_slug === slug) && !snapshot) throw opError('page_identity_changed', 'The resolved fact entity was removed.',
       `Entity page ${slug} in source ${sourceId} was deleted after the facts were resolved to it, so nothing was admitted. Run the extraction again (the same request_id is safe: nothing was accepted); it resolves entities against the current pages.`,
       { fix: pageFix(sourceId, slug) });
-    inputs.push({ slug, pageId: snapshot?.page.id ?? null, intent: { kind: 'managed_facts_entity', batchKey: session.batchKey,
+    const intent: ManagedFactIntent = { kind: 'managed_facts_entity', batchKey: session.batchKey,
       inputDigest: session.inputDigest, origin: session.origin, originalRequestId: session.originalRequestId,
       embedding: session.embedding ?? null, ...(options.supersede ? { supersede: true as const } : {}),
       ...(options.attributeFallback ? { attribute_fallback: true as const } : {}),
+      ...(options.withdrawn === 'skip' ? { withdrawn: 'skip' as const } : {}),
       ...(session.captureSource ? { capture_source: session.captureSource } : {}),
       ...(session.derivation ? { derivation: session.derivation } : {}),
-      ...(snapshot ? { expected_revision: snapshot.revision } : {}), facts: group } });
+      ...(snapshot ? { expected_revision: snapshot.revision } : {}), facts: group };
+    inputs.push(...entityParts(session.batchKey, { slug, pageId: snapshot?.page.id ?? null, intent }));
   }
-  return collectManagedFacts(engine, session, await admitManagedFactsBatch(engine, session, inputs, embedded, ctx.abortSignal));
+  const admitted = await admitManagedFactsBatch(engine, session, inputs, embedded, ctx.abortSignal);
+  return collectManagedFacts(engine, session, session.entityMoveRetry ? await followEntityMoves(engine, session, admitted) : admitted);
 }
 
 interface ManagedFactsEntityInput { slug: string; pageId: number | null; intent: ManagedFactIntent }
+
+/**
+ * #6898 follow-up: one entity's facts as requests of at most MANAGED_FACTS_PUBLICATION_MAX facts. A group
+ * within the cap stays one request, exactly as before. Every part targets the revision the batch read; a
+ * later part also accepts the revision its committed predecessor left (facts-prepare.ts).
+ */
+/** A follow-up batch re-admits refused parts: an entity's retained facts are rejoined in part order and split again. */
+function regroupParts(batchKey: string, inputs: ManagedFactsEntityInput[]): ManagedFactsEntityInput[] {
+  const bySlug = new Map<string, ManagedFactsEntityInput>();
+  for (const { intent: { part: _part, ...intent }, ...input } of inputs) {
+    const seen = bySlug.get(input.slug);
+    bySlug.set(input.slug, seen ? { ...seen, intent: { ...seen.intent, facts: [...seen.intent.facts!, ...intent.facts!] } } : { ...input, intent });
+  }
+  return [...bySlug.values()].flatMap(input => entityParts(batchKey, input));
+}
+
+function entityParts(batchKey: string, input: ManagedFactsEntityInput): ManagedFactsEntityInput[] {
+  const facts = input.intent.facts!;
+  if (facts.length <= MANAGED_FACTS_PUBLICATION_MAX) return [input];
+  const of = Math.ceil(facts.length / MANAGED_FACTS_PUBLICATION_MAX);
+  const ids = Array.from({ length: of }, (_, i) => managedFactRequestId(batchKey, input.slug, i + 1));
+  return ids.map((_, i) => ({ ...input, intent: { ...input.intent,
+    facts: facts.slice(i * MANAGED_FACTS_PUBLICATION_MAX, (i + 1) * MANAGED_FACTS_PUBLICATION_MAX),
+    part: { index: i + 1, of, deferred_facts: Math.max(0, facts.length - (i + 1) * MANAGED_FACTS_PUBLICATION_MAX), follow_up: ids.slice(i + 1) } } }));
+}
 
 /** One transaction: the session's per-entity fact requests, then the completion request that names them. */
 async function admitManagedFactsBatch(engine: BrainEngine, session: ManagedFactsSession, inputs: ManagedFactsEntityInput[],
@@ -432,7 +674,8 @@ async function admitManagedFactsBatch(engine: BrainEngine, session: ManagedFacts
       ...(session.captureSource ? { capture_source: session.captureSource } : {}) } as ManagedFactIntent }]) {
       if (signal?.aborted) throw new DOMException('Fact extraction was aborted before admission.', 'AbortError');
       await authorizePageVisibility(tx, session.authority, input.slug);
-      const requestId = input.intent.kind === 'managed_facts_complete' ? session.completionRequestId : managedFactRequestId(session.batchKey, input.slug);
+      const requestId = input.intent.kind === 'managed_facts_complete' ? session.completionRequestId
+        : managedFactRequestId(session.batchKey, input.slug, input.intent.part?.index);
       const row = await admitWriteInTransaction(tx, { principal: session.authority.principal, authority: session.authority,
         operation: 'extract_facts', sourceId, sourceIncarnation: session.authority.sourceIncarnation,
         worktreeId: session.binding?.worktree_id, topologyGeneration: session.binding?.topology_generation,

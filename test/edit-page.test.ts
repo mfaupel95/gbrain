@@ -19,9 +19,11 @@ import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { renderTakesFence } from '../src/core/takes-fence.ts';
 import { editDiff, editableView } from '../src/core/persistence/page-edit.ts';
+import { materializedPage } from '../src/core/persistence/segmented-apply.ts';
 import { STARTER_OPS } from '../src/mcp/surface.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import type { Page } from '../src/core/types.ts';
+import { unquoteTranscriptText } from '../src/core/search/transcript-quote.ts';
 
 let engine: PGLiteEngine;
 let fixture: string;
@@ -162,6 +164,30 @@ describe('edit_page matching', () => {
     expect(poll.body.outcome.diff).toBe(result.body.diff);
   });
 
+  test('a one-line edit on a 50k-line page commits with a windowed line diff', async () => {
+    const lines = Array.from({ length: 50_000 }, (_, i) => `Row ${i} of the long page.`);
+    await seed('notes/long', `${lines.join('\n')}\n`);
+    const head = await call('get_page', { slug: 'notes/long', body: 'none' });
+    const result = await edit('notes/long', [{ old_text: 'Row 25000 of the long page.', new_text: 'Row 25000 was edited.' }], { revision: head.body.revision });
+    expect({ isError: result.isError, text: result.text.slice(0, 300) }).toMatchObject({ isError: false });
+    const snapshot = (await engine.readPageSnapshot('notes/long', { sourceId: 'default' }))!;
+    // Wave B: the 50k-line page is over 1 MiB, so it may be stored in segments; read it back whole (within 24 MiB) to locate the line.
+    const line = editableView(await materializedPage(engine, snapshot.page as Page), snapshot.tags, true).split('\n').indexOf('Row 25000 was edited.') + 1;
+    expect(line).toBeGreaterThan(25_000);
+    expect(result.body.diff).toBe([
+      '--- a/notes/long.md',
+      '+++ b/notes/long.md',
+      `@@ -${line - 3},7 +${line - 3},7 @@`,
+      ...[24_997, 24_998, 24_999].map(i => ` Row ${i} of the long page.`),
+      '-Row 25000 of the long page.',
+      '+Row 25000 was edited.',
+      ...[25_001, 25_002, 25_003].map(i => ` Row ${i} of the long page.`),
+      '',
+    ].join('\n'));
+    expect(result.body.diff_truncated).toBeUndefined();
+    expect(result.body.diff_coarse).toBeUndefined();
+  }, 120_000);
+
   test('a stale revision is a revision_conflict that carries the current revision', async () => {
     await seed('notes/d', 'Body.\n');
     const stale = (await read('notes/d')).revision;
@@ -208,6 +234,7 @@ describe('edit_page protected fences and privacy', () => {
     expect(canonicalAfter).toBe(canonicalBefore.replace('Line two to change.', 'Line two, changed.'));
   });
 
+  // GST-687: an agent-written page reaches a remote reader quoted; the edit surface is the content inside the quote fence.
   test('the edit surface is byte-equal to get_page content for remote and local readers', async () => {
     const bodies = ['Plain body.\n', fencedBody(), `${fencedBody()}\n\n<!-- timeline -->\n\n- 2026-01-02 Example entry`,
       `Body.\n\n<!-- timeline -->\n\n${renderTakesFence([{ rowNum: 1, claim: SECRET_TAKE, kind: 'take', holder: 'people/alice-example', weight: 0.5, active: true } as never])}`];
@@ -216,7 +243,10 @@ describe('edit_page protected fences and privacy', () => {
       await seed(slug, body);
       const snapshot = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
       for (const remote of [true, false]) {
-        expect({ slug, remote, view: editableView(snapshot.page as Page, snapshot.tags, remote) }).toEqual({ slug, remote, view: (await read(slug, remote)).content });
+        const content: string = (await read(slug, remote)).content;
+        const unquoted = unquoteTranscriptText(content, slug);
+        expect({ slug, remote, quoted: unquoted !== content }).toEqual({ slug, remote, quoted: remote });
+        expect({ slug, remote, view: editableView(snapshot.page as Page, snapshot.tags, remote) }).toEqual({ slug, remote, view: unquoted });
       }
       expect(serializePageToMarkdown(snapshot.page as Page, snapshot.tags)).toBe((await read(slug, false)).content);
     }

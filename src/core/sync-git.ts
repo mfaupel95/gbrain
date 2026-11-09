@@ -3,14 +3,17 @@
  * baseline-commit self-heal, and path-containment guards. Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { realpathSync } from 'fs';
-import { execFileSync } from 'child_process';
-import { isAbsolute, join, relative, sep } from 'path';
+import { lstatSync, realpathSync } from 'fs';
+import { execFileSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { invalidateGitListingCache, knownOutsideGitRepo, noteGitFailure } from './git-visible-files.ts';
 import { hasUnresolvedDbOnlyDeclaration, loadStorageConfig } from './storage-config.ts';
+import { GIT_READ_ENV, gitChildEnv } from './git-env.ts';
+import { recordCommit, recordIntent } from './git/commit-ledger.ts';
 
 /**
  * v0.32.7 CJK wave (codex post-merge F4): resolve a slug by `pages.source_path`
@@ -30,34 +33,15 @@ export async function resolveSlugByPathOrSourcePath(
   path: string,
   sourceId?: string,
 ): Promise<string> {
-  // v0.41.19.0 (D8): when sourceId is set, delegate to the new batch
-  // resolveSlugsByPaths so single-call and batched paths share one SQL
-  // owner + one fallback semantic. One Map allocation per single-call;
-  // negligible cost. When sourceId is undefined (legacy unscoped callers),
-  // a direct executeRaw runs instead — the batch method requires sourceId
-  // to prevent the multi-source-bug-class on its new surface (D5). That
-  // branch is NOT the historical unscoped query any more; see below.
+  // v0.41.19.0 (D8): the batch resolveSlugsByPaths is the one SQL owner and
+  // fallback semantic (#6948: the canonical page of the path, never an
+  // arbitrary twin). #3583 gate14: without a sourceId it is scoped to
+  // 'default', matching every WRITE the bare no-sourceId path performs
+  // (updateSlug, deletePage, the rename bookkeeping repair), so resolve and
+  // mutate agree on the scope.
   try {
-    if (sourceId) {
-      const m = await engine.resolveSlugsByPaths([path], { sourceId });
-      const slug = m.get(path);
-      if (slug) return slug;
-    } else {
-      // #3583 gate14: scoped to 'default', matching every WRITE the bare
-      // no-sourceId path performs (updateSlug, deletePage, the rename
-      // bookkeeping repair — all default-scoped). The historical unscoped
-      // form could hand back a row from ANOTHER source that happened to
-      // share the source_path; the rename loop takes this return value
-      // directly as its cheap-move target, so that foreign slug went to
-      // updateSlug, the default-scoped move silently no-opped, and the
-      // fallback import landed under a cross-source dedup. Resolve and
-      // mutate must agree on the scope.
-      const rows = await engine.executeRaw<{ slug: string }>(
-        `SELECT slug FROM pages WHERE source_path = $1 AND source_id = $2 LIMIT 1`,
-        [path, DEFAULT_SOURCE_ID],
-      );
-      if (rows.length > 0 && rows[0].slug) return rows[0].slug;
-    }
+    const slug = (await engine.resolveSlugsByPaths([path], { sourceId: sourceId ?? DEFAULT_SOURCE_ID })).get(path);
+    if (slug) return slug;
   } catch {
     // Fall through — best-effort. Pre-migration brains or query errors
     // shouldn't break delete/rename for path-derived pages.
@@ -73,6 +57,8 @@ export interface RefusedSlugResolution {
   slug: string;
   /** The DIFFERENT file the page at that slug records as its origin. */
   originPath: string;
+  /** #6948: several live pages record the removed path and none is its canonical page; none is touched. */
+  claimants?: string[];
 }
 
 export interface RemovedPathSlugResolution {
@@ -89,6 +75,9 @@ function normalizeOriginPath(p: string): string {
 
 /** One-line operator warning for a refused resolution (#3942). */
 export function refusedRemovedPathMessage(r: RefusedSlugResolution): string {
+  if (r.claimants) {
+    return `  [sync] refusing to delete a page for removed path '${r.path}': ${r.claimants.join(', ')} all record it as their origin (preview gbrain repair origin-twins to choose the page that keeps it).`;
+  }
   return (
     `  [sync] refusing to touch '${r.slug}' for removed path '${r.path}': ` +
     `that page originates from '${r.originPath}' (#3942 — re-slugified paths ` +
@@ -163,8 +152,21 @@ export async function resolveSlugsForRemovedPaths(
     }
   }
 
+  const twins = new Map<string, string[]>();
+  const unresolved = paths.filter(p => !exact.has(p));
+  for (let i = 0; sourceId !== undefined && i < unresolved.length; i += DELETE_BATCH_SIZE) {
+    try {
+      const rows = await engine.executeRaw<{ source_path: string; slugs: string[] }>(`SELECT source_path, array_agg(slug ORDER BY slug) AS slugs FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND source_path = ANY($2::text[]) GROUP BY source_path HAVING count(*) > 1`, [sourceId, unresolved.slice(i, i + DELETE_BATCH_SIZE)]);
+      for (const row of rows) twins.set(row.source_path, row.slugs);
+    } catch {
+      // Best-effort, like phase 1.
+    }
+  }
   const fallbacks: Array<{ path: string; slug: string }> = [];
   for (const p of paths) {
+    const claimants = twins.get(p);
+    if (claimants) { refused.push({ path: p, slug: claimants[0]!, originPath: p, claimants }); continue; }
     const hit = exact.get(p);
     if (hit !== undefined) slugs.set(p, hit);
     else fallbacks.push({ path: p, slug: resolveSlugForPath(p) });
@@ -290,6 +292,11 @@ function noteGitCommand(args: string[]): void {
   if (!READ_ONLY_GIT.has(args[0] ?? '')) invalidateGitListingCache();
 }
 
+/** `GIT_READ_ENV` for a read-only subcommand (no optional index lock), nothing for one that writes. */
+function readOnlyEnv(args: string[]): NodeJS.ProcessEnv {
+  return READ_ONLY_GIT.has(args[0] ?? '') ? GIT_READ_ENV : {};
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -318,11 +325,36 @@ export function git(
 ): string {
   noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(readOnlyEnv(args)),
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
     ...(silenceStderr ? { stdio: ['ignore', 'pipe', 'pipe'] as const } : {}),
   }).trim();
+}
+
+/**
+ * GBRA-133 2b.3: `git()` without blocking the event loop, for the classic sync a resident (serve, the jobs worker,
+ * autopilot) runs in-process on a commit. Same invocation, environment, timeout and buffer. A failure rejects like
+ * `execFileSync` throws (`status`, `signal`, `stdout`, `stderr`), and git's stderr reaches this process's stderr unless
+ * silenced, as `execFileSync` passes it through. `raw` keeps the output untrimmed (NUL-delimited listings).
+ */
+export async function gitAsync(
+  repoPath: string,
+  args: string[],
+  { configs = [], timeoutMs = 30000, silenceStderr = false, raw = false }: { configs?: string[]; timeoutMs?: number; silenceStderr?: boolean; raw?: boolean } = {},
+): Promise<string> {
+  noteGitCommand(args);
+  const r = await execFileBounded('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(readOnlyEnv(args)), timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024,
+  });
+  if (r.stderr && !silenceStderr) process.stderr.write(r.stderr);
+  if (r.error) {
+    const code = (r.error as { code?: unknown }).code;
+    throw Object.assign(new Error(r.error.message), { status: typeof code === 'number' ? code : null, signal: r.error.signal ?? null,
+      code, stdout: r.stdout, stderr: r.stderr });
+  }
+  return raw ? r.stdout : r.stdout.trim();
 }
 
 /**
@@ -335,6 +367,7 @@ export function git(
 export function gitRawOutput(repoPath: string, args: string[]): string {
   noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, []), {
+    env: gitChildEnv(readOnlyEnv(args)),
     encoding: 'utf-8',
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
@@ -361,11 +394,23 @@ export function discoverGitRoot(inputPath: string): string {
     if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
   } catch (error) {
-    noteGitFailure(inputPath, error);
-    throw new Error(
-      `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
-    );
+    throw notAGitRepository(inputPath, error);
   }
+}
+
+/** `discoverGitRoot` without blocking the event loop (GBRA-133 2b.3). */
+export async function discoverGitRootAsync(inputPath: string): Promise<string> {
+  try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
+    return await gitAsync(inputPath, ['rev-parse', '--show-toplevel'], { silenceStderr: true });
+  } catch (error) {
+    throw notAGitRepository(inputPath, error);
+  }
+}
+
+function notAGitRepository(inputPath: string, error: unknown): Error {
+  noteGitFailure(inputPath, error);
+  return new Error(`Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`);
 }
 
 /**
@@ -485,14 +530,13 @@ export function createSyncBaselineCommit(repoPath: string): void {
   const dbOnlyDirs = storageConfig?.db_only ?? [];
   // Sniff-test fail-closed (round 6, P2): `loadStorageConfig` warns-and-
   // returns an EMPTY config for syntactically-valid-but-unsupported YAML
-  // (e.g. flow-style `db_only: [dir/]`; the narrow custom parser only
-  // handles block-style lists), which would silently resolve zero
+  // (e.g. a flow list split over lines; the narrow custom parser handles
+  // block lists and one-line flow lists), which would silently resolve zero
   // exclusions from a file that clearly intended some. If gbrain.yml has a
   // db_only (or deprecated `supabase_only`) key line but nothing resolved
   // from it, refuse rather than guess; `hasUnresolvedDbOnlyDeclaration`
-  // owns the key-line rules. Accepted trade-off: an intentionally empty
-  // `db_only: []` also refuses (same empty config); silently committing
-  // db_only content into permanent git history is high-cost and hard to undo.
+  // owns the key-line rules (an explicit empty `db_only: []` declares none, #8007);
+  // silently committing db_only content into permanent git history is high-cost and hard to undo.
   if (hasUnresolvedDbOnlyDeclaration(repoPath, storageConfig)) {
     const yamlPath = join(repoPath, 'gbrain.yml');
     throw new Error(
@@ -549,6 +593,7 @@ export function createSyncBaselineCommit(repoPath: string): void {
     const stderr = err && typeof err === 'object' && 'stderr' in err ? String((err as { stderr: unknown }).stderr) : '';
     if (!stderr.includes('ignored by one of your .gitignore files')) throw err;
   }
+  recordIntent(repoPath, { writer: 'sync_init', head_before: null, message: 'gbrain: initial commit (auto-init by sync)' });
   git(
     repoPath,
     // --no-verify only skips pre-commit/commit-msg — prepare-commit-msg
@@ -570,6 +615,7 @@ export function createSyncBaselineCommit(repoPath: string): void {
     ],
     ['user.name=gbrain', 'user.email=gbrain@localhost', 'core.hooksPath=/dev/null'],
   );
+  recordCommit(repoPath, { sha: git(repoPath, ['rev-parse', 'HEAD']), writer: 'sync_init' });
 }
 
 /**
@@ -614,11 +660,15 @@ export function isWithinRoot(
 /**
  * #774 NAV-1 TOCTOU: true only if filePath realpath-resolves inside gitRoot.
  * Guards symlink escape at the per-file level (a committed symlink whose
- * target lives outside the repo), not just at scope entry.
+ * target lives outside the repo), not just at scope entry. GBRA-133 S-4: a
+ * leaf that is not a symlink resolves through its parent directory (Bun's
+ * realpathSync returns ENOENT for an existing name containing a backslash).
  */
 export function isPathSafe(filePath: string, gitRoot: string): boolean {
   try {
-    return isWithinRoot(realpathSync(filePath), realpathSync(gitRoot));
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- this is the containment guard: join normalizes the realpath'd parent plus basename, and isWithinRoot below rejects any result outside gitRoot
+    const real = lstatSync(filePath).isSymbolicLink() ? realpathSync(filePath) : join(realpathSync(dirname(filePath)), basename(filePath));
+    return isWithinRoot(real, realpathSync(gitRoot));
   } catch {
     return false;
   }
@@ -627,6 +677,7 @@ export function isPathSafe(filePath: string, gitRoot: string): boolean {
 export function hasOriginRemote(repoPath: string): boolean {
   try {
     execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
+      env: gitChildEnv(GIT_READ_ENV),
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],
@@ -644,6 +695,11 @@ export function isDetachedHead(repoPath: string): boolean {
   } catch {
     return true;
   }
+}
+
+/** `isDetachedHead` without blocking the event loop (GBRA-133 2b.3). */
+export async function isDetachedHeadAsync(repoPath: string): Promise<boolean> {
+  return gitAsync(repoPath, ['symbolic-ref', '--quiet', 'HEAD']).then(() => false, () => true);
 }
 
 export function unique<T>(items: T[]): T[] {

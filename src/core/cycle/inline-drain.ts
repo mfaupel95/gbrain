@@ -36,8 +36,9 @@
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import { MinionQueue } from '../minions/queue.ts';
-import type { MinionHandler, MinionJobContext } from '../minions/types.ts';
+import type { MinionHandler, MinionJob, MinionJobContext } from '../minions/types.ts';
 import { UnrecoverableError } from '../minions/types.ts';
+import { jobRefusal, refusedJobResult } from '../minions/refusal.ts';
 import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
 import { RateLeaseUnavailableError, leaseFullBackoffMs } from '../minions/rate-leases.ts';
 import { reconnectAfterConnectionError } from '../minions/reconnect.ts';
@@ -267,6 +268,7 @@ async function drainLoop(
         name: job.name,
         data: job.data,
         attempts_made: job.attempts_made,
+        idempotency_key: job.idempotency_key,
         // #4077: fold the phase's cancellation into the per-job signal so an
         // in-flight handler (mid-LLM-call) stops without waiting for its own
         // timeout; `abort` stays the loop-local source for timedOut below.
@@ -396,17 +398,7 @@ async function drainLoop(
           // Lock-token mismatch (stall sweep won) — fall through to failJob,
           // which no-ops under the same fence.
         }
-        const timedOut = abort.signal.aborted;
-        const errorText = timedOut ? 'timeout exceeded' : (handlerErr instanceof Error ? handlerErr.message : String(handlerErr));
-        const isUnrecoverable = handlerErr instanceof UnrecoverableError;
-        const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
-        await queue.failJob(
-          job.id,
-          lockToken,
-          errorText,
-          timedOut || isUnrecoverable || attemptsExhausted ? 'dead' : 'delayed',
-          0,
-        );
+        await failChild(queue, job, lockToken, handlerErr, abort.signal.aborted);
       };
       try {
         // #4077: external cancellation outranks outcome recording — a child
@@ -449,4 +441,17 @@ async function drainLoop(
     poolAbort?.abort(e);
     throw e;
   }
+}
+
+/**
+ * Record a failed child: a timeout or an UnrecoverableError is dead; a deterministic refusal (#7239) is dead with its
+ * code and fix on the result; anything else is retried (delayed, no backoff) until its attempts run out.
+ */
+async function failChild(queue: MinionQueue, job: MinionJob, lockToken: string, handlerErr: unknown, timedOut: boolean): Promise<void> {
+  const errorText = timedOut ? 'timeout exceeded' : (handlerErr instanceof Error ? handlerErr.message : String(handlerErr));
+  const refusal = timedOut ? null : jobRefusal(handlerErr);
+  const isUnrecoverable = refusal !== null || handlerErr instanceof UnrecoverableError;
+  const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
+  await queue.failJob(job.id, lockToken, errorText, timedOut || isUnrecoverable || attemptsExhausted ? 'dead' : 'delayed', 0,
+    refusal ? refusedJobResult(refusal) : undefined);
 }

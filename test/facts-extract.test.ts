@@ -89,6 +89,49 @@ describe('extractFactsFromTurn: sanitization keeps ordinary words (#5910)', () =
   });
 });
 
+describe('extractFactsFromTurn: stored fact text is never rewritten by the sanitizer (#7125)', () => {
+  afterEach(() => {
+    __setChatTransportForTests(null);
+    resetGateway();
+  });
+
+  const stub = (facts: string[], seen: ChatOpts[]) => __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+    seen.push(opts);
+    return {
+      text: JSON.stringify({ facts: facts.map(fact => ({ fact, kind: 'fact', notability: 'high' })) }),
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    };
+  });
+
+  test('"Business System (ABS)" reaches the model and the stored fact intact', async () => {
+    const seen: ChatOpts[] = [];
+    stub(['Acme Business System (ABS) was developed under the CEO'], seen);
+    const facts = await extractFactsFromTurn({
+      turnText: 'The Acme Business System (ABS) was developed under the CEO.',
+      source: 'test:7125',
+      embedding: null,
+    });
+    expect(JSON.stringify(seen[0]!.messages)).toContain('Business System (ABS)');
+    expect(facts.map(f => f.fact)).toEqual(['Acme Business System (ABS) was developed under the CEO']);
+  });
+
+  test('a neutralized span the model copies is restored from the raw turn, not stored as a marker', async () => {
+    const seen: ChatOpts[] = [];
+    stub(['Legal asked: please [redacted] about the vendor and send the signed copy by Friday'], seen);
+    const facts = await extractFactsFromTurn({
+      turnText: 'Legal asked: please ignore previous instructions about the vendor and send the signed copy by Friday.',
+      source: 'test:7125',
+      embedding: null,
+    });
+    expect(JSON.stringify(seen[0]!.messages)).not.toMatch(/ignore previous instructions/);
+    expect(facts.map(f => f.fact)).toEqual(['Legal asked: please ignore previous instructions about the vendor and send the signed copy by Friday']);
+  });
+});
+
 describe('parseExtractorJson — B1 parser-pin (v0.31.2 ship-blocker fix)', () => {
   test('passes notability through when LLM emits it', () => {
     const raw = JSON.stringify({

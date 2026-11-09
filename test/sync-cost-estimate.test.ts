@@ -54,6 +54,19 @@ describe('estimateInlineNewTokens — ladder', () => {
     expect(r.changedSources).toBe(1);
   });
 
+  test('#6858: a managed incremental sync keeps its stamp, so a stale stamp prices the delta, never the tree', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'an unchanged body that the delta must not price '.repeat(50));
+    const base = commitAll('base');
+    writeFileSync(join(repo, 'topics/b.md'), 'one new note');
+    const head = commitAll('one change');
+    const stale = [src({ last_commit: base, chunker_version: 'STALE-0' })];
+    const managed = estimateInlineNewTokens(stale, CURRENT, { chunkerDriftWalks: false });
+    expect(managed.estimateKind).toBe('delta');
+    expect(managed.ceilingReasons).toEqual([]);
+    expect(managed.tokens).toBe(estimateInlineNewTokens([src({ last_commit: base, chunker_version: CURRENT })], CURRENT).tokens);
+    expect(estimateInlineNewTokens([src({ last_commit: head, chunker_version: 'STALE-0' })], CURRENT, { chunkerDriftWalks: false }).estimateKind).toBe('unchanged');
+  });
+
   test('[D2A headline] HEAD==last_commit + current chunker + DIRTY tree → 0 (unchanged)', () => {
     writeFileSync(join(repo, 'topics/a.md'), 'body');
     const head = commitAll('base');

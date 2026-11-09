@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VERSION } from '../src/version.ts';
+import { writeChannelCache } from './helpers/update-cache.ts';
 
 const AUTOPILOT_TS = join(import.meta.dir, '..', 'src', 'commands', 'autopilot.ts');
 const TARGET = '99.0.0.0';
@@ -45,15 +46,16 @@ function harness(label: string): Harness {
   writeFileSync(join(dotG, 'config.json'), JSON.stringify({
     engine: 'pglite',
     database_path: join(dotG, 'brain.pglite'),
-    self_upgrade: { mode: 'auto', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
+    self_upgrade: { mode: 'auto', channel: 'alpha', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
   }));
-  writeFileSync(join(dotG, 'last-update-check'), `UPGRADE_AVAILABLE ${VERSION} ${TARGET}\n`);
+  writeChannelCache(dotG, `UPGRADE_AVAILABLE ${VERSION} ${TARGET}`);
   const shims = join(root, 'bin');
   mkdirSync(shims);
   const argvLog = join(root, 'argv.log');
   writeFileSync(argvLog, '');
   writeFileSync(join(shims, 'bun'), '#!/usr/bin/env bash\necho "$FAKE_BUN_VERSION"\n', { mode: 0o755 });
-  writeFileSync(join(shims, 'gbrain'), `#!/usr/bin/env bash\nprintf 'gbrain %s\\n' "$*" >> "${argvLog}"\nexit "\${FAKE_GBRAIN_EXIT:-0}"\n`, { mode: 0o755 });
+  // #6828: a swap is confirmed by the version it left on disk, so `--version` reports the target (a real swap) and is not logged as a swap call.
+  writeFileSync(join(shims, 'gbrain'), `#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then [ "\${FAKE_GBRAIN_EXIT:-0}" = 0 ] && echo "gbrain ${TARGET}"; exit "\${FAKE_GBRAIN_EXIT:-0}"; fi\nprintf 'gbrain %s\\n' "$*" >> "${argvLog}"\nexit "\${FAKE_GBRAIN_EXIT:-0}"\n`, { mode: 0o755 });
   return { root, home, shims, argvLog };
 }
 

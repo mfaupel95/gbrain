@@ -23,6 +23,7 @@ import {
   targetIdentity, targetProbeBlockers,
 } from '../src/core/persistence/graduation-target.ts';
 import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
+import { LAST_KNOWN_OP, queueRefresh } from '../src/commands/doctor/last-known.ts';
 
 const SECRET = 's3cr3t-Pa55';
 const thrown = (fn: () => unknown): Record<string, any> => {
@@ -159,6 +160,10 @@ describe.skipIf(!databaseUrl)('Postgres probes and the route cross-check', () =>
       const seeded = await probeTarget(routes);
       expect(seeded).toMatchObject({ empty: true, gbrainSchema: true, nonEmptyTables: [] });
       expect(seeded.embeddingColumns.map(c => `${c.relation}.${c.column}`)).toEqual(expect.arrayContaining(['content_chunks.embedding', 'facts.embedding']));
+      // #7142: a doctor run's last known results and its queued refresh are not brain data.
+      await engine.executeRaw(`INSERT INTO op_checkpoints (op, fingerprint, completed_keys) VALUES ($1, 'queue_health', '[{}]'::jsonb), ($1, 'schema_version', '[{}]'::jsonb)`, [LAST_KNOWN_OP]);
+      expect(await queueRefresh(engine)).not.toBeNull();
+      expect(await probeTarget(routes)).toMatchObject({ empty: true, nonEmptyTables: [] });
       await engine.executeRaw("INSERT INTO sources (id, name) VALUES ('notes', 'Notes')");
       await engine.executeRaw("UPDATE persistence_brain SET enabled = true");
       const used = await probeTarget(routes);

@@ -32,6 +32,14 @@ class ScriptedSocket extends Socket {
     this.destroy();
     for (const listener of listeners) listener(false);
   }
+  /** A connection reset as Bun reports it: 'error' (ECONNRESET), then 'close' with hadError on a later turn. */
+  async resetNow(): Promise<void> {
+    const errors = this.listeners('error') as ((error: Error) => void)[], closes = this.listeners('close') as ((hadError: boolean) => void)[];
+    this.removeAllListeners('error'); this.removeAllListeners('close'); this.on('error', () => undefined); this.destroy();
+    for (const listener of errors) listener(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+    await new Promise(resolve => setImmediate(resolve));
+    for (const listener of closes) listener(true);
+  }
 }
 
 /** A one-byte type plus int32 length frame of the wire protocol. */
@@ -54,25 +62,35 @@ const fatalTerminated = frame('E', Buffer.concat([
   Buffer.from('M'), cstr('terminating connection due to administrator command'), Buffer.from([0]),
 ]));
 
+type Script = { kill?: boolean; killAt?: number; holdAt?: number };
 /**
  * Answers the extended protocol with empty results (ParseComplete, BindComplete, NoData, CommandComplete, ReadyForQuery)
- * and a simple Query with CommandComplete. `kill` ends the connection with FATAL 57P01 at its first statement.
+ * and a simple Query with CommandComplete. `kill` ends the connection with FATAL 57P01 at its first statement, `killAt`
+ * at its n-th (1-based), `holdAt` never answers its n-th. ReadyForQuery reports T between a BEGIN and its COMMIT or ROLLBACK.
  */
-function serve(socket: Socket, buffered: Buffer, mode: { kill?: boolean }, onStatement: () => void): Buffer {
+function serve(socket: Socket, buffered: Buffer, mode: Script, onStatement: () => number, held = { on: false, tx: false }): Buffer {
   let rest: Buffer = buffered;
   for (;;) {
     if (rest.length < 5) return rest;
     const type = String.fromCharCode(rest[0]!), length = rest.readInt32BE(1);
     if (rest.length < length + 1) return rest;
+    const body = rest.subarray(5, length + 1);
     rest = rest.subarray(length + 1);
-    if (type === 'P' || type === 'Q') onStatement();
-    if (mode.kill) { socket.write(fatalTerminated); socket.end(); return Buffer.alloc(0); }
+    const statement = type === 'P' || type === 'Q' ? onStatement() : 0;
+    if (statement > 0) {
+      const text = (type === 'P' ? body.subarray(body.indexOf(0) + 1) : body).toString('utf8').toLowerCase();
+      held.tx = /^\s*begin/.test(text) || (held.tx && !/^\s*(commit|rollback)/.test(text));
+    }
+    const ready = held.tx ? frame('Z', Buffer.from('T')) : readyForQuery;
+    if (mode.kill || (statement > 0 && statement === mode.killAt)) { socket.write(fatalTerminated); socket.end(); return Buffer.alloc(0); }
+    if (statement > 0) held.on = statement === mode.holdAt;
+    if (held.on) continue;
     if (type === 'P') socket.write(frame('1'));
     else if (type === 'B') socket.write(frame('2'));
     else if (type === 'D') socket.write(frame('n'));
     else if (type === 'E') socket.write(frame('C', cstr('SELECT 0')));
-    else if (type === 'S') socket.write(readyForQuery);
-    else if (type === 'Q') socket.write(Buffer.concat([frame('C', cstr('SELECT 0')), readyForQuery]));
+    else if (type === 'S') socket.write(ready);
+    else if (type === 'Q') socket.write(Buffer.concat([frame('C', cstr('SELECT 0')), ready]));
     else if (type === 'X') { socket.end(); return Buffer.alloc(0); }
   }
 }
@@ -81,13 +99,14 @@ let server: Server | undefined;
 afterEach(() => new Promise<void>(resolve => { server ? server.close(() => resolve()) : resolve(); server = undefined; }));
 
 /** A scripted server; `script(n)` chooses how the n-th connection (1-based) behaves. */
-async function listen(script: (connection: number) => { kill?: boolean }): Promise<{ port: number; connections: { statements: number }[] }> {
+async function listen(script: (connection: number) => Script): Promise<{ port: number; connections: { statements: number }[] }> {
   const connections: { statements: number }[] = [];
   server = createServer(socket => {
     const connection = { statements: 0 };
     connections.push(connection);
     const mode = script(connections.length);
     let buffered: Buffer = Buffer.alloc(0), started = false;
+    const held = { on: false, tx: false };
     socket.on('data', (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk]);
       if (!started) {
@@ -97,18 +116,18 @@ async function listen(script: (connection: number) => { kill?: boolean }): Promi
         buffered = buffered.subarray(length); started = true;
         socket.write(startupReply);
       }
-      buffered = serve(socket, buffered, mode, () => { connection.statements++; });
+      buffered = serve(socket, buffered, mode, () => ++connection.statements, held);
     });
     socket.on('error', () => undefined);
   });
   await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', () => resolve()));
   return { port: (server.address() as { port: number }).port, connections };
 }
-function client(port: number): { sql: ReturnType<typeof postgres>; socket: () => ScriptedSocket } {
+function client(port: number, extra: Record<string, unknown> = {}): { sql: ReturnType<typeof postgres>; socket: () => ScriptedSocket } {
   let current: ScriptedSocket | undefined;
   // A socket option hands the driver a connecting socket (the driver then skips its own connect step); the option is not in the public types.
   const options = { host: '127.0.0.1', port, user: 'u', password: 'p', database: 'd', ssl: false, max: 1, prepare: false, fetch_types: true, connect_timeout: 2, onnotice() {},
-    socket: () => (current = new ScriptedSocket()).connect(port, '127.0.0.1') };
+    socket: () => (current = new ScriptedSocket()).connect(port, '127.0.0.1'), ...extra };
   const sql = postgres(options as unknown as Parameters<typeof postgres>[0]);
   return { sql, socket: () => current! };
 }
@@ -155,3 +174,55 @@ test('forced probe: a close delivered while a statement\'s bytes wait for the wr
     expect(connections[1]!.statements).toBeGreaterThanOrEqual(2);
   } finally { await sql.end({ timeout: 1 }); }
 }, 15_000);
+
+test('forced probe (#6543): a backend terminated under a running statement does not hand its 57P01 to the first statement of the replacement connection', async () => {
+  // The serve wedge's `recovery_scan reason=57P01`: a FATAL that arrived before the close stayed in the connection's
+  // state, and the reconnect's startup ReadyForQuery delivered it to the statement the pool had queued for the slot.
+  // `max_pipeline: 0` keeps that statement in the pool's queue, so it is written only on the replacement connection.
+  const { port, connections } = await listen(connection => (connection === 1 ? { killAt: 2 } : {}));
+  const { sql } = client(port, { fetch_types: false, max_pipeline: 0 });
+  const settled = (query: PromiseLike<unknown>) => Promise.resolve(query).then(rows => ({ rows: [...rows as unknown[]] }), (error: { code?: string }) => ({ code: error.code }));
+  try {
+    expect([...await sql.unsafe('select 1')]).toEqual([]);
+    const head = settled(sql.unsafe('select 2'));
+    const queued = settled(sql.unsafe('select 3'));
+    expect(await head).toEqual({ code: 'CONNECTION_CLOSED' });
+    expect(await queued).toEqual({ rows: [] });
+    expect(connections.length).toBe(2);
+    expect(connections[1]!.statements).toBe(1);
+  } finally { await sql.end({ timeout: 1 }); }
+}, 15_000);
+
+test('forced probe (GBRA-133): a statement a transaction issues between a socket error and its close settles, and the reconnect serves the next reservation', async () => {
+  // Managed-sync convergence mode (f): a pooler drop reset the transaction's connection under a running statement. Its
+  // rejection ran the coordinated write's finally, which sent the settings restore on the same connection before the
+  // socket's 'close' arrived. The close skipped rejecting it (hadError), the replacement socket's startup ReadyForQuery
+  // made it the current statement without sending it, and the reservation waiting for that startup never got the
+  // connection: the run stalled 330 s until the in-flight watchdog retired it.
+  const { port, connections } = await listen(connection => (connection === 1 ? { holdAt: 2 } : {}));
+  const { sql, socket } = client(port, { fetch_types: false });
+  const within = <T>(promise: Promise<T>, label: string) => Promise.race([promise, Bun.sleep(3_000).then(() => `${label} never settled`)]);
+  try {
+    let restore: Promise<string | null> | undefined;
+    let running!: () => void;
+    const started = new Promise<void>(resolve => { running = resolve; });
+    const transaction = sql.begin(async tx => {
+      const held = tx.unsafe('select 1');
+      running();
+      await held.catch(() => {
+        restore = Promise.resolve(tx.unsafe('select 2')).then(() => null, (error: { code?: string }) => error.code ?? 'error');
+        return restore;
+      });
+    }).then(() => null, (error: { code?: string }) => error.code ?? 'error');
+    await started;
+    await Bun.sleep(20);
+    await socket().resetNow();
+    expect(await within(transaction, 'transaction')).toMatch(/^(ECONNRESET|CONNECTION_CLOSED)$/);
+    expect(restore).toBeDefined();
+    expect(await within(restore!, 'restore')).toBe('CONNECTION_CLOSED');
+    const next = await within(sql.reserve().then(async reserved => { try { return [...await reserved.unsafe('select 3')]; } finally { reserved.release(); } }), 'next reservation');
+    expect(next).toEqual([]);
+    expect(connections.length).toBe(2);
+  } finally { await sql.end({ timeout: 1 }); }
+}, 15_000);
+

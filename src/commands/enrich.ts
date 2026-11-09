@@ -72,6 +72,7 @@ import {
   parseSynthesis,
   type EnrichEvidence,
 } from '../core/enrich/thin.ts';
+import { restoreNeutralized } from '../core/think/sanitize.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables (exported for tests).
@@ -443,7 +444,9 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
   // Write via the put_page op handler (trusted local: remote=false) so
   // auto-link + disk write-through fire, exactly like `gbrain capture`. The
   // retrieved context was sanitized in buildEnrichPrompt; the synthesized body
-  // is the model's grounded output.
+  // is the model's grounded output, with any neutralized span it copied from
+  // the prompt restored from the raw stub and evidence (#7125).
+  const body = restoreNeutralized(parsed.body, [page.compiled_truth ?? '', ...evidence.map(e => e.text)].join('\n')).text;
   const tags = snapshot.tags;
   const newFrontmatter: Record<string, unknown> = {
     ...page.frontmatter,
@@ -454,7 +457,7 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
   };
   // The model owns the prose only: the page's facts/takes fences are carried
   // over verbatim so publication never expires fence facts or deletes takes.
-  const content = serializeMarkdown(newFrontmatter, preserveCanonicalFences(page, parsed.body), page.timeline ?? '', {
+  const content = serializeMarkdown(newFrontmatter, preserveCanonicalFences(page, body), page.timeline ?? '', {
     type: page.type,
     title: page.title,
     tags,

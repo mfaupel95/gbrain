@@ -97,8 +97,8 @@ export async function connectorsHealthCheck(engine: BrainEngine): Promise<Check>
 
   // Drift: latest connector receipt reports skipped conversations.
   try {
-    const log = await engine.getIngestLog({ limit: 20 });
-    const latest = log.find((e) => e.source_type === 'connector');
+    // #7145: the newest connector receipt itself, not whichever falls inside the newest rows of every source type.
+    const [latest] = await engine.executeRaw<{ summary: string }>("SELECT summary FROM ingest_log WHERE source_type = 'connector' ORDER BY created_at DESC, id DESC LIMIT 1");
     if (latest && /DRIFT/.test(latest.summary)) {
       problems.push('last connector sync reported format drift — the provider API shape may have changed');
     }

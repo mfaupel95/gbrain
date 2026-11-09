@@ -25,30 +25,35 @@ export type ReadTrustHandling = 'filtered' | 'labeled' | 'text_free';
 
 export const OP_READ_TRUST: Readonly<Record<string, ReadTrustHandling>> = {
   // memory verbs and retrieval
-  recall: 'filtered', context_pack: 'filtered', delta: 'filtered',
-  search: 'filtered', query: 'filtered', get_page: 'filtered', fetch: 'filtered',
+  recall: 'filtered', context_pack: 'filtered', delta: 'filtered', memory_recall: 'labeled',
+  search: 'filtered', search_exact: 'filtered', query: 'filtered', get_page: 'filtered', fetch: 'filtered',
   get_chunks: 'filtered', get_timeline: 'filtered', takes_list: 'filtered', takes_search: 'filtered',
   assemble_evidence: 'filtered',
   entity: 'labeled', synthesize: 'labeled', think: 'labeled',
-  search_by_image: 'labeled', list_pages: 'labeled', volunteer_context: 'filtered',
-  get_versions: 'labeled', get_raw_data: 'labeled', resolve_slugs: 'labeled',
+  search_by_image: 'labeled', list_pages: 'labeled', find_pages: 'labeled', volunteer_context: 'filtered',
+  get_versions: 'labeled', get_raw_data: 'labeled', resolve_slugs: 'labeled', whois: 'labeled',
   get_recent_salience: 'labeled', find_anomalies: 'labeled', get_recent_transcripts: 'labeled',
-  find_orphans: 'labeled', traverse_graph: 'labeled', get_links: 'labeled', get_backlinks: 'labeled',
+  find_orphans: 'labeled', traverse_graph: 'labeled', get_links: 'labeled', get_backlinks: 'labeled', rank_entities: 'labeled',
   wanted_pages: 'labeled', get_tags: 'labeled', get_ingest_log: 'labeled',
   chronicle_day: 'labeled', chronicle_on_this_day: 'labeled', chronicle_since: 'labeled', chronicle_last_seen: 'labeled',
   ontology_get: 'labeled', ontology_dimensions: 'labeled', ontology_conflicts: 'labeled', volunteer_chronicle: 'labeled',
-  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'labeled',
+  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'filtered',
   find_experts: 'labeled', find_trajectory: 'labeled', takes_scorecard: 'labeled', takes_calibration: 'labeled',
   open_loops: 'labeled', schema_review_orphans: 'labeled',
+  questions_list: 'labeled', questions_status: 'labeled',
   code_callers: 'labeled', code_callees: 'labeled', code_def: 'labeled', code_refs: 'labeled', code_blast: 'labeled', code_flow: 'labeled',
   // no stored memory text
   search_modes: 'text_free', list_link_sources: 'text_free', get_brain_identity: 'text_free',
   list_skills: 'text_free', get_skill: 'text_free', list_brain_skillpack: 'text_free', advisor: 'text_free',
   get_skill_asset: 'text_free', join_brain: 'text_free', sync_brain_skills: 'text_free', leave_brain: 'text_free',
-  get_calibration_profile: 'text_free', whoami: 'text_free', sources_list: 'text_free', sources_status: 'text_free',
+  get_calibration_profile: 'text_free', whoami: 'text_free', sources_list: 'text_free', sources_status: 'text_free', sources_resolve_path: 'text_free',
   sources_inspect: 'text_free', request_tools: 'text_free', connectors_status: 'text_free',
   get_active_schema_pack: 'text_free', list_schema_packs: 'text_free', schema_stats: 'text_free', schema_lint: 'text_free',
   schema_graph: 'text_free', schema_explain_type: 'text_free',
+  list_write_conflicts: 'text_free', get_brain_health: 'text_free',
+  // Held at the unlisted default (refused under a token floor) pending a trust-posture call: it returns config-derived
+  // settings and rule text, no stored memory text, so text_free would describe it but would admit floored connections.
+  get_memory_settings: 'labeled',
 };
 
 /** The class an op resolves to; an unlisted read op is held to the strictest (`labeled`) rule. */

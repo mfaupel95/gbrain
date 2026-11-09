@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import postgres from '#postgres'
 import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
+import { pumpText, waitForText } from './helpers/stream-text.ts';
 
 const host = process.env.GBRAIN_TEST_OPENCLAW_BIN;
 const root = resolve(import.meta.dir, '..');
@@ -82,6 +83,10 @@ describe.skipIf(!host)('pinned OpenClaw native context-engine startup', () => {
         retrieval_reflex: true, retrieval_reflex_window_turns: 1, retrieval_reflex_volunteer: false,
       }));
       const manifest = JSON.parse(readFileSync(join(root, 'openclaw.plugin.json'), 'utf8'));
+      const modelsConfig = { mode: 'replace', providers: { fixture: {
+        baseUrl: `http://127.0.0.1:${address.port}/v1`, api: 'openai-completions', apiKey: 'local-fixture',
+        models: [{ id: 'fixture', name: 'Fixture', contextWindow: 32768, maxTokens: 512, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      } } };
       writeFileSync(configPath, JSON.stringify({
         plugins: {
           allow: [manifest.id], load: { paths: [root] },
@@ -95,11 +100,11 @@ describe.skipIf(!host)('pinned OpenClaw native context-engine startup', () => {
         },
         tools: { deny: ['*'] },
         mcp: { servers: { gbrain: { enabled: false } } },
-        models: { mode: 'replace', providers: { fixture: {
-          baseUrl: `http://127.0.0.1:${address.port}/v1`, api: 'openai-completions', apiKey: 'local-fixture',
-          models: [{ id: 'fixture', name: 'Fixture', contextWindow: 32768, maxTokens: 512, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-        } } },
         gateway: { mode: 'local' },
+        // No network at startup: the pinned gateway otherwise checks telemetry.openclaw.ai for a newer
+        // release and downloads the hosted model catalog from catalog.openclaw.ai on every start.
+        update: { checkOnStart: false },
+        models: { ...modelsConfig, catalogRefresh: { enabled: false } },
       }));
       expect(await run(['--version'])).toContain('2026.9.4');
       const inspection = JSON.parse(await run(['plugins', 'inspect', manifest.id, '--runtime', '--json']));
@@ -148,17 +153,13 @@ describe.skipIf(!host)('pinned OpenClaw native context-engine startup', () => {
       const config = JSON.parse(readFileSync(configPath, 'utf8'));
       writeFileSync(configPath, JSON.stringify({ ...config, gateway: { mode: 'local', port: gatewayPort, bind: 'loopback', auth: { mode: 'none' } } }));
       const gateway = Bun.spawn([host!, 'gateway', 'run'], { env, cwd: otherWorkspace, stdout: 'pipe', stderr: 'pipe' });
+      const gatewayLog = pumpText(gateway.stdout);
+      const gatewayErrors = pumpText(gateway.stderr);
       try {
-        const reader = gateway.stdout.getReader();
-        let gatewayLog = '';
-        const readyBy = Date.now() + 60_000;
-        while (!gatewayLog.includes('[gateway] ready') && Date.now() < readyBy) {
-          const chunk = await Promise.race([reader.read(), Bun.sleep(1_000).then(() => null)]);
-          if (chunk?.done) break;
-          if (chunk?.value) gatewayLog += new TextDecoder().decode(chunk.value);
-        }
-        reader.releaseLock();
-        expect(gatewayLog).toContain('[gateway] ready');
+        await waitForText(gatewayLog, '[gateway] ready', 60_000);
+        expect({ stdout: gatewayLog.text, stderr: gatewayErrors.text }).toMatchObject({ stdout: expect.stringContaining('[gateway] ready') });
+        expect(gatewayLog.text).not.toContain('update available');
+        expect(gatewayLog.text).not.toContain('remote model catalog');
         const compacted = JSON.parse(await run(['sessions', 'compact', 'agent:main:fresh-conversation-one', '--agent', 'main', '--json', '--timeout', '60000']));
         expect(compacted).toMatchObject({ ok: true, compacted: true });
       } finally {

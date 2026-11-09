@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { LanguageModelV2CallOptions } from '@ai-sdk/provider';
 import { withEnv } from './helpers/with-env.ts';
+import { fileURLToPath } from 'node:url';
 
 const stubDir = join(tmpdir(), `claude-cli-recipe-stub-${process.pid}`);
 const stubBin = join(stubDir, 'claude');
@@ -94,6 +95,9 @@ describe('claude-cli recipe registration', () => {
     expect(recipe!.touchpoints.chat!.models).toContain('claude-opus-5');
     expect(recipe!.touchpoints.chat!.models).toContain('claude-opus-4-8');
     expect(recipe!.touchpoints.chat!.models).toContain('claude-sonnet-5');
+    // #6675: the CLI serves Haiku 5.5 (the anthropic recipe lists it), so both lists carry it.
+    expect(recipe!.touchpoints.chat!.models).toContain('claude-haiku-5-5');
+    expect(recipe!.touchpoints.expansion!.models).toContain('claude-haiku-5-5');
     expect(recipe!.touchpoints.embedding).toBeUndefined();
     // Expansion IS declared. Without it `isAvailable('expansion')` is false
     // for every claude-cli model, so expandQuery() returns [query] before any
@@ -344,7 +348,7 @@ describe('claude-cli LanguageModel — tool use', () => {
     // fresh subprocess replayed from an id-stripped transcript cannot avoid
     // repeats, which is exactly what collided real dream jobs to death.
     const src = readFileSync(
-      new URL('../src/core/ai/providers/claude-cli-language-model.ts', import.meta.url).pathname,
+      fileURLToPath(new URL('../src/core/ai/providers/claude-cli-language-model.ts', import.meta.url)),
       'utf-8',
     );
     expect(src).toContain('{"name": "<tool name>", "input":');

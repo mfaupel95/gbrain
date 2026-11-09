@@ -15,7 +15,7 @@ import type { Check } from '../../doctor.ts';
 import { checkError, doctorVerify } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { readTrustScanState } from '../../../core/eligibility/scan.ts';
-import { isUndefinedColumnError, isUndefinedTableError } from '../../../core/utils.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
 
 const SCAN_USER_MESSAGE = 'gbrain can check your memory written before its write gate for text that reads like instructions to an AI '
   + '(for example "from now on always say..."). Anything it flags stays in your brain, in search and in what agents get automatically, '
@@ -41,7 +41,7 @@ async function runTrustScan(ctx: DoctorContext): Promise<Check[]> {
         why: 'Scans legacy agent-written and unverified rows with the deterministic detector and records flag receipts; it moves, deletes or rewrites nothing, but flagged rows read as flagged (and leave proactive context under trust.agent_activation suppress) until the owner confirms them, so the user runs it after reading user_message; no agent starts it.',
         user_message: SCAN_USER_MESSAGE } });
   } catch (err) {
-    if (isUndefinedColumnError(err, 'trust_tier') || isUndefinedTableError(err)) {
+    if (isMissingSchemaObject(err, 'column', 'trust_tier') || isMissingSchemaObject(err, 'table', ['facts', 'takes', 'timeline_entries'])) {
       checks.push({ name: 'trust_scan', status: 'ok', details: { schema: 'pre_trust' }, message: 'This schema predates the write gate; the scan arrives with its migration.' });
     } else {
       checks.push(checkError('trust_scan', 'read the trust scan state', err));

@@ -9,14 +9,15 @@ export function makePurgeHandler(engine: BrainEngine): MinionHandler {
     const scope = (typeof job.data.scope === 'string' && ['pages', 'sources', 'all'].includes(job.data.scope))
       ? (job.data.scope as 'pages' | 'sources' | 'all')
       : 'all';
-    const olderThanHours = typeof job.data.olderThanHours === 'number' ? job.data.olderThanHours : 72;
+    const olderThanHours = typeof job.data.olderThanHours === 'number' ? job.data.olderThanHours : await (await import('../../sync-reconcile.ts')).readPurgeRetentionHours(engine);
     const dryRun = !!job.data.dryRun;
     let pagesPurged = 0;
     let pagesBlocked: Array<{ source_id: string; slug: string; reason: string }> = [];
     let pagesError: string | undefined;
     let sourcesPurged: string[] = [];
     if (scope === 'pages' || scope === 'all') {
-      const result = await (await import('../../persistence/purge-deleted.ts')).purgeDeletedPagesCoordinated(engine, olderThanHours);
+      // #7130: the job runs without consent, so it keeps managed sync tombstones with no live twin, like the cycle phase.
+      const result = await (await import('../../persistence/purge-deleted.ts')).purgeDeletedPagesCoordinated(engine, olderThanHours, { automatic: true });
       pagesPurged = result.count; pagesBlocked = result.blocked; pagesError = result.error?.message;
     }
     let sourcesBlocked: Array<{ id: string; reason: string }> = [];

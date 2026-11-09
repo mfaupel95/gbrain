@@ -71,12 +71,23 @@ gbrain recall --query "renewal terms" --return-unit section --budget-tokens 4000
 Use `page` for multi-session / temporal questions where the answer depends on
 the whole conversation. Use `window` when you only need local context.
 
+With `return_unit: page`, `query` sizes its hit list to the budget so the
+budget fills. Autocut stays off unless you set `autocut`, and a budget above
+about 6,250 tokens raises the row count to one row per 250 tokens, up to 100.
+An explicit `limit` or `autocut` still wins.
+
 ## Parameters and config
 
 Per-call params on `search`, `query`, `recall`:
 
 - `return_unit`: `chunk` | `window` | `section` | `page` | `auto`. Default from
   config `search.return_unit` (default `auto`).
+- `search.long_page_unit` (config only, default `off`): `window` | `section` |
+  `page` for long non-conversation hits under the implied `auto`; see
+  [Long pages](#long-pages-searchlong_page_unit).
+- `search.long_page_min_chars` (config only, default 20,000): the
+  rendered-body length in characters at which a page counts as long for
+  `search.long_page_unit`.
 - `return_window`: integer 1–3, default from `search.return_window` (default 1).
   Used by `window` (and by the `section` fallback to `window`).
 - Budget: `token_budget` on `search` / `query`, `budget_tokens` on `recall`.
@@ -85,7 +96,12 @@ Per-call params on `search`, `query`, `recall`:
   long sessions were still trimmed) and the other units use
   `search.return_budget_default` (default 6,000). Remote callers are clamped to
   `search.return_budget_max_remote` (default 32,000); the clamp is reported in
-  `delivery.budget_clamped` and `delivery.fallbacks`, never raised.
+  `delivery.budget_clamped` and `delivery.fallbacks`, never raised per call.
+  A trusted brain that needs more over stdio MCP (an eval cell's hermetic
+  brain, for example) raises the ceiling once with
+  `gbrain config set search.return_budget_max_remote 200000` and asserts that
+  `delivery.budget_clamped` is absent; trusted local CLI calls are never
+  clamped.
 - An explicit budget under `auto` (`return_unit: "auto"`, or `auto` from config
   on `search`) is a hard cap, packed by `search.auto_packing` (see
   [Explicit budgets](#explicit-budgets-the-cap)); it must be at least 32 tokens.
@@ -93,15 +109,100 @@ Per-call params on `search`, `query`, `recall`:
   `query`'s `token_budget` still prunes chunks (chunk mode), and `recall`'s
   `budget_tokens` / `budget_policy` still pack chunks (facts first), so any of
   them keeps an implied `auto` on `chunk`.
+- `recall` with a unit and `budget_tokens` packs saved facts first (unless
+  `budget_policy` is `query_first`). Delivery gets the budget the facts leave,
+  and each delivered block costs what delivery counted (text and title, in
+  `delivery.tokenizer`), so the facts and blocks together fill
+  `budget_tokens` and no delivered block is dropped afterwards.
+- Page-unit ranking cut (`search.page_rank_cut`, default `whole_pages`). A
+  `return_unit: "page"` call that passes its own budget on `search`, `query`
+  or `recall` lifts the search mode's chunk-token cut (`search.tokenBudget`:
+  4,000 under conservative, none under tokenmax), and delivery walks the
+  ranked pages, costing each at what it would deliver whole (text, title and
+  date header in `delivery.tokenizer`, within the block char cap). It stops
+  once they fill `search.page_rank_cut_factor` (default 1.5) × the budget the
+  pages share; the page that crosses it stays only if its matching span still
+  fits what the whole pages before it leave, and later pages are dropped as
+  `rank_cut` (so a short page ranked after one that cannot be delivered even
+  in part is not reached). Without the cut, a mode cut under-filled the budget
+  on small pages, and tokenmax handed delivery more pages than it could
+  deliver whole, so each arrived as a sliver. `delivery.page_rank_cut`
+  reports `mode`, `factor`, `caller_budget`, `target`, `applied_cost` (the
+  kept pages' whole cost), `candidates` and `kept`. A page call without a
+  budget and every other unit are unchanged.
+  `gbrain config set search.page_rank_cut off` restores the old path.
+  Evidence: on 72 BEAM conversations the cut at 1.5 was non-inferior to the
+  cut off (−0.25 points, lower bound −1.00 against a −3 margin) with
+  delivered context at budget. Those conversations are regression evidence,
+  not a held-out test, and 1.5 was picked under a rule amended after the dev
+  results ([gbrain-evals #126, wave 2 results](https://github.com/garrytan/gbrain-evals/blob/8b764e3e/docs/benchmarks/2026-10-13-memory-proof-wave-2-results.md)).
 
 Think reads `think.return_unit` (default `auto`) and never
 `search.return_unit`, so changing search's default does not change `think`.
 Under `auto`, think renders conversation pages whole and keeps its usual
 excerpts for every other page.
 
+### Query budgets (GBRA-205)
+
+`query`'s `token_budget` without a `return_unit` keeps its chunk-mode
+meaning by default. `gbrain config set search.query_budget_unit auto` makes
+it the same hard cap `search` uses: conversations come back whole or cut,
+packed by `search.auto_packing`. A budget below 32 is then refused.
+`search.evidence_titles` (default off) appends each page block's title to
+its date header line when date headers are on.
+
+### Date headers
+
+With `search.evidence_date_header` on (default off), every delivered block,
+including `auto`'s unchanged chunks, starts with one fixed line, and
+`delivery.date_header` is `true`:
+
+```text
+[observed 2026-03-05]
+```
+
+`observed` is when the page's text was written or said: its filename or slug
+date, frontmatter `date`, `published` or a created key, in effective-date
+precedence with `event_date` removed. An event date (when something happened)
+and the row's own timestamps are never shown as observed; a page without an
+observation date reads `[observed unknown]`. A date stored at midnight UTC
+renders as written, any other instant in `brain.timezone`. The header line
+and its newline are part of `chunk_text`: they count in `delivered.tokens`,
+`tokens_delivered` and the budget, `match_spans` offsets include them, and
+`evidenceFingerprint` hashes them; under an explicit `auto` budget the cap pays for
+them first and a cut keeps the header line whole. `recall` facts gain
+`date_header: "[observed 2026-02-10; valid 2026-03-01 to unknown]"`. A fact's
+`observed` date is the observation date of the page it came from
+(`source_markdown_slug`, such as the conversation it was extracted from), and it
+reads `unknown` for a fact kept only in its entity page's facts fence. `valid`
+starts at the fact's `valid_from`: `remember` sets it from its `valid_from`
+parameter (when the fact was said or became true). A `valid_from` that only
+records the write time (within a minute of `created_at`) reads `unknown`, so a
+header never presents when a fact was written as when it became true. An open
+validity end reads `unknown`. The setting
+applies to `search`, `query`, `recall`, `think` and `assemble_evidence`.
+
+### Tail trim
+
+With `search.evidence_tail_trim` on (default off), an `auto` delivery for
+`search` or `query` drops whole-conversation blocks past the top 3 whose
+search score is under half of rank one's. A block that holds the query's terms
+nearly as fully as rank one (at least 80% of rank one's share of them) is kept:
+a low-scoring session can restate the asked fact with an earlier value, which
+an update question needs. Ranked chunks, saved facts and long pages are never
+dropped, and a delivery without a usable score on every row is unchanged.
+`delivery.tail_trim` reports `{ dropped, kept_by_query_terms }` and
+`dropped_reasons.tail_trim` counts the dropped blocks. On LongMemEval-S
+(development evidence), the trim cut delivered tokens by about 36% on the
+questions it touched, with no measurable loss on three reader models
+([gbrain-evals#185](https://github.com/garrytan/gbrain-evals/pull/185)). The
+library `assembleEvidenceForHits` runs it when the call passes `query` and
+each hit's `score`.
+
 Config keys: `search.return_unit`, `search.return_window`,
 `search.return_budget_default`, `search.return_budget_conversation`,
-`search.return_budget_max_remote`, `search.auto_packing`, `think.return_unit`. Kill switch:
+`search.return_budget_max_remote`, `search.evidence_date_header`, `search.evidence_titles`, `search.evidence_tail_trim`, `search.auto_packing`, `search.query_budget_unit`,
+`search.page_rank_cut`, `search.page_rank_cut_factor`, `think.return_unit`. Kill switch:
 `gbrain config set search.return_unit chunk` and
 `gbrain config set think.return_unit chunk` (or pass `return_unit: "chunk"`
 per call).
@@ -135,13 +236,87 @@ explicit budget never returns less than `chunk` would, and `budget_used`
 exceeds `budget_tokens` only by such unchanged chunks. An explicit budget
 changes this; see the next section.
 
+### Long pages (`search.long_page_unit`)
+
+Off by default. `gbrain config set search.long_page_unit section` (or `window`,
+`page`; `off` turns it back off) makes `search` and `query` deliver a **long
+non-conversation hit** in that unit under the implied `auto`, the way `auto`
+already delivers conversations whole. Every other hit keeps its ranked chunk
+unchanged. The value is a delivery unit from the table above and the unit
+algorithms are the same; nothing selects passages by term overlap, so the
+delivered unit is always the one around the ranked hit.
+
+**Which unit applies.** One table decides, per call and hit:
+
+| # | Source | When it applies | Unit |
+|---|---|---|---|
+| 1 | `return_unit` on the call | always (`auto` included: an explicit `auto` keeps every non-conversation chunk) | that unit |
+| 2 | `search.return_unit` set to anything but `auto` | `return_unit` omitted | that unit, every hit |
+| 3 | `search.long_page_unit` (not `off`) | `return_unit` omitted, `search.return_unit` unset or `auto`, no explicit `token_budget`, and the hit is a long non-conversation page | that unit (`delivered.reason: "long_page"`) |
+| 4 | implied `auto` | everything else | conversations whole, other hits their ranked chunk |
+
+The policy is resolved at the `search`/`query` caller and passed to the
+assembler, so `recall`, `think` (`think.return_unit`) and `assemble_evidence`
+never read the key and stay byte-identical with it on. `snippet_chars` does
+not turn it off: a row widened by it (`delivered: {unit, reason: "long_page"}`)
+is exempt from `snippet_chars` and comes back whole, because a head cut would
+drop the tail the unit was widened to reach. The widened row still sits inside
+`search.return_budget_conversation` and the long-page page and input-byte
+limits below, and `snippet_chars` still cuts every other row, ranked chunks
+included (those rows report `delivered: {truncated: true}`). The
+`delivered.unit` and `reason` on the row are what tell the reader why it is
+longer than `snippet_chars`. An explicit `token_budget` keeps it off because the cap (next section) keeps
+its own rules, and `query`'s bare `token_budget` is chunk-mode budgeting anyway.
+The subagent default snippet cap already keeps the implied `auto` on `chunk`.
+
+**What is long.** A page whose rendered body (compiled truth plus timeline;
+compiled truth only under `detail: "low"`) holds at least
+`search.long_page_min_chars` characters (default **20,000**;
+`gbrain config set` refuses anything but a positive whole number, and an
+unusable stored value reads as the default). The size preflight compares the
+stored body's character count; delivery confirms the threshold on the rendered
+text (`pageEvidenceText`), and a page under it keeps its ranked chunk with no
+fallback code. Conversation pages
+(see [Conversation detection](#conversation-detection)) and saved-fact rows are
+never long pages.
+
+**Limits.** One size preflight query reads the character and byte counts of the hit pages
+under the caller's read scope; it never reads a body. Then, in rank order, at
+most **5** long pages (`LONG_PAGE_MAX_PAGES`) holding at most **1,000,000**
+stored-body bytes together (`LONG_PAGE_MAX_INPUT_BYTES`) are fetched in one
+bounded batched call of their own, so they can neither slow nor fail the
+conversation fetch. A page that would cross a limit is skipped whole, never
+sliced: bodies are sanitized whole before any cut. Preflight plus fetch share
+a cooperative **2,000 ms** deadline (`LONG_PAGE_DEADLINE_MS`). A long page that
+cannot be delivered in its unit keeps its ranked chunk, byte-identical to the
+off path, with `delivered.reason: "long_page_chunk"` and a fallback code
+saying why (below). A preflight that fails or misses the deadline leaves the
+call on the off path.
+
+**Budget.** Long pages are counted in the same delivery budget as
+conversations (`search.return_budget_conversation`, default 24,000, clamped for
+remote callers): unchanged chunks are paid for first, then conversations and
+long pages reserve their matching span and grow in rank order. A long page
+whose matching span no longer fits keeps its ranked chunk
+(`long_page_chunk`, fallback `long_page_over_budget`), so the key never returns
+less than `chunk` would.
+
+**Response.** A long-page block is an ordinary delivered row (`delivered.unit`
+is the unit that ran; a `section` with no structure falls back to `window`
+with `no_section_structure`). Lean rows (the remote default) keep
+`delivered: { unit, reason }` on both long-page reasons, plus `truncated: true`
+when cut; every other lean row keeps only `{ truncated: true }`. A response
+with no long page and no conversation is byte-identical to the key off.
+
 ### Explicit budgets (the cap)
 
 When the caller passes a budget (`token_budget` on `query`, `search` and
 `assemble_evidence`, `budget_tokens` on `recall`) and the unit is `auto`, the
 budget is a hard cap on the delivered evidence: the recount of every result's
 title plus `chunk_text` (the evidence, its omission lines, cut markers and
-snippet markers) never exceeds it. JSON fields outside those two (`delivered`,
+snippet markers) never exceeds it, except that a quoted conversation row at
+rank one is kept when its quote fence alone exceeds a very small budget (see
+[Response shape](#response-shape-additive)). JSON fields outside those two (`delivered`,
 spans, scores, the `delivery` meta) are not counted. The four operations share
 one rule:
 
@@ -195,13 +370,17 @@ so a bare budget does not engage the cap.
 
 1. An explicit `snippet_chars` wins: delivered blocks are capped at that many
    characters (spans are clipped, `delivered.truncated` becomes true and
-   `snippet_cap` is reported).
+   `snippet_cap` is reported). The one exemption is a row widened by
+   `search.long_page_unit` (`delivered.reason: "long_page"`): it comes back
+   whole, within `search.return_budget_conversation` and the long-page limits.
 2. Then an explicit `return_unit`: the subagent default snippet cap is skipped
    for its blocks.
 3. Then the subagent default snippet cap (`agent.search_snippet_chars`, 300):
    when it applies, neither the implied `auto` nor a config-level
    `search.return_unit` expands.
-4. Then `search.return_unit` from config, else `auto`.
+4. Then `search.return_unit` from config, else `auto` (with `search.long_page_unit`
+   for long non-conversation hits, whose widened rows are exempt from an
+   explicit `snippet_chars`; see rule 1).
 
 ## Response shape (additive)
 
@@ -223,7 +402,7 @@ so those responses carry neither `delivered` nor `delivery`.
   "revision": "3f0c…",            // pages.knowledge_revision the text was read from
   "unmapped_chunk_ids": [],       // hits whose chunk is no longer in the current revision (present only when non-empty)
   "fallback_reason": "fetch_failed", // present only when the block fell back to the hit chunk text
-  "reason": "conversation_type"     // auto only: conversation_type | conversation_slug | not_conversation | conversation_over_budget
+  "reason": "conversation_type"     // auto only: conversation_type | conversation_slug | not_conversation | conversation_over_budget | saved_fact | long_page | long_page_chunk
 }
 ```
 
@@ -238,6 +417,30 @@ by page. `gbrain search --explain` prints each result's unit and reason
 the returned `chunk_text`, computed after every text transformation (sanitizing,
 cuts, omission lines and secret redaction). The text carries no inline markers.
 A hit whose chunk cannot be located is listed in `unmapped_chunk_ids` instead.
+
+A row of third-party text is returned as a quoted excerpt (#7600, #8042,
+`search/transcript-quote.ts`): a page whose type holds someone else's words
+(`conversation`, `meeting`, `slack`, `slack-dm-day`, `slack-thread`,
+`email`, `email-digest`, `imessage`, `imessage-daily`, `transcript`, `chat`)
+or a fact row taken from one (marker `fact <id>`): `facts.source`
+`cli:extract-conversation-facts…`, or a fact whose `source_markdown_slug`,
+`derivation_inputs` or backstop `source_session` page (`sync:<slug>`,
+`put_page:<slug>`) is such a page (the facts backstop's facts).
+Tool-call blocks become a one-line summary, then a marker line and a code
+fence wrap the text. `assemble_evidence`, `search` and `query` quote these
+rows for every caller; `recall` quotes its `results` and `facts` for remote
+callers, and think's prompt quotes them on every run. A remote (MCP)
+reader also gets a row below the owner's trust tier (agent-written, tool
+data, external or unverified origin; GST-687) quoted the same way, by its
+stored tier; only third-party types get tool calls summarized. Its
+`match_spans` index that returned text (a span inside a summarized block
+covers the summary), and its `tokens`, the meta `tokens_delivered` and
+`budget_used` and `evidenceFingerprint` count or hash the fenced text. An
+explicit `snippet_chars` caps the text inside the fence, so the row can run
+longer than the cap by the marker and fence lines. Under `auto` an explicit
+budget pays for the fence, except that a rank-one row is kept when the fence
+alone exceeds a very small budget; budgets under other units do not count it.
+With `date_header`, the header stays the first line of the row, ahead of the marker and the fence.
 
 One result is returned per expanded page, at the page's best rank. `chunk_id`,
 `chunk_index`, `score` and the other ranking fields stay those of the page's
@@ -261,6 +464,8 @@ Response meta (`_meta.retrieval.delivery` over MCP; top-level `delivery` on
   "dropped_reasons": { "budget_floor": 1 },
   "fallbacks": ["budget_clamped"], // distinct non-fatal problem codes, never silent
   "budget_clamped": { "requested": 50000, "max": 32000 },
+  "date_header": true,             // only when search.evidence_date_header is on
+  "tail_trim": { "dropped": 1, "kept_by_query_terms": 0 }, // only when search.evidence_tail_trim ran
   "auto_packing": "cap_only"       // explicit auto budgets only: the packing that ran
 }
 ```
@@ -279,11 +484,16 @@ delivered text and each result gains `delivered`.
 | `no_section_structure` | `section` found no headings or speaker turns. | A `window` block (`delivered.unit: "window"`). |
 | `no_text_chunks` / `anchor_not_located` | No hit could be placed in the page text: no text chunk was in reach and the hit text itself was not found, or none of the located chunks overlap a hit. | The hit chunk (a code chunk without its synthesized header line), `fallback_reason` set. |
 | `page_missing` | A hit carried no page id (cannot be re-authorized by id). | The hit chunk (live hits only), `fallback_reason` set. |
+| `segment_read_failed` | A page stored in segments could not be read around its hits (its stored projection metadata was unusable, or a segment read failed). | The hit chunk (live hits only; cached hits are dropped as `not_readable`), `fallback_reason` set. |
 | `redaction_unmapped` | Secret redaction changed a block. | Redacted block; its spans move to `unmapped_chunk_ids`. |
 | `image_query_unsupported` | `query` with `image`: image hits are never expanded. | Plain image results; meta says so. |
 | `snippet_cap` | An explicit `snippet_chars` cut a block. | Capped block, `truncated: true`. |
 | `budget_clamped` | A remote budget above the max was clamped. | Clamped budget. |
 | `tokenizer_heuristic` | cl100k unavailable; char/4 heuristic used. | Counts from the heuristic. |
+| `date_header_unavailable` | Date headers are on but the page dates could not be read. | Every header reads `[observed unknown]`. |
+| `long_page_pages` / `long_page_bytes` | `search.long_page_unit`: the long page came after 5 long pages, or would cross 1,000,000 stored-body bytes. | Its ranked chunk (`reason: long_page_chunk`). |
+| `long_page_over_budget` | `search.long_page_unit`: the long page's matching span no longer fit the budget. | Its ranked chunk (`reason: long_page_chunk`). |
+| `long_page_deadline` / `long_page_fetch_failed` / `long_page_preflight_failed` | `search.long_page_unit`: the size preflight or the long-page fetch missed the 2,000 ms deadline or failed. | Its ranked chunk (`reason: long_page_chunk`); a failed preflight leaves the call on the off path. |
 | drop `not_readable` | The page is no longer readable by this caller (deleted, private, grant revoked, quarantined, archived source, source outside scope). | Result removed. Never falls back to cached text. |
 | `snippet_marker_omitted` | Under an explicit `auto` budget, a row's allocation could not hold the snippet recovery marker. | Capped block without the marker, `truncated: true`. |
 | drop `budget_floor` | Not even the block's matching span fits the remaining budget. | Result removed (rank one is instead cut to fit). Under `auto` without an explicit budget nothing is dropped for budget: the conversation keeps its ranked chunks. |
@@ -333,7 +543,9 @@ warning naming the minimum server version.
   part of delivered text; `page` text is the sanitized body only.
 - **Non-mutation.** The stage returns new result objects and never mutates or
   caches expanded text.
-- **Bounded work.** One engine query per request. It reads each hit page's
+- **Bounded work.** One engine query per request (with `search.long_page_unit`
+  on and a long page among the hits: plus one size preflight and one bounded
+  long-page fetch, see [Long pages](#long-pages-searchlong_page_unit)). It reads each hit page's
   body once (bounded by the import size cap) plus the chunks within
   ±`return_window` of each hit; each block ≤ 60,000 characters (under the
   64 KiB output-redaction field limit).

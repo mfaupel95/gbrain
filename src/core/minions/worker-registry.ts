@@ -27,9 +27,11 @@ import {
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync } from '../spawn.ts';
 import { gbrainPath, loadConfig } from '../config.ts';
 import { getEffectiveNiceness } from './niceness.ts';
+import { VERSION } from '../../version.ts';
+import { runtimeInstallRoot } from '../runtime-build.ts';
 
 /** On-disk shape of a `worker-<pid>.json` entry. */
 export interface WorkerRegistryEntry {
@@ -43,12 +45,38 @@ export interface WorkerRegistryEntry {
   nice_requested: number | null;
   /** Niceness actually in effect when the worker registered. */
   nice_effective: number | null;
+  /** #7245: the gbrain version the worker runs (in memory); absent on an entry an older worker wrote. */
+  version?: string;
+  /** #7245: the package root the worker loaded its code from (local path, never in remote output); null in a compiled binary. */
+  install_root?: string | null;
 }
 
 /** A live worker as returned by readWorkers(): on-disk entry + fresh re-measure. */
 export interface LiveWorker extends WorkerRegistryEntry {
   /** Niceness re-measured NOW via getEffectiveNiceness(pid). */
   nice_now: number | null;
+}
+
+/**
+ * The registry directory exists but cannot be listed (EACCES on it or a
+ * parent, ENOTDIR, ...). Worker liveness is unknown: callers report it as
+ * unknown with this errno and path, never as zero workers.
+ */
+export class WorkerRegistryUnreadableError extends Error {
+  readonly path: string;
+  readonly errno: string;
+  constructor(path: string, errno: string, cause: unknown) {
+    super(`worker registry unreadable (${errno}): ${path}`, { cause });
+    this.name = 'WorkerRegistryUnreadableError';
+    this.path = path;
+    this.errno = errno;
+  }
+}
+
+/** The safe evidence of a failed registry read: errno and path, or the error class name for anything else. */
+export function workerRegistryReadFailure(err: unknown): { errno: string; path: string | null } {
+  if (err instanceof WorkerRegistryUnreadableError) return { errno: err.errno, path: err.path };
+  return { errno: err instanceof Error ? err.name : 'unknown', path: null };
 }
 
 /** Directory holding one file per live worker. Brain-isolated via GBRAIN_HOME. */
@@ -101,6 +129,8 @@ export function registerWorker(info: {
     started_at: info.started_at,
     nice_requested: info.nice_requested,
     nice_effective: info.nice_effective,
+    version: VERSION,
+    install_root: runtimeInstallRoot(),
   };
   const path = entryPath(info.pid);
   try {
@@ -206,23 +236,26 @@ const PID_REUSE_TOLERANCE_MS = 5000;
  * confirmed-dead entries (pruning their files), filters by brain id, applies the
  * PID-reuse guard, and re-measures each live worker's niceness now.
  *
+ * Only a missing registry directory (ENOENT) is an empty registry; any other
+ * listing failure throws WorkerRegistryUnreadableError (existsSync() answers
+ * false for an unsearchable parent too, so it is not used as the gate).
  * `getNice` is injectable for tests.
  */
 export function readWorkers(
   getNice: (pid: number) => number | null = (pid) => getEffectiveNiceness(pid),
 ): LiveWorker[] {
   const dir = workerRegistryDir();
-  if (!existsSync(dir)) return [];
-
-  const brainId = currentBrainId();
-  const live: LiveWorker[] = [];
-
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.startsWith('worker-') && f.endsWith('.json'));
-  } catch {
-    return [];
+  } catch (e) {
+    const errno = (e as NodeJS.ErrnoException)?.code;
+    if (errno === 'ENOENT') return [];
+    throw new WorkerRegistryUnreadableError(dir, errno ?? 'unknown', e);
   }
+
+  const brainId = currentBrainId();
+  const live: LiveWorker[] = [];
 
   for (const f of files) {
     const full = join(dir, f);

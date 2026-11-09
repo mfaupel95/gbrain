@@ -25,6 +25,7 @@ import { readPageSnapshot, resolveGlobalPurges } from './page-state/snapshot.ts'
 import type { GlobalPurgeMarker, PageSnapshot, PageWithdrawal } from './page-state/types.ts';
 import { REVISION_BACKFILL_PENDING } from './page-state/types.ts';
 import type { ReadQuery } from './search/read-enrichment.ts';
+import { isSegmentedPage } from './page-body/page-shape.ts';
 import { rowToPage } from './utils.ts';
 
 export const PAGE_SNAPSHOT_BATCH_MAX_BYTES = 32 * 1024 * 1024;
@@ -88,10 +89,13 @@ export async function readPageSnapshotsBatch(
     const globalPurges: GlobalPurgeMarker = { count: Number(raw?.count ?? 0), latest: raw?.latest == null ? null : String(raw.latest), world_only: false };
     const withdrawals = [...row.snapshot_withdrawals as PageWithdrawal[], ...await resolveGlobalPurges(query, page.source_id, globalPurges,
       [String(row.fingerprint_body ?? ''), String(row.fingerprint_timeline ?? '')])];
-    page.compiled_truth = overlayWithdrawalBody(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);
-    page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
+    if (!isSegmentedPage(page)) {
+      page.compiled_truth = overlayWithdrawalBody(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);
+      page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
+    }
     snapshots.set(key, { page, tags: row.snapshot_tags as string[], revision: row.knowledge_revision == null ? REVISION_BACKFILL_PENDING : String(row.knowledge_revision),
-      sourceIncarnation: String(row.source_incarnation), withdrawals, ...(globalPurges.count > 0 ? { globalPurges } : {}) });
+      sourceIncarnation: String(row.source_incarnation), withdrawals, ...(globalPurges.count > 0 ? { globalPurges } : {}),
+      ...(isSegmentedPage(page) ? { bodyGeneration: Number(row.body_generation) } : {}) });
   }
   return { snapshots, covered: rows.length };
 }

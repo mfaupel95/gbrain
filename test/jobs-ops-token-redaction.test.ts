@@ -200,6 +200,7 @@ describe('registry sweep ratchet — no jobs op envelope may carry the raw token
         const id = await seedPrivateJobWithStatus(status);
         const args: Record<string, unknown> = { id };
         if ((op.params as Record<string, unknown>).message) args.message = 'sweep-probe';
+        if ((op.params as Record<string, unknown>).timeout_s) args.timeout_s = 0;
         // Success OR error envelope — the raw capability must appear in neither.
         const res = await dispatchToolCall(engine, op.name, args, { ...STDIO });
         expect(res.content[0].text).not.toContain(RAW_TOKEN);

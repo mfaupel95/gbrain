@@ -5,6 +5,7 @@ import { managedPersistenceEnabled } from './ownership.ts';
 import { deriveTrust, recordTaintEdges } from '../trust/taint.ts';
 import { applyGateDecision, derivedGateConfig, derivedGateInput, emptyGateTally, type GateTally } from '../trust/derived-gate.ts';
 import { decideFactWrite, recordFlaggedRow } from '../write-gate-store.ts';
+import { inheritRelinkedEntities } from '../facts/conversation-relink-carry.ts';
 
 /**
  * #5575 I2: the conversation fact extractor's context is the page alone, so
@@ -28,8 +29,9 @@ async function recordInsertedEdges(tx: BrainEngine, sourceId: string, result: un
  * counted and skipped.
  */
 type FenceRow = NewFact & { row_num: number; source_markdown_slug: string };
-export async function insertGatedFacts(tx: BrainEngine, sourceId: string, slug: string, rows: FenceRow[],
+export async function insertGatedFacts(tx: BrainEngine, sourceId: string, slug: string, batch: FenceRow[],
   derivation: Awaited<ReturnType<typeof conversationDerivation>>): Promise<{ inserted: number; ids: number[]; write_gate: GateTally }> {
+  const rows = await inheritRelinkedEntities(tx, sourceId, slug, batch); // #6764: a cleared free-relinked claim keeps its entity
   const cfg = await derivedGateConfig(tx);
   const input = derivedGateInput(derivation.trust);
   const write_gate = emptyGateTally();

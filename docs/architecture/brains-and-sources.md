@@ -49,6 +49,27 @@ source name) and never picks the repo, on a local brain, through a running
 `GBRAIN_SOURCE`, `.gbrain-source` or the defaults select, and the JSON result
 names it in `source_id`.
 
+### Git is the parent of a source with a checkout
+
+Most sources are a Git checkout (`local_path`) plus the pages gbrain derived
+from it. The files are the record people read, review and clone; the
+database is an index that gbrain can rebuild from them. How tightly the
+database follows Git depends on the source:
+
+| Source | Where the record is | How the database follows |
+|---|---|---|
+| Checkout, mixed (the default) | The files in Git | Sync imports what is committed (or the working tree when asked). A write publishes the file and its database row together (managed) or the row first (classic), and the Git commit follows later (a background Git effect once Git durability is on). When the two disagree, sync keeps the database version or holds the page for review. |
+| Checkout, strict (`canonical: git`, opt-in per source) | Git commits | Every write is committed to Git before its row. Sync indexes committed blobs only, and Git wins. Private pages, `storage.db_only` directories and ignored paths are declared database-only. |
+| Read-only mirror (`gbrain sources mirror-readonly`) | The upstream repository | Sync imports; gbrain never writes into the checkout. |
+| No checkout (connector sources, database-only sources) | The database | Nothing to derive from; back up the database. |
+
+Scripts, crons and people that write files in a checkout commit them with
+`gbrain git commit-push -- <paths>`, which takes the same writer lock. To make
+a source strict, or to see how far its database is from Git, read
+[git-canonical sources](../guides/git-canonical.md); `gbrain sources git-gap <id>`
+is the read-only check, and doctor's `db_ahead_of_git` and `git_index_lag`
+report it brain-wide.
+
 ### When does each axis move?
 
 | You want to | Adjust |
@@ -302,11 +323,24 @@ gbrain extract links --source db                      # re-extract once; --stale
 
 Without the flag, an isolated (`federated=false`) source only writes edges
 whose both endpoints live in that source; a federated source may also link
-into the configured default source (`sources.default`). With the flag on, a
-target that exists only in other sources resolves to the lexicographically
-smallest source id, so repeated extracts converge on the same row. The read
-side is unchanged: a federated caller's source grant still scopes every link
-read.
+into the configured default source (`sources.default`) and follow an
+explicit `[[source:slug]]` reference. With the flag on, a target that exists
+only in other sources resolves to the lexicographically smallest source id,
+so repeated extracts converge on the same row.
+
+Every automatic writer applies that one policy: `put_page` and `capture`
+(link preparation), the managed stale pass, the source reconciliation sweep
+and `extract links --source db`. A local write resolves a cross-source
+wikilink only under `link_resolution.cross_source` or from a federated origin
+source; the drops it counts come back in the write receipt as
+`auto_links.skipped_cross_source`. An outbound edge always originates in the
+page's own source (canonical attendance, which points at the person, is the
+one edge whose far endpoint may live elsewhere), and a derived edge records
+whether its reference was authored qualified (`links.resolution_type`:
+`qualified` for `[[source:slug]]`, `unqualified` otherwise). The read side is
+unchanged: a federated caller's source grant still scopes both endpoints of
+every link read, and the entity card confines an untrusted caller's edges to
+the card's own source.
 
 ## What confines remote callers (and what does not)
 
@@ -318,7 +352,7 @@ fail-closed and tested:
   (federated grant array > scalar source floor > nothing). A caller without a
   grant for a source cannot read its pages, chunks, or edges.
 - **Facts visibility** — facts carry `private`/`world` visibility; remote
-  callers see `world` only.
+  callers see `world` only, except the brain owner's `recall`.
 - **Takes holders** — per-token allow-lists (`gbrain auth permissions <token>
   set-takes-holders ...`) scope which held takes a remote caller sees.
 - **Write-side slug fences** — a client bound to slug prefixes can only write
@@ -337,13 +371,21 @@ The exact frontmatter value `private` hides that concrete page row;
 derived pages: an extracted atom or synthesized concept with no `visibility`
 is private, an atom whose origin page is private is hidden, and so is a
 synthesized concept built from a private atom. Trusted local CLI callers
-retain access. Operator settings can opt out of private-page
+retain access, and so does a credential bound to the brain owner
+(`gbrain access owner set <member>`). Operator settings can opt out of private-page
 filtering, so source grants remain an independent boundary: keep content in an
 ungranted source when remote callers must have no access to that source.
+Every designation, who reads it and when to use it:
+[access designations](../guides/access-designations.md).
 
 ## Further reading
 
 - [`topologies.md`](./topologies.md) — where the DB lives (operator recipes
   for each deployment shape).
+- [`git-canonical.md`](../guides/git-canonical.md) — strict sources: Git
+  first, the database derived from the commits, and how to convert or roll
+  back a source.
+- [`multi-source-brains.md`](../guides/multi-source-brains.md) — adding,
+  scoping and hosting sources, and narrowing one request with `source_ids`.
 - `skills/conventions/brain-routing.md` — the agent-facing decision table.
 - `CHANGELOG.md` — release history for the `sources` and `mounts` primitives.

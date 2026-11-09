@@ -7,7 +7,7 @@
  * patches process-global stdout/exit.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,6 +25,34 @@ async function run(body: string): Promise<{ out: string; err: string; code: numb
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('#6629 json_document_missing event', () => {
+  test('the event names the release, guard and exit code, and carries no argv values', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-6629-'));
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-6629-run-'));
+    const script = join(dir, 'run.ts');
+    const src = join(import.meta.dir, '..', 'src');
+    writeFileSync(script, `import * as g from ${JSON.stringify(HELPER)};
+import { agentJsonGuardMode } from ${JSON.stringify(join(src, 'cli', 'json-guard.ts'))};
+const { json } = agentJsonGuardMode(['doctor', '--json', '--fast', 'private-arg-value']);
+g.installStdoutPipeDelivery({ json });
+console.log('forgot the document');
+process.exit(0);`);
+    try {
+      const proc = Bun.spawn([process.execPath, script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GBRAIN_HOME: home } });
+      expect(await proc.exited).toBe(0);
+      const raw = readFileSync(join(home, '.gbrain', 'agent-contract', 'events.jsonl'), 'utf8').trim();
+      const { ts, ...event } = JSON.parse(raw.split('\n').pop()!);
+      expect(typeof ts).toBe('string');
+      const { VERSION } = await import('../src/version.ts');
+      expect(event).toEqual({ transport: 'cli', command: 'doctor', code: 'json_document_missing', outcome: 'committed', version: VERSION, guard: 'document', exit_code: 0 });
+      expect(raw).not.toContain('private-arg-value');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('--json guard (document mode)', () => {
   test('console.log and stdout.write go to stderr; the final document alone reaches fd 1', async () => {
@@ -185,7 +213,7 @@ describe('D2 command migrations: doctor, sync, embed on a keyless brain', () => 
     const ok = await cli(['sync', '--source', 'notes', '--no-pull', '--json']);
     expect(ok.exitCode).toBe(0);
     expect(onlyDocument(ok.stdout)).toMatchObject({ schema_version: 1, source_id: 'notes', added: 1 });
-    const bad = await cli(['sync', '--source', 'notes', '--json']);
+    const bad = await cli(['sync', '--source', 'no-such-source', '--no-pull', '--json']);
     expect(bad.exitCode).toBe(1);
     const doc = onlyDocument(bad.stdout);
     expect(typeof doc.code).toBe('string');

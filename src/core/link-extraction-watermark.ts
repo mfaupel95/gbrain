@@ -13,6 +13,18 @@
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { LINK_EXTRACTION_GENERATION_KEY } from './line-grammar.ts';
 
+/**
+ * #6803 (D5): every `LINK_EXTRACTOR_VERSION_TS` value carries its release note, written with the code and copied into
+ * the CHANGELOG at ship. A bump re-stales every page brain-wide, and a plain `gbrain extract --stale` drains a large
+ * brain only a few percent per 30-minute run, so the note names the re-extraction and the command that finishes it.
+ * Pinned by test/link-extractor-bump-notes.test.ts.
+ */
+export const EXTRACTOR_BUMP_NOTES: Readonly<Record<string, string>> = {
+  '2026-10-08T00:00:00Z': 'Link typing picks up the held-out-confirmed Q2 units (U1, U3, U4), so every page re-extracts its links once, brain-wide (zero model calls). ' +
+    'Plain `gbrain extract --stale` drains it 30 minutes per run and resumes (the cron default); `gbrain extract --stale --catch-up` finishes it in one run on the brain host ' +
+    '(about 6 h at 290K pages and 10 ms RTT; each page commits alone, safe to interrupt). `gbrain extract --stale --dry-run --json` reports `actionable: 0` when done.',
+};
+
 /** The later of two ISO-8601 instants, returned as written (a microsecond stamp keeps its precision). */
 export function laterInstant(a: string, b: string | null | undefined): string {
   if (!b) return a;

@@ -97,6 +97,31 @@ describe('projection statistics refresh after a write pass', () => {
       await verifyProjectionStatistics(engine);
     } finally { await db.close(); }
   }, 30_000);
+
+  test('PGLite: growth of planner_stats_deltas alone keeps a small pass off the full ANALYZE; another grown table still runs it', async () => {
+    const db = new PGlite();
+    try {
+      const engine = fixtureEngine(db);
+      const relpages = async (table: string) => Number((await db.query<{ relpages: number }>(
+        'SELECT relpages FROM pg_class WHERE oid = $1::regclass', [table])).rows[0].relpages);
+      const grow = (table: string) => db.exec(`INSERT INTO ${table}(n) SELECT i FROM generate_series(1, 20000) i; DELETE FROM ${table};`);
+      await db.exec(`CREATE TABLE pages (id integer PRIMARY KEY, text_projection_revision uuid, knowledge_revision uuid);
+        INSERT INTO pages SELECT i, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001' FROM generate_series(1, 10000) i;
+        CREATE TABLE planner_stats_deltas (id bigserial PRIMARY KEY, n integer);
+        CREATE TABLE facts (id bigserial PRIMARY KEY, n integer);
+        INSERT INTO planner_stats_deltas(n) VALUES (1); INSERT INTO facts(n) VALUES (1);
+        ANALYZE;`);
+      await db.exec(PROJECTION_STATISTICS_SQL);
+      await grow('planner_stats_deltas');
+      const sampled = await relpages('planner_stats_deltas');
+      expect(await refreshProjectionStatistics(engine, 100)).toBe(true);
+      expect(await relpages('planner_stats_deltas')).toBe(sampled);
+      await grow('facts');
+      expect(await refreshProjectionStatistics(engine, 100)).toBe(true);
+      expect(await relpages('facts')).toBeGreaterThan(1);
+      expect(await relpages('planner_stats_deltas')).toBeGreaterThan(sampled);
+    } finally { await db.close(); }
+  }, 30_000);
 });
 
 describe('projection statistics migration postconditions', () => {

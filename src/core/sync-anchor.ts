@@ -5,7 +5,8 @@ import { withCompanyBrainSource } from './company-brain/profile.ts';
  * sprint C13-C14) as a pure move.
  */
 import { realpathSync } from 'fs';
-import { resolve as pathResolve } from 'path';
+import { syncDispatchRow } from './sync-dispatch-read.ts';
+import { isAbsolute, resolve as pathResolve } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type { SyncOpts } from '../commands/sync.ts';
 import { ownsGlobalSyncAnchor, sameRepoDir } from './sync.ts';
@@ -24,6 +25,9 @@ export async function readSyncAnchor(
   which: 'repo_path' | 'last_commit',
 ): Promise<string | null> {
   if (sourceId) {
+    // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the repo path (sync-dispatch-read.ts).
+    const routing = which === 'repo_path' ? await syncDispatchRow(engine, sourceId) : undefined;
+    if (routing) return routing.local_path;
     const col = which === 'repo_path' ? 'local_path' : 'last_commit';
     const rows = await engine.executeRaw<Record<string, string | null>>(
       `SELECT ${col} AS value FROM sources WHERE id = $1`,
@@ -74,6 +78,10 @@ export async function readSyncAnchor(
  * commit runs `git add -A` at the git root (there's no file list yet to
  * scope it to — collection happens after this point) — see the P2 review
  * finding on `createSyncBaselineCommit`'s callers.
+ *
+ * #7630: a relative stored anchor (a legacy `local_path` of ".") proves
+ * nothing: it realpath-resolves against the process cwd, so it "equals"
+ * whatever directory the sync runs from. Only an absolute anchor can.
  */
 export async function isAnchorOwnedSyncPath(
   engine: BrainEngine,
@@ -83,7 +91,7 @@ export async function isAnchorOwnedSyncPath(
   if (opts.srcSubpath) return false;
   if (opts.sourceId && opts.sourceId !== 'default') return false;
   const anchor = await readSyncAnchor(engine, opts.sourceId, 'repo_path');
-  if (anchor === null) return false;
+  if (anchor === null || !isAbsolute(anchor)) return false;
   try {
     return realpathSync(anchor) === realpathSync(repoPath);
   } catch {
@@ -135,6 +143,7 @@ export async function ownsSourceSyncAnchor(
     );
     const configured = rows[0]?.local_path ?? null;
     if (configured === null) return { owns: true, configured: null };
+    if (!isAbsolute(configured)) return { owns: false, configured };
     return { owns: sameRepoDir(configured, dir), configured };
   } catch {
     return { owns: true, configured: null };
@@ -197,7 +206,8 @@ export async function sourceCommitAnchorAllowed(
   try {
     let configured: string | null = null;
     if (sourceId === 'default') {
-      configured = (await engine.getConfig('sync.repo_path')) || null;
+      const globalPath = (await engine.getConfig('sync.repo_path')) || null;
+      configured = globalPath && isAbsolute(globalPath) ? globalPath : null;
     }
     if (configured === null) {
       const rows = await engine.executeRaw<{ local_path: string | null }>(
@@ -207,6 +217,7 @@ export async function sourceCommitAnchorAllowed(
       configured = rows[0]?.local_path ?? null;
     }
     if (configured === null) return { owns: true, configured: null };
+    if (!isAbsolute(configured)) return { owns: false, configured };
     return { owns: sameOrNestedRepoDir(configured, repoDir), configured };
   } catch {
     return { owns: true, configured: null };
@@ -270,6 +281,8 @@ export async function writeSyncAnchor(
           [value, sourceId],
         );
       }
+      // GBRA-133 PR 2a: the host that advanced a classic source is the one whose resident notifier watches it.
+      await (await import('./notifier/store.ts')).recordLocalSyncer(engine, sourceId);
     } else {
       // #4369: repo_path repoints require directory-identity EQUALITY
       // (ownsSourceSyncAnchor); last_commit advances above use the weaker

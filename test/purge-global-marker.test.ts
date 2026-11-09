@@ -116,8 +116,8 @@ describe("subject-'*' purges resolve per overlay", () => {
       await purgedEverywhere(engine, slug);
       const snapshot = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
       expect(snapshot.withdrawals.filter(w => w.purged)).toEqual([]);
-      expect(await fileMatchesSnapshot(engine, slug, pageBody(slug), snapshot)).toBe(true);
-      expect(await fileMatchesSnapshot(engine, slug, pageBody(slug) + '\nAn uncoordinated local edit.\n', snapshot)).toBe(false);
+      expect(await fileMatchesSnapshot(engine, slug, pageBody(slug), snapshot, `${slug}.md`)).toBe(true);
+      expect(await fileMatchesSnapshot(engine, slug, pageBody(slug) + '\nAn uncoordinated local edit.\n', snapshot, `${slug}.md`)).toBe(false);
     }
   }), 60_000);
 

@@ -30,7 +30,7 @@
  * table reset is needed. Hermetic: no embedding provider, no model calls.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../../core/spawn.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

@@ -16,17 +16,28 @@
  *   managed worktree at the binding's path plus a `host.json` minted later
  *   under a different `HOME`/`GBRAIN_HOME`). Names both files and the one-line
  *   `GBRAIN_HOME` fix; never re-identifies anything.
+ *
+ * #6696 C6: `serve_build_drift` (its own entry, one read) compares the live
+ * resident consumers' heartbeat `version` with this binary's VERSION and warns
+ * when serve or a worker runs an older build than this checkout, with the
+ * installed service's restart command (else the pid) and a verify. A serve
+ * that predates heartbeats has no row; `consumers_without_heartbeat` names it.
  */
+import { homedir } from 'node:os';
 import type { Check } from '../../doctor.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
-import { listHostConsumers } from '../../../core/persistence/consumer-heartbeat.ts';
+import { listHostConsumers, RESIDENT_CONSUMER_KINDS, type ListedConsumer } from '../../../core/persistence/consumer-heartbeat.ts';
+import { compareWriterVersions } from '../../../core/persistence/writer-versions.ts';
+import { serveServiceRestartArgv } from '../../../core/serve-service.ts';
+import { VERSION } from '../../../version.ts';
 import { consumerOverlap, hostIdentityMismatches, ownersWithoutHeartbeat, OVERLAP_MIN_AGE_MS } from '../../../core/persistence/consumer-diagnostics.ts';
-import { localHostIdentity } from '../../../core/persistence/identity.ts';
-import { agentFix, checkError } from '../check-fix.ts';
+import { isEmbeddedIdentityValue, localHostIdentity } from '../../../core/persistence/identity.ts';
+import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 
 const DOCS = 'docs/guides/troubleshooting.md#two-consumers-on-host';
 const IDENTITY_DOCS = 'docs/guides/troubleshooting.md#host-identity-mismatch';
+const DRIFT_DOCS = 'docs/guides/troubleshooting.md#serve-build-drift';
 const STATUS_ARGV = ['gbrain', 'sources', 'writer', 'status', '--json'];
 
 export async function twoConsumersOnHostCheck(engine: BrainEngine, hostId: string): Promise<Check> {
@@ -83,7 +94,7 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
     return { name: 'host_identity_mismatch', status: 'warn', details: { ...details, minted_under: me.minted_under ?? 'unknown' },
       message: `host_identity_mismatch: ${mismatches.length} managed worktree(s) on this filesystem belong to another host identity. `
         + `This process reads ${me.path} (host ${me.id}, ${minted(me.minted_under)}). `
-        + ordered.slice(0, 3).map(m => `The binding for ${m.source_ids.join(', ') || m.worktree_id} at ${m.local_path} is owned by host ${m.owner_host_id} (${m.owner_host.host_json_path}, ${minted(m.owner_host.minted_under)})`
+        + ordered.slice(0, 3).map(m => `The binding for ${m.source_ids.join(', ') || m.worktree_id} at ${m.local_path} is owned by host ${m.owner_host_id} (${isEmbeddedIdentityValue(m.owner_host.host_json_path) ? 'identity given at open by an embedding host, no host.json' : `${m.owner_host.host_json_path}, ${minted(m.owner_host.minted_under)}`})`
           + `${m.reason === 'same_machine_id' ? ', minted on this same machine' : ', and this process\'s identity was minted after that binding under a different home'}.`).join(' ')
         + `${mismatches.length > 3 ? ` (first 3 of ${mismatches.length} shown.)` : ''} `
         + 'Every write from this process on those sources reports owner_unavailable (host_mismatch) and their maintenance never runs. '
@@ -91,6 +102,43 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
       fix: agentFix(STATUS_ARGV, 'Read-only: shows local_host_id, each binding\'s owner_host_id and host.consumers with the owner\'s identity file path.', 'host_identity_mismatch', { docs: IDENTITY_DOCS }) };
   } catch (error) {
     return checkError('host_identity_mismatch', 'compare the host identity with the binding owners', error, { details: { count: 'unknown', health: 'unknown', docs: IDENTITY_DOCS } });
+  }
+}
+
+export interface ServiceHost { platform: string; home: string; uid: number }
+
+/** The restart for one consumer: the installed serve service's own command, else stopping that pid for its supervisor or operator to start again. */
+export function restartArgv(row: Pick<ListedConsumer, 'kind' | 'pid'>, service: ServiceHost): string[] {
+  return (row.kind === 'serve' ? serveServiceRestartArgv(service) : null) ?? ['kill', String(row.pid)];
+}
+
+export async function serveBuildDriftCheck(engine: BrainEngine, hostId: string,
+  service: ServiceHost = { platform: process.platform, home: homedir(), uid: process.getuid?.() ?? 501 }): Promise<Check> {
+  if (engine.kind === 'pglite') return { name: 'serve_build_drift', status: 'ok', message: 'PGLite admits one process; no consumer heartbeat rows are kept to compare builds.', details: { count: 0, docs: DRIFT_DOCS } };
+  try {
+    const live = (await listHostConsumers(engine, hostId)).filter(row => row.liveness === 'live' && !row.self && RESIDENT_CONSUMER_KINDS.includes(row.kind));
+    const owner = live.find(row => row.mode === 'full' || row.mode === 'promoted') ?? live[0] ?? null;
+    const order = (row: ListedConsumer) => compareWriterVersions(row.version, VERSION) ?? -1;
+    const older = live.filter(row => order(row) < 0), newer = live.filter(row => order(row) > 0);
+    const label = (row: ListedConsumer) => `${row.kind} pid ${row.pid} v${row.version}`;
+    const details = { count: older.length, this_version: VERSION, owner: owner ? { kind: owner.kind, pid: owner.pid, mode: owner.mode, version: owner.version } : null,
+      older: older.map(row => ({ kind: row.kind, pid: row.pid, mode: row.mode, version: row.version })), newer: newer.map(row => ({ kind: row.kind, pid: row.pid, version: row.version })), docs: DRIFT_DOCS };
+    if (!live.length) return { name: 'serve_build_drift', status: 'ok', details,
+      message: 'No live gbrain consumer on this host writes a heartbeat row. A serve that predates heartbeats writes none; consumers_without_heartbeat names it when it holds claims.' };
+    if (!older.length) return { name: 'serve_build_drift', status: 'ok', details,
+      message: newer.length ? `This checkout (v${VERSION}) is older than the running ${newer.map(label).join('; ')}; upgrade this checkout before running one-shot commands from it.`
+        : `Every live consumer on this host runs this build (v${VERSION}).` };
+    const target = older.find(row => row.kind === 'serve') ?? older[0]!;
+    const argv = restartArgv(target, service);
+    return { name: 'serve_build_drift', status: 'warn', details,
+      message: `serve_build_drift: serve is running an older build than this checkout; restart serve and workers. This binary is v${VERSION}; running: ${older.map(label).join('; ')}. `
+        + 'Until they restart, one-shot commands from this checkout run newer code against an older consumer. '
+        + `Restart with \`${argv.join(' ')}\`${argv[0] === 'kill' ? ' and start it again the way it was launched' : ''}, then restart each other listed process. `
+        + 'A serve that predates heartbeats writes no row; consumers_without_heartbeat names it.',
+      fix: { argv, consent: [], actor: 'user', requires_exclusive: false, verify: doctorVerify('serve_build_drift'), docs: DRIFT_DOCS,
+        why: `Restarts ${label(target)} on this build (v${VERSION}); restart every other listed process the same way.` } };
+  } catch (error) {
+    return checkError('serve_build_drift', 'read the consumer heartbeat rows', error, { details: { count: 'unknown', health: 'unknown', docs: DRIFT_DOCS } });
   }
 }
 
@@ -108,4 +156,17 @@ export const persistenceConsumersEntry: DoctorEntry = {
   name: 'two_consumers_on_host',
   emits: ['two_consumers_on_host', 'consumers_without_heartbeat', 'host_identity_mismatch'],
   run: runPersistenceConsumers,
+};
+
+async function runServeBuildDrift(ctx: DoctorContext): Promise<Check[]> {
+  const checks: Check[] = [];
+  checks.push(await serveBuildDriftCheck(connectedEngine(ctx), localHostIdentity().id));
+  return checks;
+}
+
+export const serveBuildDriftEntry: DoctorEntry = {
+  name: 'serve_build_drift',
+  emits: ['serve_build_drift'],
+  tier: 'ops',
+  run: runServeBuildDrift,
 };

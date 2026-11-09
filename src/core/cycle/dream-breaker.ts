@@ -216,7 +216,7 @@ export async function resetDreamBreakerKey(engine: BrainEngine, baseKey: string)
        VALUES ($1, jsonb_build_object($2::text, to_char((now() + interval '1 millisecond') AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))::text)
      ON CONFLICT (key) DO UPDATE SET value = ((
        SELECT COALESCE(jsonb_object_agg(entry.key, entry.value), '{}'::jsonb)
-         FROM jsonb_each_text(CASE WHEN config.value IS JSON OBJECT THEN config.value::jsonb ELSE '{}'::jsonb END) entry
+         FROM jsonb_each_text(CASE WHEN jsonb_typeof(gbrain_try_jsonb(config.value)) = 'object' THEN gbrain_try_jsonb(config.value) ELSE '{}'::jsonb END) entry
         WHERE entry.key <> $2::text AND entry.value ~ '^[0-9]{4}-' AND entry.value::timestamptz > now() - interval '24 hours'
      ) || EXCLUDED.value::jsonb)::text`,
     [DREAM_BREAKER_RESETS_KEY, dreamBreakerBaseKey(baseKey)],

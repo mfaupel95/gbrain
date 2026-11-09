@@ -24,7 +24,7 @@ function context(engine: BrainEngine, remote?: boolean): OperationContext {
   return ctx;
 }
 const history = (engine: BrainEngine, slug: string, remote?: boolean) =>
-  operationsByName.get_versions.handler(context(engine, remote), { slug }) as Promise<PageVersion[]>;
+  operationsByName.get_versions.handler(context(engine, remote), { slug, include_body: true }) as Promise<PageVersion[]>;
 function protectedBody(prefix: string): string {
   return `${prefix} public prose\n${renderFactsTable([
     { rowNum: 1, claim: `${prefix} world fact`, kind: 'fact', confidence: 1, visibility: 'world', notability: 'high', active: true },

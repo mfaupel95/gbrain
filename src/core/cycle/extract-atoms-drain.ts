@@ -55,6 +55,9 @@ export interface ExtractAtomsDrainFailure {
   source: string;
   /** Bounded, sanitized failure reason (secrets/connection info redacted). */
   reason: string;
+  /** #7514: a write that did not commit: its request id (`gbrain write-request` explains it) and the refusal's own code. */
+  request_id?: string;
+  code?: string;
 }
 
 /**
@@ -111,9 +114,15 @@ export interface ExtractAtomsDrainDeps {
     providerFailure?: boolean;
     failureCount?: number;
     firstError?: string;
-    failures?: Array<{ source: string; reason: string }>;
+    failures?: Array<{ source: string; reason: string; request_id?: string; code?: string }>;
+    /** #7514: write failures that recorded a strike toward their hold this batch; a batch of them is progress, not a stall. */
+    writeStrikes?: number;
     budgetSkipped?: number;
     budget?: { spentUsd: number; capUsd: number };
+    /** #6503: items the batch cut at `cycle.extract_atoms.max_input_chars` (partial disposition, not complete). */
+    inputTruncated?: number;
+    /** #6817: with `providerFailure`, what the outage was; unset reads as `transient`. */
+    providerFailureClass?: DrainProviderFailureClass;
   }>;
   /**
    * Count remaining eligible-but-unextracted pages, or null on query error.
@@ -152,6 +161,14 @@ export interface ExtractAtomsDrainOpts {
 export type DrainStop =
   | 'drained' | 'window' | 'deadline' | 'lock_lost' | 'aborted'
   | 'no_progress' | 'max_batches' | 'provider_failure' | 'budget';
+
+/**
+ * #6817: why every item of a provider_failure batch failed. `auth`, `billing`,
+ * `model_not_found` and `content_block` repeat on every retry until someone
+ * changes the key, plan, model or content; `rate_limit` and `transient`
+ * (5xx, timeout, network, an unclassified error) can clear on their own.
+ */
+export type DrainProviderFailureClass = 'auth' | 'billing' | 'model_not_found' | 'content_block' | 'rate_limit' | 'transient';
 
 export const DRAIN_COUNT_TIMEOUT_MS = 60_000;
 
@@ -213,6 +230,10 @@ export interface ExtractAtomsDrainResult {
   /** #6425: on a `budget` stop, the attempt's spend and its per-run cap (`cycle.extract_atoms.budget_usd`). */
   spent_usd?: number;
   budget_usd?: number;
+  /** #6503: items cut at the input cap across every batch; the model did not read their tails and they are not marked complete. */
+  input_truncated?: number;
+  /** #6817: with `status: 'provider_failure'`, the failing batch's class (`transient` when the batch named none). */
+  provider_failure_class?: DrainProviderFailureClass;
 }
 
 /**
@@ -247,6 +268,7 @@ export async function runExtractAtomsDrain(
   // the returned `status`, independent of how `stopped` reads after the
   // final (possibly overriding) remaining-count check below.
   let providerFailure = false;
+  let providerFailureClass: DrainProviderFailureClass = 'transient';
   // #4539: accumulate per-item failure visibility across batches.
   let failureCount = 0;
   // #4730: bounded typed per-item records (batch order, sanitized).
@@ -255,6 +277,7 @@ export async function runExtractAtomsDrain(
   let lastCount: number | null = null;
   let lockSignal: AbortSignal | null = null;
   let budget: { spentUsd: number; capUsd: number } | undefined;
+  let inputTruncated = 0;
   const result = (stopped: DrainStop, remaining: number | null): ExtractAtomsDrainResult => ({
     phase: 'extract_atoms',
     status: providerFailure ? 'provider_failure' : 'ok',
@@ -268,6 +291,8 @@ export async function runExtractAtomsDrain(
     omitted_failure_count: failureCount - failures.length,
     last_error: lastError,
     ...(stopped === 'budget' && budget ? { spent_usd: budget.spentUsd, budget_usd: budget.capUsd } : {}),
+    input_truncated: inputTruncated,
+    ...(providerFailure ? { provider_failure_class: providerFailureClass } : {}),
   });
   try {
     return await deps.withLock(async (signal) => {
@@ -322,13 +347,14 @@ export async function runExtractAtomsDrain(
           const r = await deps.runBatch({ signal: hard.signal, stopSignal: soft.signal });
           extracted += r.extracted;
           skipped += r.skipped;
+          inputTruncated += Math.max(0, Math.floor(Number(r.inputTruncated ?? 0)) || 0);
           batches++;
           // #4730: preserve typed per-item records (bounded, sanitized) while
           // keeping failure_count exact and reconcilable — count-only adapters
           // (the #4539 shape) still contribute to the total via failureCount.
           const batchFailures = Array.isArray(r.failures)
             ? r.failures.filter(
-                (f): f is { source: string; reason: string } =>
+                (f): f is { source: string; reason: string; request_id?: string; code?: string } =>
                   f != null &&
                   typeof f === 'object' &&
                   typeof f.source === 'string' &&
@@ -346,6 +372,8 @@ export async function runExtractAtomsDrain(
               batch: batches,
               source: sanitizeFailureText(f.source, MAX_DRAIN_FAILURE_SOURCE_CHARS),
               reason: sanitizeFailureText(f.reason, MAX_DRAIN_FAILURE_REASON_CHARS),
+              ...(typeof f.request_id === 'string' ? { request_id: sanitizeFailureText(f.request_id, 64) } : {}),
+              ...(typeof f.code === 'string' ? { code: sanitizeFailureText(f.code, 64) } : {}),
             });
           }
           const representative = batchFailures[0];
@@ -373,6 +401,7 @@ export async function runExtractAtomsDrain(
           // drain as a clean completion.
           if (r.providerFailure) {
             providerFailure = true;
+            providerFailureClass = r.providerFailureClass ?? 'transient';
             stopped = 'provider_failure';
             break;
           }
@@ -395,7 +424,7 @@ export async function runExtractAtomsDrain(
             const after = await count();
             if (hard.signal.aborted) break;
             if (after !== null) lastCount = after;
-            if (after === null || before === null || after >= before) { stopped = 'no_progress'; break; }
+            if (after === null || before === null || (after >= before && !((r.writeStrikes ?? 0) > 0))) { stopped = 'no_progress'; break; }
           }
         }
 
@@ -427,6 +456,18 @@ export async function runExtractAtomsDrain(
     if (lock?.aborted && err === lock.reason) return result('lock_lost', lastCount);
     throw err;
   }
+}
+
+/**
+ * #6817: classify a batch whose every item failed. The phase's whole-run halt
+ * class (`details.aborted_global_error`) wins; a batch whose every failure is
+ * a provider content block is `content_block`; anything else is `transient`,
+ * because nothing shows that retrying cannot succeed.
+ */
+export function batchProviderFailureClass(halted: unknown, failures: ReadonlyArray<{ reason: string }>): DrainProviderFailureClass {
+  if (halted === 'auth' || halted === 'billing' || halted === 'model_not_found' || halted === 'rate_limit') return halted;
+  if (failures.length > 0 && failures.every(f => f.reason.startsWith('provider blocked content'))) return 'content_block';
+  return 'transient';
 }
 
 // ─── Shared wiring helper (v0.42.x #1685 DECISION 5A) ──────────────────────
@@ -509,30 +550,39 @@ export async function runExtractAtomsDrainForSource(
         // + pages_processed both 0 means every attempted `chat()` call threw —
         // items that succeed with 0 atoms still count as processed, so this
         // does not fire on "provider fine, nothing extractable").
-        const failures = Array.isArray(d.failures) ? d.failures : [];
+        const reported: unknown[] = Array.isArray(d.failures) ? d.failures : [];
+        // #7514: a write that did not commit (its record names the request id) never reached a provider, so
+        // `failures` is the provider side only: a write failure neither makes nor classes a provider failure.
+        const written = (f: unknown): f is { request_id: string; code?: unknown; strikes?: unknown } =>
+          f != null && typeof f === 'object' && typeof (f as { request_id?: unknown }).request_id === 'string';
+        const failures = reported.filter(f => !written(f));
         const itemsSucceeded =
           Number(d.transcripts_processed ?? 0) + Number(d.pages_processed ?? 0);
         // #4730: carry EVERY per-item failure up as a typed {source, reason}
         // record (the pure loop bounds + sanitizes them) instead of the
         // #4539 collapse to count + one representative error — a mixed
         // three-failure batch used to be unrecoverable from `--json`.
-        const typedFailures = failures
-          .filter(
-            (f): f is { source: string; error: string } =>
-              f != null &&
-              typeof f === 'object' &&
-              typeof (f as { source?: unknown }).source === 'string' &&
-              typeof (f as { error?: unknown }).error === 'string',
-          )
-          .map(({ source, error }) => ({ source, reason: error }));
+        const typed = reported.filter(
+          (f): f is { source: string; error: string } =>
+            f != null &&
+            typeof f === 'object' &&
+            typeof (f as { source?: unknown }).source === 'string' &&
+            typeof (f as { error?: unknown }).error === 'string',
+        );
+        const typedFailures: Array<{ source: string; reason: string; request_id?: string; code?: string }> = typed
+          .map(({ source, error }) => ({ source, reason: error }))
+          .map((f, i) => { const w = typed[i]; return written(w) ? { ...f, request_id: w.request_id, ...(typeof w.code === 'string' ? { code: w.code } : {}) } : f; });
         return {
           extracted: Number(d.atoms_extracted ?? 0),
           skipped: Number(d.duplicates_skipped ?? 0),
           providerFailure: failures.length > 0 && itemsSucceeded === 0,
-          failureCount: failures.length,
+          providerFailureClass: batchProviderFailureClass(d.aborted_global_error, typedFailures.filter(f => f.request_id === undefined)),
+          failureCount: reported.length,
           failures: typedFailures,
+          writeStrikes: reported.filter(f => written(f) && typeof f.strikes === 'number').length,
           budgetSkipped: Number(d.pages_skipped_budget ?? 0) + Number(d.transcripts_skipped_budget ?? 0),
           budget: { spentUsd: Number(d.estimated_spend_usd ?? 0), capUsd: Number(d.budget_usd ?? 0) },
+          inputTruncated: Number(d.input_truncated ?? 0),
         };
       },
       countRemaining: (signal) => countExtractAtomsBacklog(engine, extractionSourceId, { signal }),

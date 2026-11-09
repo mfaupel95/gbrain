@@ -20,7 +20,7 @@
  *             coherent?" question.
  *
  * Why this matters: the doctor's legacy `health_score` ( 100 − 20×fails −
- * 5×warns ) weights every check equally. A skill routing miss costs the same
+ * 5×warns, over the checks that finished: #7276 ) weights every check equally. A skill routing miss costs the same
  * as a corrupt embedding column. With categorization, the doctor surfaces a
  * brain_checks_score and category_scores so operators see signal-to-noise on
  * the question they're actually asking.
@@ -57,26 +57,60 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
   'atom_provenance_drift',
+  // #7013: atoms an empty managed re-extraction retired that atoms-restore can bring back (doctor/checks/atom-retirements.ts).
+  'atom_retirements_restorable',
   'captured_facts_active',
+  // #8064: owner-attributed capture facts from agent-launched sessions (doctor/checks/agent-session-facts.ts).
+  'agent_session_facts',
+  // #7125: facts whose stored text holds a pre-fix sanitizer redaction marker (doctor/checks/facts-redaction-marker.ts).
+  'facts_redaction_marker',
+  // #7247: a calendar day holding a bulk-loaded share of a source's facts as their valid_from (doctor/checks/fact-bulk-dates.ts).
+  'fact_bulk_dates',
   'conversation_label_facts',
   'conversation_outcomes_stale',
   'connector_checkpoints',
   'connector_held_items',
   'git_held_files',
+  // GST-1209: live pages stored in segments whose live rows do not cover their body (doctor/checks/segmented-tiling.ts).
+  'segmented_tiling',
   'fence_integrity',
+  // GBRA-221: live fence rows on imported pages whose body is outside-authored text (doctor/checks/outside-content-fences.ts).
+  'outside_content_fences',
+  // GBRA-161: derived items live generations retired in the restore window, and results held instead of published (doctor/checks/generations.ts).
+  'generation_held',
+  'generation_pending',
+  'generation_retirements',
   // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
   'trust_tiers',
   'trust_scan',
   'trust_sources_unclaimed',
+  // #7656: index-existing trust releases confirmed before their preview showed the fence row's fields (doctor/checks/trust-release-unpreviewed.ts).
+  'trust_release_unpreviewed_fields',
   'credential_projection_pending',
   'derived_visibility',
+  // GBRA-218: member read access (doctor/checks/member-access.ts).
+  'access_readers_malformed',
+  'access_unknown_readers',
+  'access_recent_narrowings',
+  'access_page_readers_backfill',
+  'access_policy_pending',
+  'access_policy_widening_held',
+  'access_policy_invalid',
+  'access_policy_store_mismatch',
+  // GBRA-231: shared agents (doctor/checks/shared-agent-access.ts).
+  'access_may_act_for_wildcard',
   'extractor_facts_expired',
+  'unwithdrawn_facts',
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
+  'foreign_ownership_marker',
+  'coordination_lock_location',
   'safe_index_pending',
   'self_capture',
   'brain_score',
+  // W1: belief ledger coverage intervals, drift, orphan lifetimes and unsafe restores.
+  'belief_ledger_coverage',
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
@@ -103,12 +137,17 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embed_staleness',
   'embedding_column_registry',
   'embedding_env_override',
+  // #6113: a bare legacy embedding_model DB row; the fix previews migrate embeddings.
+  'embedding_identity_unqualified',
   // #5137: an env provider key shadowing a different config key.
   'embedding_key_source',
   'embedding_migration_state',
+  // GBRA-248 W0b: the config file disables embeddings over a database that holds vectors (doctor/checks/embedding-plane.ts).
+  'embedding_plane_disagreement',
   'embedding_provider',
   // #5691: query-instruction advisory for instruction-style embedding models.
   'embedding_query_prefix',
+  'embedding_state',
   'embedding_width_consistency',
   'embeddings',
   'entity_link_coverage',
@@ -117,6 +156,12 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #6325: managed atom origins held after repeated extraction failures.
   'extract_atoms_held_failed',
   'extract_health',
+  // Large pages A7: page extractions that read only part of their input.
+  'extraction_input_truncated',
+  // PR 4 (Wave B incremental derivation, transcripts): conversation pages held because no format is detected over them.
+  'conversation_detection_ambiguous',
+  // PR 4 (Wave B incremental derivation, transcripts): segmented derivations held back by a model without a price.
+  'derivation_unpriced_model',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
   'facts_health',
@@ -132,6 +177,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'extraction_date_grounding',
   'hidden_by_search_policy',
   'image_assets',
+  // #6529: image pages without an image vector, apart from text coverage (plus NULL source_path and held images).
+  'image_embedding_coverage',
   'integrity',
   'jsonb_integrity',
   // #4222 — near-empty entity pages that accreted huge edge counts (junk
@@ -146,6 +193,11 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_ratio',
   'oversized_pages',
   'parked_effects',
+  // #6741: managed purges parked after repeated failures (doctor/checks/purge-parks.ts).
+  'purge_parked_pages',
+  // Wave B PR 4: fact purge sweeps of stored derivation results still pending or stalled (doctor/checks/derivation-purge-sweeps.ts).
+  'derivation_purge_sweeps',
+  'partial_embedding',
   'pglite_scratch_probe',
   'quarantined_pages',
   'raw_provenance',
@@ -157,16 +209,41 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'source_routing_health',
   'stale_mentions',
   'stub_guard_24h',
+  // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
+  'supersession_calibration',
+  // #6590: whether the embedding model has measured fact admission cosine floors (search/fact-relevance.ts).
+  'fact_admission_floors',
   'sync_failures',
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
   'sync_freshness',
+  // #6858 ask 6: p95 commit→searchable of managed sources over 24 h (doctor/checks/managed-sync-latency.ts).
+  'managed_sync_latency',
+  // GBRA-133 PR 2a: the resident that syncs each local source on commit, or none with the fix (doctor/checks/commit-notifier.ts).
+  'commit_notifier',
   // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
   'git_convergence',
+  // #5186: an ownership marker committed to a source checkout's Git index.
+  'tracked_ownership_marker',
+  // #7381: a source checkout behind its upstream, write-through files or staged files waiting for a commit, unpushed commits outside the source root (doctor/checks/git-writer.ts).
+  'checkout_lagging',
+  'dirty_age',
+  'commits_outside_source_root',
+  'quarantined_changes',
+  // PR B: commits in a source checkout that gbrain's commit ledger does not name, and page files left uncommitted (doctor/checks/foreign-writers.ts).
+  'foreign_writers',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).
   'unlinked_facts',
+  // #7160: title-prefixed person pages that likely duplicate an unprefixed page (preview only).
+  'person_title_duplicates',
+  // Git-canonical G1: the database compared with the commit at HEAD per source, informational (doctor/checks/db-ahead-of-git.ts).
+  'db_ahead_of_git',
+  // Git-canonical G3: how far each strict source's index trails HEAD (doctor/checks/git-index-lag.ts).
+  'git_index_lag',
+  // GST-1601: local edits adopted in the last 24 h per source (doctor/checks/local-edit-adoptions.ts).
+  'local_edit_adoptions',
   'edge_validity',
   'text_projection_readiness',
   'timeline_coverage',
@@ -177,6 +254,28 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',
+  // #6696 B5: live pages whose canonical file is missing on the owner host (doctor/checks/ghost-pages.ts).
+  'ghost_pages',
+  // #6948: files recorded by several live pages (origin twins) and the pages_live_origin_key index (doctor/checks/origin-twins.ts).
+  'origin_twins',
+  // #7305: live pages whose slug their recorded file path does not derive, and whose file lacks the slug: stamp (doctor/checks/slug-path-mismatch.ts).
+  'slug_path_mismatch',
+  // #6729: inexact renames whose identity sync did not keep, until the pair gets a disposition (doctor/checks/rename-identity-downgrades.ts).
+  'rename_identity_downgrades',
+  // #6609: live pages of a classic checkout whose recorded file a full sync would not find (doctor/checks/missing-recorded-files.ts).
+  'missing_recorded_files',
+  // #7130: soft-deleted pages a managed sync removed although Git never held their file (doctor/checks/uncommitted-sync-deletions.ts).
+  'uncommitted_sync_deletions',
+  // #6865: committed files of a managed Git source with no page and no hold, from the stored detector result (doctor/checks/unindexed-files.ts).
+  'unindexed_files',
+  // GBRA-150: pages a managed sync committed past the freshness target that search cannot fully see (doctor/checks/landing-gaps.ts).
+  'sync_landing_gaps',
+  // #6712: live pages whose database-only edit an incremental sync overwrote without a hold (doctor/checks/overwritten-edits.ts).
+  'sync_overwritten_db_edits',
+  // #8071: rows a managed sync's checkpoint moved past, compared with the file at the checkpoint commit (doctor/checks/rows-behind.ts).
+  'sync_rows_behind_checkpoint',
+  // #7891: provenance stamps and trust markers a write removed before #7892 (doctor/checks/provenance-stamp-drift.ts).
+  'provenance_stamp_drift',
   'unified_multimodal_coverage',
   'unverified_extractions',
   'voice_gate_health',
@@ -213,7 +312,11 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'chat_fallback_chain',
   // Agent operator wave: is an agent harness wired to this brain (registration read; --only adds the smoke test).
   'harness_wiring',
+  // Cat 41: the provider-use decision gbrain setup recorded; declined = no provider request (discovery, probe).
+  'provider_consent',
   'frontmatter_hook',
+  // URL source clones with no record of who added them (url-source-origin.ts).
+  'url_source_origin',
   // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
   'planner_stats_stale',
   'alternative_providers',
@@ -240,14 +343,24 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'db_only_collector_collision',
   'federation_health',
   'google_file_modes',
+  // #5012 item 9: a Google source's configured calendar was unreadable at its last sync (doctor/checks/google-calendar.ts).
+  'google_calendar_readable',
+  // #7073: a Google source's last sync could not reach a service (API disabled, scope not granted) (doctor/checks/google-api-access.ts).
+  'google_api_access',
   'google_oauth',
   'home_dir_in_worktree',
+  // GBRA-108: cron commands that run gbrain without GBRAIN_HOME (doctor/checks/cron-gbrain-home.ts).
+  'cron_gbrain_home',
   'index_audit',
   'npm_squat',
   'oauth_client_scope_health',
   'oauth_confidential_client_health',
   'orphan_clones',
   'persistence_capacity',
+  'persistence_compaction',
+  // #6712 PR 2: the managed-sync soak counters (interventions, content decisions), informational.
+  'sync_soak_counters',
+  'persistence_counter_drift',
   'worktree_refresh_stuck',
   'managed_guard_schema_drift',
   'publication_refusals',
@@ -255,17 +368,39 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'persistence_request_indexes',
   'persistence_write_stall',
   'lost_caller_writes',
+  // #6650: terminal write receipts that block work or are a gbrain-defect class (doctor/checks/persistence-requests.ts).
+  'persistence_terminal_failures',
+  'stale_frontmatter_keys',
+  'maintenance_write_drift',
   'managed_sync_not_moving',
+  // #6858: a managed sync run stopped on a page that did not commit, failed past an hour (doctor/checks/managed-sync-blocked.ts).
+  'managed_sync_blocked',
+  // #6712 PR 4a: the read-only convergence shadow's counts (doctor/checks/managed-sync-convergence.ts).
+  'managed_sync_convergence',
+  // #6712 PR 4b: sync.admission is not normal, so managed sync admits less than it classifies (doctor/checks/sync-admission.ts).
+  'sync_admission_restricted',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
   'two_consumers_on_host',
   'consumers_without_heartbeat',
   'host_identity_mismatch',
+  // GBRA-248 W0a: managed writes waiting on an owner host quiet past the stale window (doctor/checks/owner-host-stale.ts).
+  'owner_host_stale',
+  // #6696 C6: a live serve or worker on an older build than this checkout (doctor/checks/persistence-consumers.ts).
+  'serve_build_drift',
+  // #7245: serve, the jobs supervisor, worker parents and job children on different builds (doctor/checks/runtime-build-skew.ts).
+  'runtime_build_skew',
+  // GBRA-156: the warm CLI socket refused CLI calls by identity part in the last 24 h (doctor/checks/cli-socket-refusals.ts).
+  'cli_socket_refusals',
   'stale_embedding_effects',
   'vector_plan',
+  'keyword_plan',
   'writer_version',
+  'segmented_storage',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  // #6573: a local IPC socket path over the platform's AF_UNIX budget (doctor/checks/local-ipc.ts).
+  'ipc_socket_path',
   // db-availability loop: engine-fit + repair-recurrence signals.
   'pglite_scale',
   'db_repair_recurrence',
@@ -278,8 +413,16 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'pool_budget',
   'progressive_batch_audit_health',
   'queue_health',
+  // Wakeshift PR 1: report-back key, enabled state and dead/id_reused watches (doctor/checks/wakeshift.ts).
+  'wakeshift',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
+  // GBRA-130 C-6: no completed brain-wide pass while jobs fail or a phase keeps blocking it.
+  'global_maintenance_stalled',
+  'embed_backfill_stalled',
+  // #7117: the content-drift sweep's latest batch failed.
+  'content_drift_sweep',
+  'connector_account_mismatch',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',
   // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
@@ -291,6 +434,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'grant_new_ops_available',
   'reranker_health',
   'rls',
+  // #7632: every gbrain function that pins a search_path ends it with pg_temp.
+  'function_search_path',
   'rls_event_trigger',
   'search_mode',
   'decide_health',
@@ -316,6 +461,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   // The one-time behavior-change disclosure, readable again here (read-only).
   'behavior_changes',
+  // #7142: checks with no result from the last 24 h on a quick-tier or capped run (doctor/last-known.ts).
+  'doctor_last_known',
   // Agent operator wave E11: recent agent dead ends from the agent-contract event log.
   'agent_contract',
   'cycle_phase_scope',
@@ -335,11 +482,15 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5216: the resumable pages.knowledge_revision backfill (resumed by apply-migrations --force-schema).
   'revision_backfill',
   'schema_columns',
+  // #6911: tables the applied migrations created that are missing (repair missing-tables recreates rebuildable caches).
+  'schema_missing_tables',
   'schema_pack_active',
   'schema_pack_consistency',
   'schema_pack_source_drift',
   'schema_version',
   'slug_fallback_audit',
+  // #6712 PR 2: retired sync.* keys stored on the brain and no longer applied.
+  'sync_config_keys',
   'timeline_dedup_index',
   'type_proliferation',
   'upgrade_errors',

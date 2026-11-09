@@ -42,7 +42,8 @@ export const SECTIONS: DocSection[] = [
       { title: "Grok Bot", path: "docs/guides/grok-bot.md", description: "Recommended: keep the brain on your computer, publish it with `gbrain mcp expose --funnel`, grant the Bot a client and install the thin CLI; local in-Bot memory as the no-host alternative. Native skill activation, shared-computer trust and dated evidence." },
       { title: "Muse personal agent", path: "docs/guides/muse.md", description: "Verify durable storage first; connect Muse to your published brain (`gbrain mcp expose --funnel` + thin CLI) or add local explicit memory with provenance alongside Muse's native memory; distinguish Muse Code and unverified native MCP." },
       { title: "Inside an existing agent", path: "docs/guides/in-agent-setup.md", description: "Isolated setup, absolute launcher, receipts, keyless maintenance, complete private backup and safe restoration." },
-      { title: "Memory boundaries", path: "docs/guides/memory-boundaries.md", description: "Durable shared preferences versus harness state; remote graph maintenance, provider text disclosure, authorization and full-backup limits.", includeInFull: false },
+      { title: "Memory boundaries", path: "docs/guides/memory-boundaries.md", description: "Durable shared preferences versus harness state; remote graph maintenance, provider text disclosure, authorization and full-backup limits; large pages (segmented storage up to 256 MiB on Postgres, append_page / gbrain append, upload sessions, windowed reads, limits per entry point).", includeInFull: false },
+      { title: "Page history", path: "docs/guides/page-history.md", description: "Why a page changed: an optional reason on page writes, replaced_because in get_versions, the gbrain-reason commit trailer, remote visibility and repo-less brains.", includeInFull: false },
       { title: "Brain versus session memory", path: "docs/guides/brain-vs-memory.md", description: "Route durable facts and preferences to shared memory, configuration to the harness, and temporary work to session state.", includeInFull: false },
       { title: "Connect a hosted brain", path: "docs/guides/hosted-harness-access.md", description: "Getting the HTTPS endpoint (`gbrain mcp expose`, admin token file), host-side grants, private credential handoff, harness installation, profile repair, delegation limits and honest verification." },
       { title: "Harness adapter reference", path: "docs/guides/harness-adapters.md", description: "Registry-generated transport, authentication lifetime and configuration facts.", includeInFull: false },
@@ -76,6 +77,13 @@ export const SECTIONS: DocSection[] = [
         description:
           "The thin-client / remote-MCP / cross-modal routing seam: isThinClient detection, callRemoteTool, SSRF-hardened URL validation, per-command routing.",
         path: "docs/architecture/thin-client.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/architecture/brains-and-sources.md",
+        description:
+          "The two axes: a brain is which database, a source is which repo inside it. Resolution precedence for --brain and --source, topologies, Git as the parent of a source with a checkout (mixed, strict, mirror, database-only), entity identity across sources, cross-source links and what confines remote callers.",
+        path: "docs/architecture/brains-and-sources.md",
         includeInFull: false,
       },
       {
@@ -123,6 +131,27 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        title: "docs/guides/where-your-memory-lives.md",
+        description:
+          "The quotable answer to \"database, vector store or Markdown?\": Markdown with frontmatter in a folder you own (normally Git) is the record, Postgres with embeddings and keyword search is a rebuildable index, and database-only records (private pages on strict sources, facts with no page, history, receipts) need a database backup. Where the folder is, mixed vs strict sources, what to back up.",
+        path: "docs/guides/where-your-memory-lives.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/page-anatomy.md",
+        description:
+          "Anatomy of a page on one annotated example: frontmatter keys gbrain reads and stamps, compiled truth, the `<!-- timeline -->` sentinel and `- **YYYY-MM-DD** | Source — Summary` rows, the facts and takes fences, and schema-pack types; links to the four reference docs.",
+        path: "docs/guides/page-anatomy.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/entity-scoped-facts.md",
+        description:
+          "Different answer per client: `remember --entity` ties a fact to a page, `recall <entity>` reads only that client's facts, `recall --question` with no entity returns a flat list with each row's entity_slug, and a default kept on its own page.",
+        path: "docs/guides/entity-scoped-facts.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/GBRAIN_RECOMMENDED_SCHEMA.md",
         description:
           "MECE directory structure (people/, companies/, concepts/).",
@@ -133,19 +162,22 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
-        // Re-inlined: the CLAUDE.md resolver restructure (per-file index moved to
-        // docs/architecture/KEY_FILES.md, link-only) freed ~530KB of bundle
-        // headroom, so this value-explainer rides the single-fetch bundle again.
+        // Link-only: the bundle reached FULL_SIZE_BUDGET; this value-explainer is
+        // the least operational inlined doc, so it gives way to protocol docs.
         title: "docs/what-schemas-unlock.md",
         description:
           "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring.",
         path: "docs/what-schemas-unlock.md",
+        includeInFull: false,
       },
       {
         title: "docs/schema-author-tutorial.md",
         description:
           "5-minute walkthrough: fork the bundled pack, add a custom `researcher` type, backfill existing pages via `gbrain schema sync --apply`, prove the T1.5 wiring via `gbrain whoknows`.",
         path: "docs/schema-author-tutorial.md",
+        // GBRA-199: an optional walkthrough; dropped from the single-fetch
+        // bundle so the memory-verb listing docs fit FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/system-one.md",
@@ -162,14 +194,84 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        title: "docs/guides/pinned-questions.md",
+        description:
+          "Pinned questions: cited answers kept current from your notes (`gbrain questions pin|list|status|refresh|unpin`, `questions_*` MCP tools), read-time staleness, receipts and blocked reasons, owner-private visibility, consent for paid refresh, the standing_questions phase and the dream.auto_think migration.",
+        path: "docs/guides/pinned-questions.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/live-sync.md",
         description: "Incremental markdown sync setup.",
         path: "docs/guides/live-sync.md",
       },
       {
+        title: "docs/guides/on-commit-sync.md",
+        description: "Opt-in on-commit sync in gbrain serve (sync.on_commit) and the per-source commit→searchable/embedded latency.",
+        path: "docs/guides/on-commit-sync.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/shared-checkout-git.md",
+        description:
+          "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
+        path: "docs/guides/shared-checkout-git.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/sync-unblock-runbook.md",
         description: "Operator-agent loop for a managed catch-up on a live checkout: gbrain sync status --json (cursor, committed_last_10m, each hold and the last error with class / safe_actions / needs_human), gbrain sync unblock --apply, and the decision table (page / connection / systemic) behind them.",
         path: "docs/guides/sync-unblock-runbook.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/git-canonical.md",
+        description:
+          "Git-canonical (strict) sources, opt-in per source: every write committed to Git through one door before the database row, the database derived from commits (Git wins), when to turn it on, `gbrain sources canonical <id> --to git|mixed` preview and apply, remote writes through the owner's door (write_pending), declared database-only classes, rollback, doctor git_index_lag / db_ahead_of_git, `sources git-gap` and `sources reindex --from-git`.",
+        path: "docs/guides/git-canonical.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/multi-source-brains.md",
+        description:
+          "Several repos in one brain: `gbrain sources add|list|federate`, per-request `source_ids` narrowing on search and query (never widens a grant), hosting an empty source in a bare repository (`gbrain sources host-repo`), read-only mirrors and the full `gbrain sources` verb list.",
+        path: "docs/guides/multi-source-brains.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/exact-search.md",
+        description:
+          "`gbrain search --exact \"<phrase>\"` / MCP `search_exact`: unranked, exhaustive literal scan instead of grep, with a `complete` flag that says whether the whole scope was read; filters and limits.",
+        path: "docs/guides/exact-search.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/cli-socket.md",
+        description:
+          "Opt-in warm CLI socket on Postgres (`gbrain serve --cli-socket`): one-shot `gbrain search`, `query`, `get` and `recall` answered by the running serve, identity matching, refusals and GBRAIN_DEBUG=1 diagnostics.",
+        path: "docs/guides/cli-socket.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/upgrades-auto-update.md",
+        description:
+          "`gbrain upgrade` and auto-update: the stable release channel, restarting every gbrain process onto the new build, doctor runtime_build_skew, known-bad releases and recovery.",
+        path: "docs/guides/upgrades-auto-update.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/mcp/TOOL_REFERENCE.md",
+        description:
+          "Longer guidance for each starter-surface MCP tool: defaults and edge cases per parameter (search and query `source_ids`, return_unit, match: keyword), and pointers to full-surface tools such as search_exact and append_page.",
+        path: "docs/mcp/TOOL_REFERENCE.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/TOOL_CATALOG.md",
+        description:
+          "Generated: every MCP tool by area with its scope, starter membership and config gate (upload sessions, append_page, search_exact and the rest).",
+        path: "docs/TOOL_CATALOG.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/cron-schedule.md",
@@ -192,12 +294,16 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/quiet-hours.md",
         description: "Notification hold + timezone-aware delivery.",
         path: "docs/guides/quiet-hours.md",
+        // Linked, not inlined: the Wave B PR 2 master merge put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/scaling-skills.md",
         description:
           "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
         path: "docs/guides/scaling-skills.md",
+        // Linked, not inlined: the operator-lessons wave (cron wrapper, managed checkout, identity) put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/life-chronicle.md",
@@ -225,6 +331,8 @@ export const SECTIONS: DocSection[] = [
         description:
           "Push-based context: the brain volunteers confidence-gated pages from the rolling conversation window. Three channels (ambient reflex, volunteer_context op, gbrain watch), config knobs, and the volunteered-vs-used feedback loop.",
         path: "docs/guides/push-context.md",
+        // Linked, not inlined: same budget trim as scaling-skills.md.
+        includeInFull: false,
       },
       {
         title: "docs/guides/time-aware-recall.md",
@@ -245,6 +353,7 @@ export const SECTIONS: DocSection[] = [
         description:
           "Mirror GitHub issues, PRs, comments, reviews and CI checks as brain pages. One key + one registration command to a searchable mirror; webhook-driven instant refresh, poll-sweep fallback, daily reconcile, App-credential option.",
         path: "docs/guides/github-source.md",
+        includeInFull: false,
       },
       {
         title: "docs/mcp/DEPLOY.md",
@@ -268,6 +377,13 @@ export const SECTIONS: DocSection[] = [
   {
     heading: "AI providers",
     entries: [
+      {
+        title: "docs/ai-providers/google.md",
+        description:
+          "Google Gemini: GOOGLE_GENERATIVE_AI_API_KEY (GEMINI_API_KEY alias), GOOGLE_GENERATIVE_AI_BASE_URL override for chat, expansion and embeddings (metering proxies, regional gateways), provider_base_urls.google.",
+        path: "docs/ai-providers/google.md",
+        includeInFull: false,
+      },
       {
         title: "docs/ai-providers/llama-server-reranker.md",
         description:
@@ -310,11 +426,14 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/exit-codes.md",
         description: "Exit statuses (3 = confirmation_required only, 10 pending write, 11 resumable budget stop) and what the agent does on each.",
         path: "docs/guides/exit-codes.md",
+        // AGENT_OPERATOR_v1.md, inlined in full, carries the same exit table; llms-full.txt sits at its byte budget.
+        includeInFull: false,
       },
       {
         title: "docs/guides/minions-fix.md",
         description: "Troubleshooting the Minions job queue.",
         path: "docs/guides/minions-fix.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/repair.md",
@@ -341,6 +460,8 @@ export const SECTIONS: DocSection[] = [
         title: "docs/integrations/reliability-repair.md",
         description: "Data integrity recovery.",
         path: "docs/integrations/reliability-repair.md",
+        // Linked, not inlined: the GBRA-200 degraded-stamp section in AGENT_OPERATOR_v1.md put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
     ],
   },
@@ -423,6 +544,13 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        title: "docs/architecture/generations.md",
+        description:
+          "Derived-data safety: how atoms, chronicle events, synthesis, facts and takes publish through one generation primitive, held results, retirements versioned and restorable for 30 days by default (generations.restore_days), and release or undo.",
+        path: "docs/architecture/generations.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/architecture/infra-layer.md",
         description: "Shared infra patterns.",
         path: "docs/architecture/infra-layer.md",
@@ -446,6 +574,8 @@ export const INLINE_TIPS = [
   "`gbrain repair [<kind>] [--apply]` - preview, then fix timeline, visibility and safe-chunk damage doctor reports.",
   "`gbrain upgrade` runs post-upgrade + apply-migrations.",
   "`gbrain errors <code> [--json]` - explain any error code offline; follow its `fix.next`.",
+  "`gbrain search --exact \"<phrase>\"` - every page containing a literal phrase, instead of grep.",
+  "`gbrain sources git-gap <id> [--json]` - read-only: how far a source's database is from what Git has committed.",
 ];
 
 // Target ~800KB so llms-full.txt fits in ~200k-token contexts with room to spare.

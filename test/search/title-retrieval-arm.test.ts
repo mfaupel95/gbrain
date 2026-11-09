@@ -154,6 +154,28 @@ describe('searchTitles — D1 title candidate arm', () => {
     expect(tlHit.chunk_index).toBe(2); // lowest index when no compiled_truth chunk
   });
 
+  test('a local OR re-run matches the title only: a timeline word is not a relaxed title hit (#7135)', async () => {
+    await engine.putPage('people/dated-entity', {
+      type: 'person',
+      title: 'Cobalt Meridian Atlas',
+      compiled_truth: 'unrelated body',
+      timeline: '- 2026-10-07: zircon quarry visit',
+    });
+    await installFixtureChunks(engine, 'people/dated-entity', [
+      { chunk_index: 0, chunk_text: 'unrelated body', chunk_source: 'compiled_truth' },
+    ]);
+    const inVector = await (engine as any).db.query(
+      `SELECT search_vector @@ to_tsquery('english', 'zircon') AS hit FROM pages WHERE slug = 'people/dated-entity'`,
+    );
+    expect(inVector.rows[0].hit).toBe(true);
+
+    const slugs = async (q: string) => (await engine.searchTitles(q, { limit: 10 })).map(r => r.slug);
+    expect(await slugs('zircon nebulith')).not.toContain('people/dated-entity');
+    expect(await slugs('quarry nebulith')).not.toContain('people/dated-entity');
+    expect(await slugs('Cobalt Meridian')).toContain('people/dated-entity');
+    expect(await slugs('Cobalt zircon')).toContain('people/dated-entity');
+  });
+
   test('respects soft-delete visibility and source scoping', async () => {
     await seedTitleOnlyPage();
 
@@ -298,6 +320,10 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   });
   test('interior hyphens are not operators — still relaxed', () => {
     expect(buildOrFallbackWebsearchQuery('alpha-beta gamma')).toBe('alpha OR beta OR gamma');
+  });
+  test('drops repeated words: a repeat adds no match and only multiplies ts_rank work (#7135)', () => {
+    expect(buildOrFallbackWebsearchQuery('idle tab idle reaper')).toBe('idle OR tab OR reaper');
+    expect(buildOrFallbackWebsearchQuery('Idle idle IDLE')).toBeNull();
   });
   test('drops literal OR/AND words so they cannot re-parse as operators', () => {
     expect(buildOrFallbackWebsearchQuery('alpha or beta')).toBe('alpha OR beta');

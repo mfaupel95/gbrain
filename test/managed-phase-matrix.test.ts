@@ -22,6 +22,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ensureCorpusSpoolDir, sessionCorpusFileName } from '../src/core/context/corpus-segments.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { ALL_PHASES, runCycle, type CycleOpts, type CyclePhase, type PhaseResult } from '../src/core/cycle.ts';
@@ -38,6 +39,8 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+import { getPin, insertPin } from '../src/core/questions/store.ts';
+import { questionSlug } from '../src/core/questions/identity.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { testBackends } from './helpers/test-backends.ts';
 
@@ -98,19 +101,22 @@ async function committed(engine: BrainEngine, sourceId: string, slug: string) {
     `SELECT operation,intent,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND state='committed' AND sequence>$3 ORDER BY sequence`,
     [sourceId, slug, since]);
 }
+// #6023: untyped facts that differ in a number token no longer cluster, so the
+// claims that should share a take vary by a plain word instead of a digit.
+const CLAIM_WORDS = ['alpha', 'beta', 'gamma'] as const;
 async function seedFacts(engine: BrainEngine, sourceId: string, slug: string) {
   const vector = `[${[1, ...Array(1535).fill(0)].join(',')}]`;
   for (let i = 0; i < 3; i++) {
     await engine.executeRaw(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,visibility,confidence,valid_from,embedding,embedding_model,embedded_text_hash)
       VALUES($1,$2,$3,'fact','test','world',$4,$5::timestamptz,$6::vector,'openai:text-embedding-3-large',md5($3))`,
-    [sourceId, slug, `Example claim ${i}`, 0.9 - i / 10, `2026-01-0${i + 1}T00:00:00Z`, vector]);
+    [sourceId, slug, `Example claim ${CLAIM_WORDS[i]}`, 0.9 - i / 10, `2026-01-0${i + 1}T00:00:00Z`, vector]);
   }
 }
 
 const MATRIX: Record<CyclePhase, Entry> = {
   lint: {
-    seed: async ({ engine, sourceId }) => put(engine, sourceId, 'notes/lint-example', page('note', 'Lint example', 'Body with a trailing space. \n\n\n\nToo many blank lines.')),
-    // #5180: the seeded page has a fixable issue (missing-created, promotable from its capture timestamp);
+    seed: async ({ engine, sourceId }) => put(engine, sourceId, 'notes/lint-example', page('note', 'Lint example', 'Of course. Here is a detailed brain page.\n\n# Lint example\n\nBody.')),
+    // #5180: the seeded page has a fixable issue (an LLM preamble; #5433 took the capture-timestamp promotion out);
     // the repair is admitted and committed by the coordinator, never written to the worktree by lint itself.
     assert: async ({ engine, sourceId, result }) => {
       expect(await committed(engine, sourceId, 'notes/lint-example')).not.toHaveLength(0);
@@ -154,10 +160,27 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect(result.details).toMatchObject({ mode: 'apply', kinds: ['slug-conflicts'] });
     },
   },
+  unindexed_files: {
+    // #6865: a file the source's last synced commit holds with no page and no hold (an older gbrain's unrecorded refusal) is
+    // found and scheduled for a re-screen on the next sync; the phase writes no page.
+    seed: async ({ engine, sourceId, root }) => {
+      git(root, 'init', '-q');
+      mkdirSync(join(root, 'notes'));
+      writeFileSync(join(root, 'notes/unindexed-example.md'), page('note', 'Unindexed example', 'Never imported.\n'));
+      git(root, 'add', '.');
+      git(root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'seed');
+      await engine.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [sourceId, git(root, 'rev-parse', 'HEAD').trim()]);
+    },
+    assert: async ({ engine, result }) => {
+      expect(result.status).toBe('ok');
+      expect(result.details).toMatchObject({ mode: 'apply', scanned: 1, unindexed: 1, scheduled_now: 1, complete: true });
+      expect(await engine.executeRaw("SELECT 1 FROM pages WHERE slug='notes/unindexed-example'")).toEqual([]);
+    },
+  },
   synthesize: {
     seed: async ({ engine, sourceId, root }) => {
       await put(engine, sourceId, 'people/example', page('note', 'Example', 'Example evidence.'));
-      writeFileSync(join(root, '2026-09-20-session.txt'), `User: we charge for durability because reliable memories should survive every tool.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
+      writeFileSync(join(ensureCorpusSpoolDir(root), sessionCorpusFileName('2026-09-20-session', sourceId)), `User: we charge for durability because reliable memories should survive every tool.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
     },
     config: { 'dream.synthesize.enabled': 'true', 'dream.synthesize.cooldown_hours': '0', 'dream.synthesize.min_chars': '100',
       'dream.synthesize.link_manifest': 'false', 'dream.synthesize.mode': 'oneshot', 'models.dream.synthesize': 'anthropic:claude-sonnet-4-6',
@@ -254,7 +277,7 @@ const MATRIX: Record<CyclePhase, Entry> = {
     assert: async ({ engine, sourceId, result }) => {
       expect(result.details.takes_written).toBe(1);
       expect(await committed(engine, sourceId, 'people/example')).not.toHaveLength(0);
-      expect((await engine.getPage('people/example', { sourceId }))?.compiled_truth).toContain('Example claim 0');
+      expect((await engine.getPage('people/example', { sourceId }))?.compiled_truth).toContain('Example claim alpha');
     },
   },
   propose_takes: {
@@ -299,6 +322,22 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect((await engine.getPage(slug!, { sourceId: 'default' }))?.compiled_truth).toContain('DRIFTED — notes/drift-example');
     },
   },
+  standing_questions: {
+    config: { 'models.standing_questions': 'anthropic:claude-sonnet-4-6' },
+    seed: async ({ engine, sourceId }) => {
+      await put(engine, sourceId, 'companies/acme-example', page('company', 'Acme', 'Acme example builds widgets in Lisbon.'));
+      const scope = { source: sourceId, entity: 'companies/acme-example' };
+      const question = 'Where does acme-example build widgets?';
+      await insertPin(engine, { sourceId, slug: questionSlug(question, scope), question, scope, state: 'active', inactiveReason: null, publishMode: 'publish', createdBy: 'cli' });
+    },
+    reply: () => JSON.stringify({ sentences: [{ text: 'Acme example builds widgets in Lisbon.', cite: ['E1'] }], gaps: [] }),
+    assert: async ({ engine, sourceId, result }) => {
+      const slug = questionSlug('Where does acme-example build widgets?', { source: sourceId, entity: 'companies/acme-example' });
+      expect(result.details).toMatchObject({ refreshed: 1 });
+      expect(await committed(engine, sourceId, slug)).not.toHaveLength(0);
+      expect((await getPin(engine, sourceId, slug))?.answer.map(s => s.text)).toEqual(['Acme example builds widgets in Lisbon.']);
+    },
+  },
   edge_contradictions: {
     config: { 'dream.edge_contradictions.mode': 'apply', 'models.dream.edge_contradictions': 'anthropic:claude-sonnet-4-6' },
     seed: async ({ engine, sourceId }) => {
@@ -328,6 +367,19 @@ const MATRIX: Record<CyclePhase, Entry> = {
       const [event] = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND type='event'", [sourceId]);
       expect(await committed(engine, sourceId, event.slug)).not.toHaveLength(0);
       expect(await engine.executeRaw("SELECT state FROM chronicle_page_state WHERE source_id=$1", [sourceId])).toEqual([{ state: 'extracted' }]);
+    },
+  },
+  claim_conflicts: {
+    config: { 'dream.claim_conflicts.mode': 'propose' },
+    seed: async ({ engine, sourceId }) => {
+      for (const [value, at] of [[40000, '2026-03-02'], [45000, '2026-03-20']] as const) {
+        await engine.executeRaw(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,visibility,confidence,valid_from,claim_metric,claim_value,claim_unit,claim_period)
+          VALUES($1,'companies/acme-example',$2,'fact','test','world',1,$3::timestamptz,'mrr',$4,'USD','monthly')`, [sourceId, `Acme MRR is ${value}`, at, value]);
+      }
+    },
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ pairs_found: 1, proposals_written: 1, deferred: 0 });
+      expect(await engine.executeRaw("SELECT status FROM decide_proposals WHERE source_id=$1 AND sweep_id LIKE 'claim_conflicts:%'", [sourceId])).toEqual([{ status: 'pending' }]);
     },
   },
   facts_drain: {

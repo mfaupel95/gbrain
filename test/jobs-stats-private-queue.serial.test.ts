@@ -99,3 +99,44 @@ describe('jobs stats — ABANDONED PRIVATE QUEUE classifier gating', () => {
     expect(out).not.toContain('WEDGED QUEUE');
   });
 });
+
+describe('jobs stats — per-queue lines fold dream-inline-* queues (#7241)', () => {
+  async function seed(): Promise<void> {
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, data)
+       SELECT '{"version":1,"kind":"application"}'::jsonb, 'sync', 'default', s, '{}'::jsonb FROM unnest(ARRAY['waiting','completed','completed']) AS s`,
+      [],
+    );
+    for (const [q, status] of [['dream-inline-1700000000000-aaaa0001', 'completed'], ['dream-inline-1700000000001-aaaa0002', 'completed'],
+      ['dream-inline-1700000000002-aaaa0003', 'dead']] as const) {
+      await engine.executeRaw(
+        `INSERT INTO minion_jobs (submission_authority, name, queue, status, data)
+         VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', $1, $2, '{}'::jsonb)`,
+        [q, status],
+      );
+    }
+  }
+
+  test('getStats reports one dream-inline row for every per-run queue, beside the named queues', async () => {
+    await seed();
+    const { MinionQueue } = await import('../src/core/minions/queue.ts');
+    const stats = await new MinionQueue(engine).getStats();
+    expect(stats.by_queue).toEqual([
+      { queue: 'default', queues: 1, waiting_now: 1, active_now: 0, total: 3, completed: 2, failed: 0, dead: 0 },
+      { queue: 'dream-inline', queues: 3, waiting_now: 0, active_now: 0, total: 3, completed: 2, failed: 0, dead: 1 },
+    ]);
+  });
+
+  test('the default output prints a line per queue family; --json carries by_queue; --queue <dream-inline-x> still scopes one queue', async () => {
+    await seed();
+    const out = await captureStats(['stats']);
+    expect(out).toMatch(/dream-inline \(3 queues\)\s+0 waiting, 0 active, 3 total, 2 done, 0 failed, 1 dead/);
+    expect(out).toMatch(/default\s+1 waiting, 0 active, 3 total, 2 done, 0 failed, 0 dead/);
+    const json = JSON.parse(await captureStats(['stats', '--json']));
+    expect(json.by_queue.map((r: { queue: string }) => r.queue)).toEqual(['default', 'dream-inline']);
+    expect(json.queue).toBe('default');
+    const one = JSON.parse(await captureStats(['stats', '--json', '--queue', 'dream-inline-1700000000002-aaaa0003']));
+    expect(one.wedge.queue).toBe('dream-inline-1700000000002-aaaa0003');
+  });
+});
+

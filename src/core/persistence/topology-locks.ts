@@ -1,11 +1,12 @@
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { assertPhysicalRoot } from './physical-root.ts';
+import { inspectRelocatedPhysicalRoot } from './physical-root-record.ts';
 import type { BrainEngine } from '../engine.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
-import { localHostId, persistenceHome, currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter } from './identity.ts';
+import { persistenceHome, currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, hostIdFor } from './identity.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { containsPath, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { completeWrite, lockCounters } from './journal.ts';
@@ -32,8 +33,14 @@ export async function lockTopologyPrincipal(engine: BrainEngine, id: string): Pr
 }
 
 /** Native locks precede every topology/source/grant/receipt transaction. */
+/**
+ * `relocation` (#5914, P1.3c): a `set-path` whose target is where the recorded
+ * root now resolves through a symlink. The recorded binding then verifies as a
+ * relocated root (reservation and stamp agree on token, brainId and worktreeId)
+ * instead of failing the realpath check; the transaction moves its records.
+ */
 export async function withTopologyLocks<T>(engine: BrainEngine, sourceId: string,
-  run: (bindings: TopologyBinding[]) => Promise<T>, additionalRoot?: string, waitMs=5000): Promise<T> {
+  run: (bindings: TopologyBinding[]) => Promise<T>, additionalRoot?: string, waitMs=5000, opts: { relocation?: boolean } = {}): Promise<T> {
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
   const handles: NativeLockHandle[] = [];
   const take = async (path: string) => {
@@ -51,7 +58,7 @@ export async function withTopologyLocks<T>(engine: BrainEngine, sourceId: string
     const bindings:TopologyBinding[] = binding ? [binding] : [];
     if (additionalRoot) {
       const local = await engine.executeRaw<TopologyBinding>(`SELECT w.id AS worktree_id,w.owner_host_id,w.owner_epoch,w.state,w.topology_generation,
-        h.local_path,h.coordination_path FROM persistence_host_bindings h JOIN persistence_worktrees w ON w.id=h.worktree_id WHERE h.host_id=$1::uuid`,[localHostId()]);
+        h.local_path,h.coordination_path FROM persistence_host_bindings h JOIN persistence_worktrees w ON w.id=h.worktree_id WHERE h.host_id=$1::uuid`,[hostIdFor(engine)]);
       for (const row of local) if (row.local_path&&(containsPath(row.local_path,additionalRoot) || containsPath(additionalRoot,row.local_path))) {
         const [member]=await engine.executeRaw<{source_id:string}>('SELECT source_id FROM persistence_source_bindings WHERE worktree_id=$1::uuid ORDER BY source_id LIMIT 1',[row.worktree_id]);
         const other = member?await getWorktreeBinding(engine,member.source_id):{...row,source_id:'',source_incarnation:'00000000-0000-0000-0000-000000000000',relative_path:'',unbound:true};
@@ -59,14 +66,31 @@ export async function withTopologyLocks<T>(engine: BrainEngine, sourceId: string
       }
     }
     for (const item of bindings.sort((a,b) => a.worktree_id.localeCompare(b.worktree_id))) {
-      if (item.owner_host_id !== localHostId() || !item.coordination_path) throw opError('owner_unavailable', 'Run source lifecycle on the current registered owner.',
-        `The worktree holding source ${item.source_id || sourceId} is owned by host ${item.owner_host_id}, not this host (${localHostId()}), or has no coordination path here, so nothing changed. Run the lifecycle command on the owning host; moving ownership is a separate, deliberate writer transfer.`,
+      if (item.owner_host_id !== hostIdFor(engine) || !item.coordination_path) throw opError('owner_unavailable', 'Run source lifecycle on the current registered owner.',
+        `The worktree holding source ${item.source_id || sourceId} is owned by host ${item.owner_host_id}, not this host (${hostIdFor(engine)}), or has no coordination path here, so nothing changed. Run the lifecycle command on the owning host; moving ownership is a separate, deliberate writer transfer.`,
         {fix:ownerStatusFix(sourceId)});
       await take(item.coordination_path);
-      if(item.local_path&&existsSync(item.local_path))assertPhysicalRoot(item.local_path,{worktreeId:item.worktree_id,coordinationPath:item.coordination_path});
+      assertBindingPhysicalRoot(item,sourceId,additionalRoot,opts);
     }
     return await run(bindings);
   } finally { for (const handle of handles.reverse()) await handle.release(); }
+}
+
+function assertBindingPhysicalRoot(item: TopologyBinding, sourceId: string, additionalRoot: string|undefined, opts: { relocation?: boolean }): void {
+  if(!item.local_path||!existsSync(item.local_path)) return;
+  const identity={worktreeId:item.worktree_id,coordinationPath:item.coordination_path};
+  if(opts.relocation&&item.source_id===sourceId&&additionalRoot&&item.local_path!==additionalRoot&&realpathSync(item.local_path)===additionalRoot) inspectRelocatedPhysicalRoot(item.local_path,additionalRoot,identity);
+  else assertPhysicalRoot(item.local_path,identity);
+}
+
+/**
+ * #6849: a lifecycle dry run predicts the physical-root refusal the real run hits in withTopologyLocks for the
+ * source's own binding on this host. Read-only: it takes no lock and writes no stamp, reservation or row.
+ */
+export async function inspectTopologyPhysicalRoot(engine: BrainEngine, sourceId: string, additionalRoot?: string, opts: { relocation?: boolean } = {}): Promise<void> {
+  const binding = await getWorktreeBinding(engine, sourceId);
+  if (!binding || binding.owner_host_id !== hostIdFor(engine) || !binding.coordination_path) return;
+  assertBindingPhysicalRoot(binding, sourceId, additionalRoot, opts);
 }
 
 /**
@@ -79,7 +103,7 @@ export async function lockTopologyRows(tx: BrainEngine, sourceId: string, bindin
   const ids = bindings.map(b => b.worktree_id).sort();
   const owners = await tx.executeRaw<{ id: string; owner_host_id: string; state: string; owner_epoch:string;topology_generation:string }>(
     'SELECT id,owner_host_id,state,owner_epoch,topology_generation FROM persistence_worktrees WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE', [ids]);
-  if (owners.length !== ids.length || owners.some(row => row.owner_host_id !== localHostId() || row.state !== 'active')) {
+  if (owners.length !== ids.length || owners.some(row => row.owner_host_id !== hostIdFor(tx) || row.state !== 'active')) {
     throw opError('recovery_required', 'The affected worktree is draining, recovering, or changed ownership.',
       `A worktree holding source ${sourceId} is draining, recovering, or now owned by another host, so the lifecycle change rolled back and nothing changed. Check its state with the command in fix; once it is active on this host, run the same lifecycle command again with the same request_id.`,
       {fix:ownerStatusFix(sourceId)});
@@ -96,7 +120,7 @@ export async function lockTopologyRows(tx: BrainEngine, sourceId: string, bindin
     if(before.unbound){
       const [member]=await tx.executeRaw('SELECT source_id FROM persistence_source_bindings WHERE worktree_id=$1::uuid LIMIT 1',[before.worktree_id]);
       const [host]=await tx.executeRaw<{local_path:string;coordination_path:string}>(
-        'SELECT local_path,coordination_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[before.worktree_id,localHostId()]);
+        'SELECT local_path,coordination_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[before.worktree_id,hostIdFor(tx)]);
       const owner=owners.find(owner=>owner.id===before.worktree_id)!;
       if(member||host?.local_path!==before.local_path||host.coordination_path!==before.coordination_path
         ||String(owner.owner_epoch)!==String(before.owner_epoch)||String(owner.topology_generation)!==String(before.topology_generation))
@@ -123,11 +147,11 @@ export async function topologyCanonicalStamp(tx:BrainEngine,worktreeId:string):P
   return row.stamp;
 }
 
-/** No provider or filesystem wait occurs while these database guards are held. */
-export async function settleTopologyRequests(tx: BrainEngine, sources: string[], worktrees: string[], principal: string): Promise<number> {
+/** Read-only half of settleTopologyRequests: refuses while a publication, recovery or blocking effect is unfinished. */
+export async function assertTopologyRequestsSettled(tx: BrainEngine, sources: string[], worktrees: string[]): Promise<WriteRequest[]> {
   const requests = await tx.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests
     WHERE (source_id=ANY($1::text[]) OR worktree_id=ANY($2::uuid[]))
-      AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) ORDER BY sequence`, [sources,worktrees]);
+      AND (state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL) ORDER BY sequence`, [sources,worktrees]);
   const busy = requests.find(row => row.state === 'running' || row.state === 'recovering' || row.recovery != null);
   if (busy) {
     throw opError('write_pending', 'Publication must finish or recover before source lifecycle can proceed.',
@@ -136,14 +160,20 @@ export async function settleTopologyRequests(tx: BrainEngine, sources: string[],
   }
   const [blocked] = await tx.executeRaw<{ id: string; source_id: string | null }>(`SELECT id,source_id FROM persistence_effects WHERE
     (source_id=ANY($1::text[]) OR worktree_id=ANY($2::uuid[])) AND
-    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state<>'committed')) LIMIT 1`, [sources,worktrees]);
+    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state='queued')) LIMIT 1`, [sources,worktrees]);
   if (blocked) {
     const source = blocked.source_id ?? sources[0];
     throw opError('recovery_required', 'Finish the pending withdrawal mirror and publication effects before changing source topology.',
-      `Effect ${blocked.id} on source ${source} (a withdrawal mirror or publication effect) has not finished, so the lifecycle change rolled back and nothing changed. The owner's effect worker settles it; check it with the command in fix, which lists it with its page and request; gbrain sources writer retry-effects re-authorizes a failed or parked one. Then run the same lifecycle command again with the same request_id.`,
+      `Effect ${blocked.id} on source ${source} (a queued withdrawal mirror, a running effect or one holding a recovery record) has not finished, so the lifecycle change rolled back and nothing changed. The owner's effect worker settles it; check it with the command in fix, which lists it with its page and request. Then run the same lifecycle command again with the same request_id.`,
       {fix:ownerStatusFix(source)});
   }
-  const pending = requests.filter(row => row.state === 'queued');
+  return requests;
+}
+
+/** No provider or filesystem wait occurs while these database guards are held. */
+export async function settleTopologyRequests(tx: BrainEngine, sources: string[], worktrees: string[], principal: string): Promise<number> {
+  const requests = await assertTopologyRequestsSettled(tx, sources, worktrees);
+  const pending = requests.filter(row => row.state === 'queued' || row.state === 'deferred');
   // Revocation and publication use the same principal rows. Administrative
   // invalidation may terminate revoked work but still respects guard ordering.
   const principals = new Map(pending.map(row => [`${row.principal_kind}:${row.principal_id}`,requestPrincipal(row)]));

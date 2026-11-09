@@ -885,3 +885,35 @@ describe('computeNightlyQualityProbeHealthCheck: judge panel (#5506)', () => {
     });
   });
 });
+
+describe('#7145 nightly_quality_probe_health explains a failing judge dimension', () => {
+  const failure = (id: string, dimension: string, mean: number, scores: number[]) =>
+    ({ question_id: id, verdict: 'fail', dimensions: [{ dimension, mean, scores, fail_reason: 'mean_below_7' }] });
+
+  test('one dimension failing while correctness never does: named, observed against the bar, with what it asks and where to look', async () => {
+    const { computeNightlyQualityProbeHealthCheck } = await import('../src/commands/doctor.ts');
+    const { PROBE_QA_DIMENSIONS } = await import('../src/core/cycle/nightly-probe-adapters.ts');
+    const events = [
+      { outcome: 'fail', ts: '2026-05-20T03:00:00Z', reader_model: 'anthropic:reader-example', failures: [failure('nightly-1', 'directness', 6.3, [6, 7, 6]), failure('nightly-2', 'directness', 5.7, [5, 6, 6])] },
+      { outcome: 'fail', ts: '2026-05-21T03:00:00Z', reader_model: 'anthropic:reader-example', receipt_dir: '/synthetic/audit/nightly-probe/run-2', failures: [failure('nightly-1', 'directness', 6.7, [7, 7, 6])] },
+    ];
+    const check = computeNightlyQualityProbeHealthCheck(true, events, PROBE_QA_DIMENSIONS);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('Failing judge dimension(s): directness in 2 runs (3 questions, judge mean 5.7-6.7; mean_below_7).');
+    expect(check.message).toContain('a mean of at least 7 across judges and no judge below 5, on a 1-10 scale');
+    expect(check.message).toContain('directness asks: Does it answer THIS question without hedging or padding or answering something else?');
+    expect(check.message).toContain('Correctness never failed');
+    expect(check.message).toContain('(reader anthropic:reader-example)');
+    expect(check.message).toContain('/synthetic/audit/nightly-probe/run-2 (lme-output.jsonl, summary.json)');
+    expect(check.details).toMatchObject({ failing_dimensions: [{ dimension: 'directness', runs: 2, questions: 3, mean_min: 5.7, mean_max: 6.7 }],
+      bar: { mean_at_least: 7, every_judge_at_least: 5, scale: '1-10' }, correctness_failed: false });
+  });
+
+  test('a correctness failure is not called a style problem', async () => {
+    const { computeNightlyQualityProbeHealthCheck } = await import('../src/commands/doctor.ts');
+    const check = computeNightlyQualityProbeHealthCheck(true, [{ outcome: 'fail', ts: '2026-05-21T03:00:00Z', failures: [failure('nightly-3', 'correctness', 3, [3, 3, 3])] }]);
+    expect(check.message).toContain('correctness in 1 run');
+    expect(check.message).not.toContain('Correctness never failed');
+    expect(check.details).toMatchObject({ correctness_failed: true });
+  });
+});

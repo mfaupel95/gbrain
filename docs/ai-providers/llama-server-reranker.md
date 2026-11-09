@@ -20,7 +20,7 @@ This recipe is the path override + recipe shape. Any provider whose
 request/response wire matches llama.cpp can use it by just pointing
 at a different base URL. A provider whose request differs only in the
 top-N key declares it via the recipe's `top_param` — that's how the
-hosted Voyage reranker recipe (`voyage:rerank-2.5`, the new-install
+hosted Voyage reranker recipe (`voyage:rerank-3-lite`, the new-install
 default, `top_k`) works. On the response side the gateway parser accepts
 both known array keys (`results[]` for llama.cpp, `data[]` for
 Voyage's REST — the shared item shape is `{index, relevance_score}`);

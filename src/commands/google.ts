@@ -32,6 +32,7 @@ import {
 } from '../core/creds/vault.ts';
 import {
   GOOGLE_PROVIDER,
+  GOOGLE_SERVICE_SCOPES,
   GoogleTokenProvider,
   apiEnableLink,
   buildAuthUrl,
@@ -58,7 +59,8 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 
 // ── Shared bits ──────────────────────────────────────────────────────────────
 
-import { ALL_GOOGLE_SERVICES, type GoogleService } from '../core/google/types.ts';
+import { ALL_GOOGLE_SERVICES, type GoogleApiProblem, type GoogleService } from '../core/google/types.ts';
+import { sourceCalendarReadability, type CalendarProbe, type CalendarReadability } from './google-calendar-status.ts';
 
 export const GOOGLE_SERVICES = ALL_GOOGLE_SERVICES;
 export type { GoogleService };
@@ -673,8 +675,10 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
     accounts.push(row);
   }
 
-  // Linked sources: best-effort, engine optional.
-  let linkedSources: Array<{ id: string; account: string | null }> = [];
+  // Linked sources: best-effort, engine optional. #5012 item 9: each one that
+  // syncs Calendar reports whether its configured calendar is readable.
+  let linkedSources: Array<{ id: string; account: string | null; calendar?: CalendarReadability }> = [];
+  const linkedServices = new Map<string, Set<GoogleService>>();
   try {
     const { loadConfig, toEngineConfig } = await import('../core/config.ts');
     const cfg = loadConfig();
@@ -684,21 +688,28 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
       const engine = await createEngine(engineConfig);
       await engine.connect(engineConfig);
       try {
-        const rows = await engine.executeRaw<{ id: string; config: unknown }>(
-          `SELECT id, config FROM sources WHERE archived IS NOT TRUE`,
+        const rows = await engine.executeRaw<{ id: string; incarnation: string; local_path: string | null; config: unknown }>(
+          `SELECT id, incarnation::text AS incarnation, local_path, config FROM sources WHERE archived IS NOT TRUE`,
           [],
         );
-        linkedSources = rows
-          .map((r) => {
-            const c =
-              typeof r.config === 'string'
-                ? (JSON.parse(r.config) as Record<string, unknown>)
-                : ((r.config ?? {}) as Record<string, unknown>);
-            return c.kind === 'google'
-              ? { id: r.id, account: typeof c.g_account === 'string' ? c.g_account : null }
-              : null;
-          })
-          .filter((x): x is { id: string; account: string | null } => x !== null);
+        const calendarProbe: CalendarProbe | null = probe ? async (account, calendarId) => {
+          const entry = await vault.get(credentialId(GOOGLE_PROVIDER, account));
+          if (!entry) throw new CredentialError('not_connected', ` for ${account}`);
+          const { CalendarClient } = await import('../core/google/google-clients.ts');
+          return new CalendarClient(new GoogleTokenProvider(vault, entry.id, fetch), fetch, () => {}, entry.meta.client_id).probeCalendar(calendarId);
+        } : null;
+        for (const r of rows) {
+          const c =
+            typeof r.config === 'string'
+              ? (JSON.parse(r.config) as Record<string, unknown>)
+              : ((r.config ?? {}) as Record<string, unknown>);
+          if (c.kind !== 'google') continue;
+          const { parseGoogleSourceConfig } = await import('../core/google/source-config.ts');
+          const sourceCfg = parseGoogleSourceConfig(c, '');
+          for (const service of sourceCfg.services) linkedServices.set(sourceCfg.account, (linkedServices.get(sourceCfg.account) ?? new Set()).add(service));
+          const calendar = await sourceCalendarReadability(engine, { ...r, config: c }, calendarProbe).catch(() => null);
+          linkedSources.push({ id: r.id, account: typeof c.g_account === 'string' ? c.g_account : null, ...(calendar ? { calendar } : {}) });
+        }
       } finally {
         await engine.disconnect();
       }
@@ -707,11 +718,30 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
     /* no engine — vault-only status */
   }
 
+  // #7073: every service a linked source syncs (else every granted one) is
+  // probed at once, so each disabled API or missing scope is named together.
+  if (probe) {
+    const { googleIdentityClients, probeGoogleApiAccess } = await import('../core/google/api-access.ts');
+    const { cliRenderContext, renderAction } = await import('../core/agent-output.ts');
+    for (const [i, m] of metas.entries()) {
+      const row = accounts[i]!;
+      if (row.refresh_probe !== 'ok') continue;
+      const account = m.account ?? m.id;
+      const granted = GOOGLE_SERVICES.filter((service) => !m.scopes?.length || m.scopes.includes(GOOGLE_SERVICE_SCOPES[service]));
+      const services = [...(linkedServices.get(account) ?? granted)];
+      const entry = await vault.get(m.id);
+      const access = await probeGoogleApiAccess(googleIdentityClients(new GoogleTokenProvider(vault, m.id), entry?.meta.client_id), account, services, m.scopes ?? []);
+      row.api_access = { ...access, ...(access.fix ? { fix: renderAction(access.fix, cliRenderContext()) } : {}) };
+    }
+  }
+  const apiBlocked = accounts.filter((a) => ((a.api_access as { problems?: unknown[] } | undefined)?.problems?.length ?? 0) > 0);
+  const unreadableCalendars = linkedSources.filter((s) => s.calendar?.code === 'calendar_unreadable');
+  if (unreadableCalendars.length > 0 || apiBlocked.length > 0) setCliExitVerdict(1);
   if (json) {
     process.stdout.write(
       JSON.stringify(
         {
-          ok: true,
+          ok: unreadableCalendars.length === 0 && apiBlocked.length === 0,
           status: accounts.length > 0 ? 'connected' : 'not_connected',
           client_on_file: client !== null,
           accounts,
@@ -742,11 +772,24 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
       const err = a.refresh_error as { fix?: string };
       if (err.fix) process.stdout.write(`  fix: ${err.fix}\n`);
     }
+    const access = a.api_access as { problems: GoogleApiProblem[]; fix?: { user_message?: string } } | undefined;
+    for (const p of access?.problems ?? []) {
+      process.stdout.write(p.code === 'api_not_enabled'
+        ? `  ${p.service}: api_not_enabled — ${p.api_title} (${p.api}) is disabled for project ${p.project ?? 'unknown'}; enable: ${p.enable_url}\n`
+        : `  ${p.service}: scope_missing — the credential was not granted ${p.service} access\n`);
+    }
+    if (access?.fix?.user_message) process.stdout.write(`  fix: ${access.fix.user_message}\n`);
   }
   if (linkedSources.length > 0) {
     process.stdout.write(
       `Linked sources: ${linkedSources.map((s) => s.id).join(', ')}\n`,
     );
+    for (const s of unreadableCalendars) {
+      const cal = s.calendar!;
+      process.stdout.write(`  ${s.id}: calendar_unreadable — ${s.account ?? 'this account'} cannot read calendar "${cal.calendar_id}" `
+        + `(HTTP ${cal.http_status}, ${cal.checked === 'live' ? 'checked now' : 'at the last sync'}); its sync imports no events.\n`
+        + `    List readable calendars: ${cal.fix!.list_command}\n    Change the source's calendar: ${cal.fix!.set_command}\n`);
+    }
   } else {
     process.stdout.write('Linked sources: none yet — `gbrain sources add <id> --kind google --account <email>`\n');
   }
@@ -809,7 +852,9 @@ Subcommands:
                --history-days <n>       backfill window for the source (default 90)
                --sync-budget-ms <ms>    first-sync wall-clock budget
                (+ all connect flags above)
-  status       accounts, scopes, refresh probe, linked sources  [--json] [--no-probe]
+  status       accounts, scopes, refresh probe, linked sources and whether each
+               source's calendar is readable  [--json] [--no-probe]
+               (--no-probe: no network; reports the last sync's calendar result)
   attachments backfill --source <id> [--yes] [--limit 1-25] [--retry-failed] [--json]
                bounded metadata-only repair of imported Gmail; managed persistence required
                See docs/guides/google-connect.md#attachment-receipts-and-historical-repair

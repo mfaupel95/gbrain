@@ -19,6 +19,8 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { embedStaleForSource, EMBED_PROBE_TEXT } from '../src/core/embed-stale.ts';
+import { contentDriftSweepKey, parseContentDriftSweepState } from '../src/core/content-drift-sweep.ts';
+import { resolveActiveEmbeddingColumnFromEngine } from '../src/core/search/embedding-column.ts';
 
 const DIMS = 1536;
 const MODEL = 'openai:text-embedding-3-large';
@@ -202,14 +204,15 @@ describe('embed --stale page-level signature reconciliation', () => {
         WHERE page_id = (SELECT id FROM pages WHERE slug = 'hash-mismatch')
           AND chunk_index = 0`,
     );
-    const originalInvalidate = engine.invalidateContentDriftEmbeddings.bind(engine);
-    engine.invalidateContentDriftEmbeddings = async () => 0;
-    try {
-      await runEmbedCore(engine, { stale: true, catchUp: true, quiet: true });
-    } finally {
-      engine.invalidateContentDriftEmbeddings = originalInvalidate;
-    }
+    // The content-drift sweep would repair the mismatch first; a pass that
+    // completed just now over a large corpus keeps it idle for this run.
+    const column = (await resolveActiveEmbeddingColumnFromEngine(engine)).name;
+    await engine.setConfig(contentDriftSweepKey(column), JSON.stringify({
+      ...parseContentDriftSweepState(null), last_completed_at: new Date().toISOString(), last_pass_checked: 10_000_000,
+    }));
+    const result = await runEmbedCore(engine, { stale: true, catchUp: true, quiet: true });
 
+    expect(result.content_drift?.state).toBe('waiting');
     expect(await pageSignature('hash-mismatch')).toBeNull();
   });
 

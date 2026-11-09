@@ -24,6 +24,7 @@ import type { ReadEligibility } from './eligibility/policy.ts';
 import { proactiveEligibility } from './eligibility/registry.ts';
 import { activationSuppressedSql, pageEligibleSql } from './eligibility/sql.ts';
 import { compactTrustLabel, needsDataEnvelope, renderTrustedText, trustFields } from './eligibility/labels.ts';
+import { PAGE_MAX_BYTES } from './page-size-policy.ts';
 
 export const CORE_DEFAULT_MAX_CHARS = 4000;
 export const CORE_MIN_MAX_CHARS = 500;
@@ -215,7 +216,7 @@ export function renderCoreBlock(input: readonly CorePage[], opts: RenderCoreBloc
   };
 }
 
-type RawExec = Pick<BrainEngine, 'executeRaw' | 'readPageSnapshot'>;
+type RawExec = BrainEngine;
 
 export interface ListCorePagesOpts {
   /** Restrict to these sources; omitted = every source in the brain. */
@@ -232,7 +233,8 @@ export interface ListCorePagesOpts {
   eligibility?: ReadEligibility;
 }
 
-interface CoreRow { source_id: string; slug: string; title: string | null; compiled_truth: string | null; frontmatter: unknown; withdrawn: boolean;
+interface CoreRow { id: number | string; source_id: string; slug: string; title: string | null; compiled_truth: string | null; frontmatter: unknown; withdrawn: boolean;
+  body_storage: string | null; body_bytes: number | string | null;
   trust_tier?: string; write_origin?: unknown; suppressed?: boolean }
 
 /**
@@ -256,19 +258,27 @@ export async function listCorePages(exec: RawExec, opts: ListCorePagesOpts = {})
   const trustCols = policy
     ? `p.trust_tier, p.write_origin, ${policy.suppressFlagged ? activationSuppressedSql('pages', 'p') : 'false'} AS suppressed,` : '';
   const rows = await exec.executeRaw<CoreRow>(
-    `SELECT p.source_id, p.slug, p.title, p.compiled_truth, p.frontmatter, ${trustCols}
+    `SELECT p.id, p.source_id, p.slug, p.title, p.compiled_truth, p.frontmatter, p.body_storage, p.body_bytes, ${trustCols}
         EXISTS (SELECT 1 FROM fact_withdrawals w WHERE w.source_id = p.source_id AND (w.subject = '*' OR w.subject = p.slug)) AS withdrawn
       FROM pages p WHERE ${where.join(' AND ')} ORDER BY p.source_id, p.slug LIMIT ${CORE_MAX_PAGES * 4}`, params);
   const pages: Array<CorePage & { suppressed?: boolean }> = [];
   for (const r of rows) {
     if (r.suppressed === true) { pages.push({ ...toCorePage({ source_id: r.source_id, slug: r.slug, title: r.title ?? r.slug, compiled_truth: '' }), suppressed: true }); continue; }
+    const segmented = r.body_storage === 'segmented';
+    // Wave B decision #1: a body stored in segments is read back whole up to PAGE_MAX_BYTES (24 MiB); a larger one
+    // is left out of the list, never read, and doctor's core_memory check reports it (skipped_segmented).
+    if (segmented && Number(r.body_bytes ?? 0) > PAGE_MAX_BYTES) continue;
     let compiled = r.compiled_truth ?? '';
     // Withdrawn facts (forget) are applied by the canonical snapshot read,
     // not by the stored body, so core never shows text get_page withholds.
     if (r.withdrawn) {
       const snap = await exec.readPageSnapshot(r.slug, { sourceId: r.source_id, ...(opts.excludePrivate ? { excludePrivate: true } : {}) });
       if (!snap) continue;
-      compiled = snap.page.compiled_truth ?? '';
+      compiled = segmented
+        ? (await (await import('./persistence/segmented-apply.ts')).materializedSnapshot(exec, snap))!.page.compiled_truth ?? ''
+        : snap.page.compiled_truth ?? '';
+    } else if (segmented) {
+      compiled = (await (await import('./page-body/ingest.ts')).materializeSegmentedBody(exec, Number(r.id), r.source_id)).compiled_truth;
     }
     pages.push(toCorePage({
       source_id: r.source_id, slug: r.slug, title: r.title ?? r.slug, compiled_truth: compiled,
@@ -347,7 +357,7 @@ export function coreNoticeLine(n: { source_id: string; slug: string; revision: s
 }
 
 /** The block a session receives; empty text when core is disabled or empty. */
-export async function loadCoreBlock(engine: Pick<BrainEngine, 'executeRaw' | 'readPageSnapshot' | 'getConfig'>, opts: LoadCoreBlockOpts = {}): Promise<CoreBlock & { enabled: boolean; activation_withheld?: number }> {
+export async function loadCoreBlock(engine: BrainEngine, opts: LoadCoreBlockOpts = {}): Promise<CoreBlock & { enabled: boolean; activation_withheld?: number }> {
   const settings = opts.settings ?? await readCoreSettings(engine);
   if (!settings.enabled) {
     return { text: '', chars_used: 0, chars_limit: settings.maxChars, pages: [], truncated: false, omitted: [], revision: 'disabled', enabled: false };

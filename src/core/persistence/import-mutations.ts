@@ -6,16 +6,19 @@ import { isImageFilePath, type ImportResult } from '../import-file.ts';
 import { loadConfig } from '../config.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission } from './page-mutations.ts';
+import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission,
+  withLiveSearchable } from './page-mutations.ts';
 import { admitBatch } from './page-batch.ts';
 import { writeOutcomeUnknown } from './admission-retry.ts';
 import { assertPersistenceAccepting, waitForWrites } from './service.ts';
 import type { WriteAdmission } from './journal.ts';
 import type { WriteRequest } from './model.ts';
 import { digest, sha256 } from './digest.ts';
-import { assertImportPaths, managedImportContent, prepareManagedImportMutation, readImportBytes, type ImportPack, type ManagedImportIntent } from './import-prepare.ts';
+import { assertImportPaths, managedImportContent, managedStreamedIdentity, prepareManagedImportMutation, readImportBytes, type ImportPack, type ManagedImportBodyRef,
+  type ManagedImportIntent } from './import-prepare.ts';
+import { readPageBodyPolicy } from '../page-body/limits.ts';
 import { submissionAuthority } from './authority.ts';
 import { inspectUnchanged, screeningRequest } from './noop-kernel.ts';
 import { withScreeningPaths } from './screening-paths.ts';
@@ -98,13 +101,14 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
   const fail = (i: number, reason: unknown) => { settled[i] = { status: 'rejected', reason }; };
   const sourceId = opts.sourceId ?? 'default';
   const binding = await getWorktreeBinding(engine, sourceId);
-  const unowned = !binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active'
+  const unowned = !binding?.local_path || binding.owner_host_id !== hostIdFor(engine) || binding.state !== 'active'
     ? opError('owner_unavailable', 'Managed import must run on the active canonical owner for the selected source.',
       `This host is not the active owner of source ${sourceId}, so nothing was imported. Run the import on the owner host that writer status names, or wait until its owner is active.`,
       { fix: readFix(`Shows source ${sourceId}'s owner host and state, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) }) : null;
   const ctx = { engine, remote: false, sourceId, config: loadConfig() ?? { engine: engine.kind } } as OperationContext;
   const reads = batchSharedReads(engine);
-  const planned: Array<{ i: number; slug: string; content: string; sourcePath: string; path: string; inputPath: string; inputHash: string; target: string }> = [];
+  const bodyPolicy = await readPageBodyPolicy(engine);
+  const planned: Array<{ i: number; slug: string; content?: string; bodyRef?: ManagedImportBodyRef; sourcePath: string; path: string; inputPath: string; inputHash: string; target: string }> = [];
   const slugs = new Set<string>();
   let rest = files.length;
   await withScreeningPaths(async () => { for (let i = 0; i < files.length; i++) {
@@ -123,11 +127,13 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
       const path = canonicalInput ? canonicalRelative : sourcePath;
       const target = resolve(root, path);
       await assertImportPaths(reads, sourceId, root, inputPath, target);
-      const bytes = readImportBytes(inputPath);
-      const { slug, content } = managedImportContent(sourcePath, bytes, opts.activePack);
+      const streamed = await managedStreamedIdentity(sourcePath, inputPath, target, bodyPolicy, sourceId);
+      const bytes = streamed ? null : readImportBytes(inputPath);
+      const { slug, content } = streamed ? { slug: streamed.slug, content: undefined } : managedImportContent(sourcePath, bytes!, opts.activePack);
       if (slugs.has(slug)) { rest = i; break; }
       slugs.add(slug);
-      planned.push({ i, slug, content, sourcePath, path, inputPath, inputHash: sha256(bytes), target });
+      planned.push({ i, slug, content, ...(streamed ? { bodyRef: streamed.bodyRef } : {}), sourcePath, path, inputPath,
+        inputHash: streamed ? streamed.bodyRef.sha256 : sha256(bytes!), target });
     } catch (error) { fail(i, error); }
   } });
   if (planned.length) await importPlanned(ctx, binding!, planned, opts, fail, (i, value) => { settled[i] = { status: 'fulfilled', value }; });
@@ -136,7 +142,7 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
 }
 
 async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
-  planned: Array<{ i: number; slug: string; content: string; sourcePath: string; path: string; inputPath: string; inputHash: string; target: string }>,
+  planned: Array<{ i: number; slug: string; content?: string; bodyRef?: ManagedImportBodyRef; sourcePath: string; path: string; inputPath: string; inputHash: string; target: string }>,
   opts: { noEmbed?: boolean; activePack?: ImportPack },
   fail: (i: number, reason: unknown) => void, done: (i: number, value: ImportResult) => void): Promise<void> {
   const { engine } = ctx;
@@ -156,7 +162,7 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
     if (stored.inputHash !== member.inputHash || stored.slug !== member.slug) throw opError('internal_error', 'A pending import checkpoint does not match the file it is keyed by.',
       `The checkpointed import of ${member.sourcePath} (request ${stored.request_id}) in source ${sourceId} records a different input than the bytes just read under the same key, so nothing was resubmitted. Report it with gbrain doctor --json.`);
     member.stored = stored;
-    member.params = { ...stored, content: member.content } as PendingImport;
+    member.params = { ...stored, ...(member.content !== undefined ? { content: member.content } : {}) } as PendingImport;
   };
   const open = new Set(members);
   const settle = (member: (typeof members)[number], value: ImportResult) => { open.delete(member); done(member.i, value); };
@@ -178,7 +184,8 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
         const snapshot = screened ? screened.get(pageSnapshotKey(sourceId, member.slug)) ?? null : await engine.readPageSnapshot(member.slug, { sourceId, includeDeleted: true });
         // The input is the canonical file itself (the common case): its hash was taken from the bytes just read.
         const targetHash = member.target === member.inputPath ? member.inputHash : existsSync(member.target) ? sha256(readImportBytes(member.target)) : null;
-        const intent: ManagedImportIntent = { kind: 'managed_file_import', slug: member.slug, content: member.content, sourcePath: member.sourcePath, path: member.path,
+        const intent: ManagedImportIntent = { kind: 'managed_file_import', slug: member.slug, ...(member.bodyRef ? { body_ref: member.bodyRef } : { content: member.content }),
+          sourcePath: member.sourcePath, path: member.path,
           inputPath: member.inputPath, inputHash: member.inputHash, targetHash,
           ownerEpoch: String(binding.owner_epoch), ...(snapshot ? { expected_revision: snapshot.revision } : {}),
           noEmbed: !!opts.noEmbed, ...(opts.activePack ? { activePack: opts.activePack } : {}) };
@@ -207,6 +214,9 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
       const value = outcome.value;
       done(member.i, { slug: String(value.slug), status: value.status as ImportResult['status'], chunks: Number(value.chunks ?? 0),
         ...(typeof value.error === 'string' ? { error: value.error } : {}),
+        ...(value.searchable !== undefined ? { searchable: value.searchable as ImportResult['searchable'] } : {}),
+        ...(value.searchable === 'pending' ? { projection: 'pending' as const, request_id: String(value.request_id),
+          searchable_retry_after_ms: Number(value.searchable_retry_after_ms), searchable_fix: value.searchable_fix as ImportResult['searchable_fix'] } : {}),
         ...(value.type_warning ? { type_warning: value.type_warning as ImportResult['type_warning'] } : {}) });
       return;
     }
@@ -260,20 +270,28 @@ async function submitManagedImports(ctx: OperationContext, batch: string, params
   }
   rows.sort((a, b) => a.index - b.index);
   const done = await waitForWrites(ctx.engine, rows.map(entry => entry.row), ctx.config, IMPORT_WAIT_MS * rows.length);
-  rows.forEach((entry, position) => {
+  await Promise.all(rows.map(async (entry, position) => {
     try {
-      const response = pendingAwareResponse(ctx, done[position]!);
+      // #7106: a new segmented page over 4 MiB replies at commit with `searchable: 'pending'`, read live here.
+      const response = await withLiveSearchable(ctx, pendingAwareResponse(ctx, done[position]!));
       if (entry.admitted) emitFenceNotice(ctx, response, done[position]!.slug);
       settled[entry.index] = { status: 'fulfilled', value: { ...response, ...(entry.typeWarning ? { type_warning: entry.typeWarning } : {}),
         ...(entry.slugAdvisory ? { slug_advisory: entry.slugAdvisory } : {}) } };
     } catch (reason) { settled[entry.index] = { status: 'rejected', reason }; }
-  });
+  }));
   return settled;
 }
 
-/** Runs the managed-import preparer on an unadmitted request; true only when the no-op kernel finds nothing to publish. */
+/**
+ * Runs the managed-import preparer on an unadmitted request; true only when the no-op kernel finds nothing to publish.
+ * A file admitted by reference (`body_ref`) is not screened: its screen would stream and stage the whole body, so its
+ * publication decides the no-op.
+ */
 async function unchangedManagedImport(ctx: OperationContext, binding: WorktreeBinding, intent: ManagedImportIntent, snapshot: PageSnapshot | null): Promise<boolean> {
-  if (!snapshot) return false;
+  if (!snapshot || intent.body_ref) return false;
+  // #6529: an image's preparation is provider work (OCR, the multimodal vector) unless its index is already complete, so the
+  // screen would pay for every incomplete image and the owner would pay again. The owner decides the hash no-op (one importer call).
+  if (isImageFilePath(intent.sourcePath)) return false;
   try {
     const authority = await submissionAuthority(ctx, 'put_page', binding.source_id, binding.source_incarnation, intent.slug);
     const row = screeningRequest({ source_id: binding.source_id, source_incarnation: binding.source_incarnation, slug: intent.slug,

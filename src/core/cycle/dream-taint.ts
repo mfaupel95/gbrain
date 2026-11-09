@@ -15,7 +15,7 @@
 import { resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { parseMarkdown } from '../markdown.ts';
-import { declareDerivation, deriveTrust, derivedMaintenanceTransaction, derivedWriteTrust, frontmatterTaint, type DerivationDeclaration } from '../trust/taint.ts';
+import { declareDerivation, deriveTrust, derivedWriteTrust, frontmatterTaint, type DerivationDeclaration } from '../trust/taint.ts';
 import type { TaintInput, TrustTier, WriteTrust } from '../trust/tier.ts';
 import { CONVERSATION_PAGE_URI_PREFIX } from './transcript-discovery.ts';
 
@@ -65,15 +65,6 @@ export async function withTranscriptTaint<R extends { raw_source?: string }>(eng
 export async function summaryDerivation(engine: BrainEngine, sourceId: string, slugs: string[]): Promise<Derivation & { declaration: DerivationDeclaration }> {
   const { trust, inputs } = await deriveTrust(engine, slugs.map(slug => ({ table: 'pages' as const, sourceId, slug })), { channel: 'derive:synthesize' });
   return { trust, inputs, declaration: declareDerivation(trust, inputs) };
-}
-
-/** An unmanaged derived page write (the dream summary): putPage at the derivation's tier, lowered, with its input edges. */
-export async function putDerivedPage(engine: BrainEngine, derivation: Derivation, slug: string,
-  page: Parameters<BrainEngine['putPage']>[1], opts: { sourceId: string }): Promise<void> {
-  await derivedMaintenanceTransaction(engine, derivation, async tx => {
-    const written = await tx.putPage(slug, page, opts);
-    return { result: undefined, rows: [{ table: 'pages' as const, id: Number(written.id), sourceId: opts.sourceId }] };
-  });
 }
 
 /** One patterns pass's derivation: every reflection submitted in its prompt. */

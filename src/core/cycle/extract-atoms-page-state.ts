@@ -2,7 +2,6 @@ import type { SqlEngine } from '../persistence/model.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { stableJson } from '../persistence/digest.ts';
 import type { BrainEngine } from '../engine.ts';
-import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /**
  * gbrain#4148: consecutive same-content failures of a content-deterministic
@@ -41,8 +40,8 @@ export class AtomPageStateError extends Error {
 export async function readAtomPageIdentity(engine: SqlEngine, sourceId: string, item: AtomPageInput): Promise<AtomPageIdentity | undefined> {
   const [row] = await engine.executeRaw<{ id: number; incarnation: string; knowledge_revision: string }>(
     `SELECT p.id, s.incarnation, p.knowledge_revision FROM pages p JOIN sources s ON s.id=p.source_id
-      WHERE p.source_id=$1 AND p.slug=$2 AND p.content_hash=$3 AND p.compiled_truth=$4 AND p.deleted_at IS NULL`,
-    [sourceId, item.slug, item.contentHash, item.content]);
+      WHERE p.source_id=$1 AND p.slug=$2 AND p.content_hash=$3 AND p.deleted_at IS NULL`,
+    [sourceId, item.slug, item.contentHash]);
   return row && { pageId: row.id, sourceIncarnation: row.incarnation, revision: row.knowledge_revision };
 }
 
@@ -53,48 +52,22 @@ export async function writeAtomPageState(
   const { pageId, sourceIncarnation, revision } = item.identity;
   const [row] = await engine.executeRaw<{ fail_count: number }>(
     `INSERT INTO extract_atoms_page_state (source_incarnation, page_id, content_hash, fail_count, tombstoned)
-      SELECT s.incarnation, p.id, p.content_hash, $8::integer, $9::boolean
+      SELECT s.incarnation, p.id, p.content_hash, $7::integer, $8::boolean
       FROM pages p JOIN sources s ON s.id=p.source_id
       WHERE p.id=$1 AND s.incarnation=$2::uuid AND p.source_id=$3 AND p.slug=$4
-        AND p.content_hash=$5 AND p.knowledge_revision=$6::uuid AND p.compiled_truth=$7 AND p.deleted_at IS NULL
+        AND p.content_hash=$5 AND p.knowledge_revision=$6::uuid AND p.deleted_at IS NULL
       FOR SHARE OF p, s
       ON CONFLICT (source_incarnation, page_id, content_hash) DO UPDATE
         SET fail_count=extract_atoms_page_state.fail_count + EXCLUDED.fail_count,
             tombstoned=extract_atoms_page_state.tombstoned OR EXCLUDED.tombstoned, updated_at=now()
       RETURNING fail_count`,
-    [pageId, sourceIncarnation, sourceId, item.slug, item.contentHash, revision, item.content,
+    [pageId, sourceIncarnation, sourceId, item.slug, item.contentHash, revision,
       outcome === 'failure' ? 1 : 0, outcome === 'complete']).catch((error: unknown) => {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
     throw new AtomPageStateError(code === '42P01' ? 'schema' : code === '42501' ? 'denied' : 'storage');
   });
   if (!row) throw new AtomPageStateError('changed');
   return Number(row.fail_count);
-}
-
-export async function completeAtomReceipts(
-  engine: BrainEngine, sourceId: string, importedSlugs: string[], hash16: string, page?: AtomPageInput,
-): Promise<void> {
-  await maintenanceTransaction(engine, async tx => {
-    const completed = await tx.executeRaw(
-      `UPDATE pages
-          SET frontmatter = frontmatter || jsonb_build_object('source_hash', $1::text)
-        WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL
-          ${page ? `AND EXISTS (
-            SELECT 1 FROM pages origin JOIN sources s ON s.id=origin.source_id
-            WHERE origin.id=$4 AND s.incarnation=$5::uuid AND origin.source_id=$2
-              AND origin.content_hash=$6 AND origin.knowledge_revision=$7::uuid AND origin.deleted_at IS NULL
-            FOR SHARE OF origin, s
-          )` : ''}
-        RETURNING slug`,
-      page
-        ? [hash16, sourceId, importedSlugs, page.identity?.pageId ?? null,
-          page.identity?.sourceIncarnation ?? null, page.contentHash, page.identity?.revision ?? null]
-        : [hash16, sourceId, importedSlugs],
-    );
-    if (completed.length !== new Set(importedSlugs).size) {
-      throw new Error('atom completion could not be saved because the source or atom pages changed; pending atoms remain retryable');
-    }
-  });
 }
 
 const LEGACY_KEYS = ['atoms_scan_hash', 'atoms_fail_hash', 'atoms_fail_count'];

@@ -13,6 +13,7 @@
  *                                                                                  `mcp.result_rows: full` -> full;
  *                                                                                  reject mode accepts `fields`
  * Old CLI renderers read slug/score/chunk_text/stale only, which lean rows keep.
+ * Lean rows carry `id` only where `fetch` is callable (a starter client gets none).
  *
  * Fails when: the thin client loses full rows (renderers, --explain), the
  * host-wide escape hatch stops working on a transport, or strict hosts
@@ -116,6 +117,21 @@ describe('OAuth HTTP host', () => {
   test('old thin CLI or third-party client (no header): lean rows; fields "full" restores them', async () => {
     expect(isLean(JSON.parse((await rawCall('search', { query: 'ocelot pricing' })).content[0].text))).toBe(true);
     expect(isFull(JSON.parse((await rawCall('search', { query: 'ocelot pricing', fields: 'full' })).content[0].text))).toBe(true);
+  });
+
+  test('a starter client (fetch not callable) gets lean rows without id; the thin client on the same row keeps full rows with id', async () => {
+    await engine.executeRaw(`UPDATE oauth_clients SET surface = 'starter' WHERE client_id = $1`, [clientId]);
+    try {
+      const lean = JSON.parse((await rawCall('search', { query: 'ocelot pricing' })).content[0].text) as Row[];
+      expect(lean.length).toBeGreaterThan(0);
+      expect(lean.every(r => !('page_id' in r) && 'chunk_id' in r && 'slug' in r && !('id' in r))).toBe(true);
+      const thin = await thinCall('search', { query: 'ocelot pricing' });
+      expect(isFull(thin)).toBe(true);
+      expect(thin.every(r => typeof r.id === 'string')).toBe(true);
+    } finally {
+      await engine.executeRaw(`UPDATE oauth_clients SET surface = NULL WHERE client_id = $1`, [clientId]);
+    }
+    expect(isLean(JSON.parse((await rawCall('search', { query: 'ocelot pricing' })).content[0].text))).toBe(true);
   });
 
   test('a header naming another client is not the thin client', async () => {

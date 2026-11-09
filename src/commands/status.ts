@@ -53,6 +53,8 @@ import {
   readSupervisorEvents,
   summarizeCrashes,
 } from '../core/minions/handlers/supervisor-audit.ts';
+import { formatSyncFreshness, readSyncFreshness, type SourceFreshness } from '../core/persistence/sync-freshness.ts';
+import { withReadMeta } from '../core/read-heartbeat.ts';
 
 const SCHEMA_VERSION = 1 as const;
 
@@ -158,6 +160,8 @@ export interface StatusReport {
   generated_at: string;
   mode: 'local' | 'thin-client';
   sync?: SyncStatusReport;
+  /** #6858 ask 6: commit→searchable / commit→embedded latency of each managed source (local mode, with the sync section). */
+  freshness?: SourceFreshness[];
   cycle?: CycleSnapshot;
   locks?: LockRow[] | { local_only_remote: true };
   workers?: WorkerSummary | RemoteWorkersSnapshot | SectionUnavailable | RemoteUnsupported | { local_only_remote: true };
@@ -511,6 +515,12 @@ async function buildLocalReport(
     } catch (err) {
       warnings.push(`sync section failed: ${(err as Error).message}`);
     }
+    try {
+      const freshness = await withSectionDeadline(readSyncFreshness(engine), remaining(), () => { if (!staleSections.includes('sync')) markStale('sync'); });
+      if (freshness?.length) report.freshness = freshness;
+    } catch (err) {
+      warnings.push(`freshness read failed: ${(err as Error).message}`);
+    }
   }
   if (want('cycle')) {
     try {
@@ -656,6 +666,9 @@ export function renderHuman(report: StatusReport): string {
       }
       if (report.sync.unacknowledged_failures > 0) {
         lines.push(`  ${report.sync.unacknowledged_failures} unacknowledged sync failure(s)`);
+      }
+      for (const f of report.freshness ?? []) {
+        if (f.commit_to_searchable.samples || f.unresolved_commits) lines.push(`  freshness ${f.source_id}: ${formatSyncFreshness(f)}`);
       }
     }
     lines.push('');
@@ -891,7 +904,7 @@ export async function runStatus(
   }
 
   if (json) {
-    stdout(JSON.stringify(report) + '\n');
+    stdout(JSON.stringify(withReadMeta(report)) + '\n');
   } else {
     stdout(renderHuman(report));
   }

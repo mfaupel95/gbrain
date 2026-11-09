@@ -142,9 +142,9 @@ describe('snapshot schema hash inputs (EO7)', () => {
 describe('pglite-snapshot CI cache keys (DX O7)', () => {
   const keys = discoverCacheKeys();
 
-  test('discovers every key: 14 across e2e.yml, test.yml and stress.yml, two profiles', () => {
-    expect(keys.length).toBe(14);
-    expect(keys.filter((k) => k.file.endsWith('e2e.yml')).length).toBe(6);
+  test('discovers every key: 15 across e2e.yml, test.yml and stress.yml, two profiles', () => {
+    expect(keys.length).toBe(15);
+    expect(keys.filter((k) => k.file.endsWith('e2e.yml')).length).toBe(7);
     expect(keys.filter((k) => k.file.endsWith('test.yml')).length).toBe(7);
     expect(keys.filter((k) => k.file.endsWith('stress.yml')).length).toBe(1);
     expect([...new Set(keys.map((k) => k.namespace))].sort()).toEqual(['pglite-snapshot', 'pglite-snapshot-default']);
@@ -184,6 +184,13 @@ describe('pglite-snapshot CI cache keys (DX O7)', () => {
     expect(uncovered).toEqual([]);
     for (const extra of ['test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts']) {
       expect(keys[0]!.patterns).toContain(extra);
+    }
+  });
+
+  test('the keys cover any src/core subdirectory, so a new folder in the closure needs no workflow edit (#8700)', () => {
+    const globs = keys[0]!.patterns.map((p) => new Bun.Glob(p));
+    for (const probe of ['src/core/feature-example/x.ts', 'src/core/feature-example/nested/y.ts', 'src/core/z.ts']) {
+      expect({ probe, covered: globs.some((g) => g.match(probe)) }).toEqual({ probe, covered: true });
     }
   });
 });

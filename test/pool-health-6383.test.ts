@@ -13,7 +13,7 @@
 import { describe, expect, test } from 'bun:test';
 import { gucMilliseconds, poolHealthOptions, resolveInflightTimeoutSeconds } from '../src/core/db.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { formatBuildFailureWarning, formatStuckConnectionWarning, PoolIncidentCounter } from '../src/core/pool-gauge.ts';
+import { formatBuildFailureWarning, formatDesyncWarning, formatStuckConnectionWarning, PoolIncidentCounter } from '../src/core/pool-gauge.ts';
 import { driverPoolStats, poolHealthSnapshot } from '../src/core/postgres-engine/pool-stats.ts';
 import { formatPoolRecoveredInfo, formatPoolStalledWarning, PoolStallWatch } from '../src/core/postgres-engine/pool-stall-watch.ts';
 import { probeDeepHealth } from '../src/commands/serve-http-metrics.ts';
@@ -51,8 +51,10 @@ describe('in-flight budget', () => {
   test('poolHealthOptions carries the hooks and the budget into postgres.js options', async () => {
     await withEnv({ GBRAIN_PG_STUCK_GRACE_MS: undefined }, async () => {
       const onstuck = () => {};
-      const options = poolHealthOptions({ onstuck }, '5min');
+      const ondesync = () => {};
+      const options = poolHealthOptions({ onstuck, ondesync }, '5min');
       expect(options.onstuck).toBe(onstuck);
+      expect(options.ondesync).toBe(ondesync);
       expect(options.onpoisoned).toBeUndefined();
       expect(options.inflight_timeout).toBe(330);
       expect(poolHealthOptions(undefined, undefined).inflight_timeout).toBeNull();
@@ -74,6 +76,28 @@ describe('warn lines', () => {
     expect(formatBuildFailureWarning('read', 'weird code', 'SELECT 1')).toContain('error=BUILD_FAILED');
   });
 
+  test('#6543: an UNDEFINED_VALUE line names the parameter, `param=?` when the driver gave none (an array element)', () => {
+    expect(formatBuildFailureWarning('read', 'UNDEFINED_VALUE', 'SELECT * FROM source_ingestion_receipts WHERE a = $1 AND b = $2', 2))
+      .toContain('error=UNDEFINED_VALUE pool=read sql=SELECT_source_ingestion_receipts param=$2 cause=');
+    expect(formatBuildFailureWarning('read', 'UNDEFINED_VALUE', 'SELECT $1')).toContain('sql=SELECT param=? cause=');
+    expect(formatBuildFailureWarning('read', 'MAX_PARAMETERS_EXCEEDED', 'SELECT $1', 3)).not.toContain('param=');
+    const counter = new PoolIncidentCounter();
+    const warn = console.warn;
+    const lines: string[] = [];
+    console.warn = (line: string) => { lines.push(line); };
+    try { counter.hooks('direct').onbuilderror('UNDEFINED_VALUE', 'UPDATE persistence_effects SET state = $1 WHERE id = $2', 2); } finally { console.warn = warn; }
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('sql=UPDATE_persistence_effects param=$2');
+  });
+
+  test('pg_connection_desync names the message type, the connection and the last statement by keyword and table only', () => {
+    const line = formatDesyncWarning('read', { message: 'C', connection: 7, statement: "SELECT enabled FROM persistence_brain WHERE singleton = 1 AND note = 'secret'" });
+    expect(line).toContain('[gbrain] warn code=pg_connection_desync pool=read message=C connection=7 sql=SELECT_persistence_brain');
+    expect(line).toContain('docs=docs/ENGINES.md#pg-connection-desync');
+    expect(line).not.toContain('secret');
+    expect(formatDesyncWarning('direct', { message: '\n', connection: -1, statement: '' })).toContain('message=? connection=0');
+  });
+
   test('PoolIncidentCounter counts each kind once per report', () => {
     const counter = new PoolIncidentCounter();
     const warn = console.warn;
@@ -83,6 +107,7 @@ describe('warn lines', () => {
       counter.recordStuck('read', { age_ms: 1, queued: 0, statement: 'SELECT 1' });
       counter.recordBuildFailure('read', 'UNDEFINED_VALUE', 'SELECT $1');
       counter.recordBuildFailure('direct', 'MAX_PARAMETERS_EXCEEDED', 'SELECT $1');
+      counter.hooks('read').ondesync({ message: 'D', connection: 3, statement: 'SELECT 1' });
     } finally {
       console.warn = warn;
     }
@@ -90,6 +115,8 @@ describe('warn lines', () => {
     expect(counter.buildFailureCount).toBe(2);
     expect(lines.filter(l => l.includes('pg_connection_stuck'))).toHaveLength(1);
     expect(lines.filter(l => l.includes('pg_statement_build_failed'))).toHaveLength(2);
+    expect(counter.desyncCount).toBe(1);
+    expect(lines.filter(l => l.includes('pg_connection_desync'))).toHaveLength(1);
   });
 });
 
@@ -102,7 +129,7 @@ function fakeEngine(state: { busy: number; queued: number; completed: number; ol
       poolMax: 4,
       poisonedDiscards: 1,
       stuckDiscards: 2,
-      buildFailures: 3,
+      buildFailures: 3, desyncDiscards: 4,
       prepare: false,
       pool: driverPoolStats({ pool: { max: 4, open: 4 - state.busy, busy: state.busy, full: 0, reserved: 0, connecting: 0, closed: 0, ended: 0, queued: state.queued, inflight_oldest_ms: state.oldest, completed: state.completed } }),
     }),
@@ -112,7 +139,7 @@ function fakeEngine(state: { busy: number; queued: number; completed: number; ol
 describe('poolHealthSnapshot', () => {
   test('joins the driver numbers with the engine counters, and is null for an engine without pool numbers', () => {
     const snapshot = poolHealthSnapshot(fakeEngine({ busy: 1, queued: 2, completed: 10, oldest: 250 }));
-    expect(snapshot).toEqual({ checked_out: 1, max: 4, waiters: 2, inflight_oldest_ms: 250, completed: 10, poisoned_discards: 1, stuck_discards: 2, build_failures: 3 });
+    expect(snapshot).toEqual({ checked_out: 1, max: 4, waiters: 2, inflight_oldest_ms: 250, completed: 10, poisoned_discards: 1, stuck_discards: 2, build_failures: 3, desync_discards: 4, recovered: 0, recovery_failed: 0 });
     expect(poolHealthSnapshot({ kind: 'pglite' })).toBeNull();
     expect(poolHealthSnapshot({ getPoolDiagnostics: () => { throw new Error('closed'); } })).toBeNull();
   });
@@ -142,7 +169,7 @@ describe('PoolStallWatch', () => {
     now += 30_000;
     expect(watch.tick()).toBeNull();
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toBe(formatPoolStalledWarning({ checked_out: 1, max: 4, waiters: 0, inflight_oldest_ms: 90_000, completed: 11, poisoned_discards: 1, stuck_discards: 2, build_failures: 3 }, 60_000));
+    expect(lines[0]).toBe(formatPoolStalledWarning({ checked_out: 1, max: 4, waiters: 0, inflight_oldest_ms: 90_000, completed: 11, poisoned_discards: 1, stuck_discards: 2, build_failures: 3, desync_discards: 4, recovered: 0, recovery_failed: 0 }, 60_000));
     expect(lines[0]).toContain('code=pg_pool_stalled checked_out=1 max=4 waiters=0 inflight_oldest_ms=90000 completed_delta=0 stalled_ms=60000');
     expect(lines[1]).toContain('stalled_ms=90000');
     expect(lines[2]).toBe(formatPoolRecoveredInfo(120_000, 1));

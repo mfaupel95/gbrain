@@ -10,8 +10,9 @@
  *    deterministic child request_id derived from the caller's request_id and
  *    the item index, so replaying the same request_id replays each child
  *    (committed children return their receipt, nothing is written twice);
- *  - each item's receipt is compact (status, fact id, entity, warnings, and
- *    the write state only when it is not committed); repeated hints appear
+ *  - each item's receipt is compact (status, fact id, entity, the fact it
+ *    superseded, warnings, and the write state only when it is not
+ *    committed); repeated hints appear
  *    once at the top level;
  *  - publication is per item: the response reports each item's status and
  *    `partial: true` when some failed. Replaying the same request_id returns
@@ -21,10 +22,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { OperationContext } from './operations.ts';
 import { OperationError } from './ops/contract.ts';
-import { isWriteRequestId } from './persistence/types.ts';
+import { clientRequestIdOf, parseWriteRequestId } from './persistence/preconditions.ts';
+import { CLAIM_PARAM_KEYS, claimColumns } from './facts/typed-claim.ts';
+import { withRefreshFenceBudget } from './persistence/admission-retry.ts';
 
 export const REMEMBER_BATCH_MAX = 20;
-const ITEM_KEYS = new Set(['fact', 'provenance', 'entity', 'infer_entity', 'kind', 'ttl', 'visibility', 'replaces']);
+const CLAIM_KEYS: readonly string[] = CLAIM_PARAM_KEYS;
+const ITEM_KEYS = new Set(['fact', 'provenance', 'entity', 'infer_entity', 'kind', 'ttl', 'visibility', 'content_origin', 'valid_from', 'replaces', ...CLAIM_KEYS]);
+/** #7432: every per-item field but the claim, `replaces` and the typed claim keys is also a top-level default (an item's own value wins); `source_id` is top-level only. */
+const SHARED_KEYS = [...ITEM_KEYS].filter(key => key !== 'fact' && key !== 'replaces' && !CLAIM_KEYS.includes(key)).concat('source_id');
 
 /** Deterministic UUID for child `index` of a batch request (stable across replays). */
 export function childRequestId(requestId: string, index: number): string {
@@ -57,20 +63,24 @@ export async function runRememberBatch(ctx: OperationContext, p: Record<string, 
     throw verbError('invalid_params', 'replaces names one fact, so it cannot apply to a whole batch.',
       'Put replaces on the item it belongs to: items: [{ "fact": "...", "replaces": "<fact_id>" }].');
   }
-  if (p.request_id !== undefined && !isWriteRequestId(p.request_id)) {
-    throw verbError('invalid_params', 'request_id must be a UUID.',
-      'Generate a UUID before submitting the write and reuse it for retries of the same request.');
+  const sharedClaim = CLAIM_KEYS.filter(key => p[key] !== undefined);
+  if (sharedClaim.length) {
+    throw verbError('invalid_params', `${sharedClaim.join(', ')} describe one fact, so they cannot apply to a whole batch.`,
+      'Put the typed claim on the item it belongs to: items: [{ "fact": "...", "claim_metric": "mrr", "claim_value": 50000 }].');
   }
+  // #6280: an unusable request_id refuses the batch before any write (F6 accepts a UUID or a printable client id).
+  if (p.request_id !== undefined) parseWriteRequestId(p.request_id);
   const shared: Record<string, unknown> = {};
-  for (const key of ['provenance', 'source_id', 'kind', 'ttl', 'visibility', 'infer_entity']) if (p[key] !== undefined) shared[key] = p[key];
+  for (const key of SHARED_KEYS) if (p[key] !== undefined) shared[key] = p[key];
   const normalized = items.map((raw, index) => {
     // A bare string is the common shorthand for one fact.
     if (typeof raw === 'string') return { ...shared, fact: raw };
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      throw verbError('invalid_params', `items[${index}] must be an object.`, 'Each item is { "fact": "...", optional entity, kind, ttl, visibility, provenance }.');
+      throw verbError('invalid_params', `items[${index}] must be an object.`, 'Each item is { "fact": "...", optional entity, kind, ttl, visibility, provenance, content_origin, valid_from }.');
     }
     const extra = Object.keys(raw).filter(k => !ITEM_KEYS.has(k));
-    if (extra.length) throw verbError('invalid_params', `items[${index}] has unknown field(s): ${extra.join(', ')}.`, `Allowed item fields: ${[...ITEM_KEYS].join(', ')}.`);
+    if (extra.length) throw verbError('invalid_params', `items[${index}] has unknown field(s): ${extra.join(', ')}.`,
+      `${extra.includes('text') ? 'Rename text to fact. ' : ''}Allowed item fields: ${[...ITEM_KEYS].join(', ')}.`);
     return { ...shared, ...(raw as Record<string, unknown>) };
   });
   // All-or-none validation before any admission.
@@ -81,11 +91,16 @@ export async function runRememberBatch(ctx: OperationContext, p: Record<string, 
     }
   }
   if (ctx.dryRun) return { dry_run: true, action: 'remember', items: normalized.length, protocol_version: 1 };
-  const requestId = typeof p.request_id === 'string' ? p.request_id : randomUUID();
+  // F6: child ids derive from the root string the client sent, so an accepted batch replays to the same receipts.
+  const rootId = typeof p.request_id === 'string' ? p.request_id : randomUUID();
+  const requestId = parseWriteRequestId(rootId)!;
+  const clientRequestId = clientRequestIdOf(rootId);
   const results: BatchItemResult[] = [];
   const hints = new Set<string>();
-  for (const [index, item] of normalized.entries()) {
-    const child = childRequestId(requestId, index);
+  const failures: Array<{ index: number; error: OperationError }> = [];
+  // GST-1387: the items share one refresh-fence wait, so a fenced checkout delays the batch once, not once per item.
+  await withRefreshFenceBudget(async () => { for (const [index, item] of normalized.entries()) {
+    const child = childRequestId(rootId, index);
     try {
       const out = await single(ctx, { ...item, request_id: child }) as Record<string, unknown>;
       // Compact per-item receipt: a batch lands in the agent's context, so it carries what the agent acts on, not the full single-fact envelope.
@@ -94,24 +109,46 @@ export async function runRememberBatch(ctx: OperationContext, p: Record<string, 
         index, request_id: child, status: String(out?.status ?? 'saved'),
         ...(out?.id !== undefined ? { id: out.id } : {}),
         ...(out?.entity_slug !== undefined ? { entity_slug: out.entity_slug } : {}),
+        ...(out?.superseded_fact_id !== undefined ? { superseded_fact_id: out.superseded_fact_id } : {}), ...claimColumns(out),
         ...(Array.isArray(out?.warnings) && out.warnings.length ? { warnings: out.warnings } : {}),
         ...(out?.valid_until ? { valid_until: out.valid_until } : {}),
         ...(typeof out?.state === 'string' && out.state !== 'committed' ? { state: out.state, retry_after_ms: out.retry_after_ms ?? null } : {}),
       });
     } catch (e) {
       if (!(e instanceof OperationError)) throw e;
-      results.push({ index, request_id: child, status: 'failed', error: { code: e.code, message: e.message, ...(e.detail ? { detail: e.detail } : {}) } });
+      // #7248: an accepted item still publishing is pending, not failed; resending it would save it twice.
+      if (e.writeError === 'write_pending' && e.writeRequest) {
+        results.push({ index, request_id: child, status: 'pending', state: e.writeRequest.state, retry_after_ms: e.writeRequest.retry_after_ms ?? null,
+          ...(e.writeRequest.target ? { target: e.writeRequest.target } : {}) });
+        continue;
+      }
+      failures.push({ index, error: e });
+      results.push({ index, request_id: child, status: 'failed', error: { code: e.code, message: e.message, ...(e.canonical ? { canonical: e.canonical } : {}), ...(e.retryable !== undefined ? { retryable: e.retryable } : {}), ...(e.writeError ? { write_error: e.writeError } : {}), ...(e.detail ? { detail: e.detail } : {}), ...(e.suggestion ? { suggestion: e.suggestion } : {}), ...(e.withdrawn ? { withdrawn: e.withdrawn } : {}) } });
     }
-  }
+  } });
   const failed = results.filter(r => r.status === 'failed').length;
+  const pending = results.filter(r => r.status === 'pending').length;
+  // GST-1387: a batch that saved nothing is a refusal on every surface (CLI exit non-zero, MCP isError), never a success
+  // envelope; its first item's error keeps that item's code and fix. An item with a receipt (accepted, or its outcome
+  // unknown) keeps the per-item envelope so its child request_id is never lost.
+  if (failures.length && failed === results.length && failures.every(f => !f.error.writeRequest && f.error.writeError !== 'write_outcome_unknown')) {
+    const [{ index, error }] = failures as [{ index: number; error: OperationError }];
+    error.message = `items[${index}]: ${error.message} None of the ${results.length} item(s) was saved.`;
+    throw error;
+  }
   return {
+    ...(failures.length ? { status: 'error', error: failures[0]!.error.code, code: failures[0]!.error.code,
+      message: `${failed} of ${results.length} item(s) failed (first: items[${failures[0]!.index}] ${failures[0]!.error.code}); see items[].error. Items not marked failed are stored.` } : {}),
     protocol_version: 1,
     request_id: requestId,
+    ...(clientRequestId ? { client_request_id: clientRequestId } : {}),
     items: results,
-    saved: results.length - failed,
+    saved: results.length - failed - pending,
     failed,
+    ...(pending ? { pending } : {}),
     partial: failed > 0 && failed < results.length,
     ...(hints.size ? { hints: [...hints] } : {}),
-    ...(failed > 0 ? { next: 'Fix each failed item as its error says, then send only the failed items in a new remember call with a new request_id; the saved items are already stored.' } : {}),
+    ...(failed > 0 ? { next: 'Fix each failed item as its error says, then send only the failed items in a new remember call with a new request_id; the saved items are already stored.' }
+      : pending > 0 ? { next: 'Pending items are accepted and still publishing: poll get_write_request with each pending item\'s request_id; do not send them again.' } : {}),
   };
 }

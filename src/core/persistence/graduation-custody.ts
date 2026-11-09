@@ -19,7 +19,7 @@ import { moveHeldPglite } from './maintenance.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import type { BrainEngine } from '../engine.ts';
-import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationRow } from './graduation-schema.ts';
+import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationConnectRow } from './graduation-schema.ts';
 import type { GraduationPathState, IntentMarker, ManifestState, TargetIdentity, Tombstone } from './engine-graduation.types.ts';
 
 
@@ -98,14 +98,15 @@ export function currentProcessIdentity(): Pick<IntentMarker, 'pid' | 'bootId' | 
 /**
  * Whether the marker's requesting process is still running. `unknown` when
  * the marker comes from another boot or PID namespace (another host on a
- * shared filesystem, or a container); callers then treat the kernel lock as
- * the authority (an acquirable lock means the run is gone).
+ * shared filesystem, or a container), or recorded a boot id / PID namespace
+ * this process cannot read for itself (#6774: an unavailable probe proves no
+ * match); callers then treat the kernel lock as the authority (an acquirable
+ * lock means the run is gone). A marker that recorded neither keeps the pid check.
  */
 export function markerLiveness(marker: IntentMarker): 'alive' | 'dead' | 'unknown' {
   if (marker.pid === process.pid) return isGraduationRunInProcess(marker.runId) ? 'alive' : 'dead';
-  const bootId = readBootId(), pidNs = readPidNs();
-  if (marker.bootId && bootId && marker.bootId !== bootId) return 'unknown';
-  if (marker.pidNs && pidNs && marker.pidNs !== pidNs) return 'unknown';
+  if (marker.bootId && marker.bootId !== readBootId()) return 'unknown';
+  if (marker.pidNs && marker.pidNs !== readPidNs()) return 'unknown';
   if (!isProcessAlive(marker.pid)) return 'dead';
   if (marker.processStart) {
     const start = processStartTime(marker.pid);
@@ -333,7 +334,7 @@ function exemptRun(runId: string, env: NodeJS.ProcessEnv): boolean {
  * otherwise `graduation_interrupted`.
  */
 export async function assertGraduationConnectAllowed(engine: BrainEngine, env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const row = await readGraduationRow(engine);
+  const row = await readGraduationConnectRow(engine);
   if (!row || exemptRun(row.run_id, env)) return;
   if (row.role === 'target') {
     if (row.state === 'authoritative') return;

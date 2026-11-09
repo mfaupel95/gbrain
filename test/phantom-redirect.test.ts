@@ -12,6 +12,7 @@ import * as os from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import {
   runPhantomRedirectPass,
@@ -248,7 +249,7 @@ describe('tryRedirectPhantom (single phantom orchestration)', () => {
       );
       await putPage('alice', phantomBody);
       writeMd(brainDir, 'alice', phantomBody);
-      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
+      writeMd(brainDir, 'people/alice-example', '# alice-example\n\n## Facts\n\n');
 
       const phantom = await engine.getPage('alice', { sourceId: 'default' });
       expect(phantom).not.toBeNull();
@@ -580,7 +581,7 @@ describe('runExtractFacts — phantom-redirect integration', () => {
     });
   });
 
-  test('round 2 P1: legacy-row guard fires BEFORE phantom-redirect pass', async () => {
+  test('round 2 P1 (#6650): the legacy-row guard holds only the phantom that owns legacy rows', async () => {
     await withTempDirs(async ({ brainDir }) => {
       // #2763: the guard only gates on rows the v0_32_2 Phase B backfill
       // could actually fence, which requires the source's local_path — set
@@ -607,11 +608,24 @@ describe('runExtractFacts — phantom-redirect integration', () => {
         await putPage('alice', STUB_BODY);
         writeMd(brainDir, 'alice', STUB_BODY);
 
+        // #6650: a phantom that owns a legacy row would strand it, so it is held.
+        await putPage('bob', STUB_BODY);
+        writeMd(brainDir, 'bob', STUB_BODY);
+        await putPage('people/bob-example', '# bob-example\n', { type: 'person' });
+        writeMd(brainDir, 'people/bob-example', '# bob-example\n');
+        await engine.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
+           VALUES ('default', 'bob', '   ', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        );
+
         const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
         expect(result.guardTriggered).toBe(true);
-        expect(result.phantomsRedirected).toBe(0);
-        // Phantom .md still on disk (pass skipped)
-        expect(mdExists(brainDir, 'alice')).toBe(true);
+        // A legacy row on another page no longer stops the pass for the source (#6650).
+        expect(result.phantomsRedirected).toBe(1);
+        expect(mdExists(brainDir, 'alice')).toBe(false);
+        // The phantom that owns a legacy row is held: its file and row stay.
+        expect(mdExists(brainDir, 'bob')).toBe(true);
+        expect(await engine.executeRaw(`SELECT 1 FROM facts WHERE entity_slug = 'bob' AND row_num IS NULL AND expired_at IS NULL`)).toHaveLength(1);
       } finally {
         await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
       }
@@ -782,7 +796,8 @@ describe('tryRedirectPhantom — fence placement above the timeline sentinel (#4
       // to reconcile a fence (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF
       // append froze the redirected rows permanently.
       const canonicalBody = `# alice-example\n\nAlice runs acme-example.\n\n---\n\n## Timeline\n\n- 2026-01-01: Founded Acme\n`;
-      await putPage('people/alice-example', canonicalBody, { type: 'person' });
+      const split = parseMarkdown(canonicalBody, 'people/alice-example.md');
+      await engine.putPage('people/alice-example', { title: 'people/alice-example', type: 'person' as never, compiled_truth: split.compiled_truth, timeline: split.timeline, frontmatter: {} });
       writeMd(brainDir, 'people/alice-example', canonicalBody);
 
       const phantomBody = FACT_FENCE(

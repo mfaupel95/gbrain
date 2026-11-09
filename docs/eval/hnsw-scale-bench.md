@@ -15,7 +15,7 @@ neighbours. The deeper scan has these effects:
 - **Unscoped searches** return identical results.
 
 **Fix 2: statistics follow bulk writes.** Import, sync, reindex and embed drains now analyze
-`content_chunks(model, modality, page_id)` and the page columns search filters read. Without those
+`content_chunks(model, modality, page_id, body_generation)` and the page columns search filters read. Without those
 statistics, the pooled statement sorted every eligible chunk instead of walking the index. At 1M to 2M
 chunks that ran past the 8 s budget on 44% to 100% of 50%-scoped searches. In the post-import statistics
 state, 1M and 2M chunks now plan on HNSW with no incomplete results.
@@ -189,8 +189,8 @@ decimals in every cell. The topic-coherent gap is not a scan budget.
 `refreshProjectionStatistics` (`src/core/search/projection-statistics.ts`) used to run
 `ANALYZE pages(text_projection_revision, knowledge_revision)` only. That is what import, sync, reindex and
 projection recovery end with. On Postgres it now runs two steps:
-1. `ANALYZE pages(text_projection_revision, knowledge_revision, deleted_at, source_id, type, slug)`.
-2. `ANALYZE content_chunks(model, modality, page_id)`, in the same transaction (30 s statement and 2 s lock
+1. `ANALYZE pages(text_projection_revision, knowledge_revision, deleted_at, source_id, type, slug, body_generation)`.
+2. `ANALYZE content_chunks(model, modality, page_id, body_generation)`, in the same transaction (30 s statement and 2 s lock
    timeouts) behind a savepoint, so a concurrent index build only skips this step, with a warning that
    names the command.
 
@@ -603,8 +603,8 @@ What the table shows:
 ## Reproduce
 
 ```bash
-# VM (Ubicloud standard-16, 320 GB): bootstrap Docker, Bun 1.4.2 and a tuned pgvector/pg16 on 127.0.0.1:5434
-UBI_OWNER=<thread> scripts/ubicloud/ubi-runner.sh up -s standard-16 -S 320
+# VM (Ubicloud standard-16, 320 GB): bootstrap Docker, Bun 1.4.4 and a tuned pgvector/pg16 on 127.0.0.1:5434
+UBI_OWNER=<thread> scripts/ubicloud/ubi-runner.sh up -s standard-16 -S 320 --ttl-hours 48
 scripts/ubicloud/ubi-runner.sh sync <vm> . && scripts/ubicloud/ubi-runner.sh ssh <vm> 'cd work/gbrain && bash scripts/bench/hnsw-scale-vm-setup.sh'
 export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5434/postgres
 B=scripts/bench/hnsw-iterative-scan.ts

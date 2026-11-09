@@ -25,18 +25,19 @@
  * Every write carries the location-only receipt (actor fence-repair).
  */
 import { copyFileSync, existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { isAbsolute, join } from 'node:path';
+import { execFileSync } from '../spawn.ts';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { gbrainPath } from '../config.ts';
 import { createFrontmatterBackup, makeFrontmatterBackupRunId } from '../brain-writer.ts';
 import { importFromFile } from '../import-file.ts';
 import { screenFenceCtx } from '../import-screen.ts';
+import { folderRestricted } from '../search/private-visibility.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { resolveSlugForPath } from '../sync.ts';
 import { sha256 } from '../persistence/digest.ts';
-import { localHostId } from '../persistence/identity.ts';
+import { hostIdFor } from '../persistence/identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { checkOwner, ownerRefusal, type OwnerRefusal } from '../persistence/owner-refusal.ts';
 import { loadRepairBusySet, type RepairBusySet } from '../persistence/repair-busy.ts';
@@ -51,6 +52,8 @@ import { clearCandidateParts } from './census-store.ts';
 import { legacyCommitStep, recordUncommittedFenceRepair } from './uncommitted.ts';
 import type { FenceRepairReceipt } from './receipt.ts';
 import type { FenceCtx, FencePage } from './types.ts';
+import { gitChildEnv } from '../git-env.ts';
+import { canonicalOriginPage, originConflictMessage } from '../persistence/origin-guard.ts';
 
 export type FenceRepairMode = 'managed' | 'legacy' | 'db' | 'mirror';
 
@@ -69,7 +72,7 @@ export interface FenceSource {
 }
 
 function inGit(root: string): boolean {
-  try { execFileSync('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' }); return true; } catch { return false; }
+  try { execFileSync('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], { env: gitChildEnv(), stdio: 'ignore' }); return true; } catch { return false; }
 }
 
 /**
@@ -89,14 +92,14 @@ export async function loadFenceSource(engine: BrainEngine, sourceId: string, opt
     const binding = await getWorktreeBinding(engine, sourceId);
     // A source with no binding at all has no checkout anywhere: it is repaired in the database (db mode), not refused.
     if (binding) {
-      const hostId = localHostId();
+      const hostId = hostIdFor(engine);
       const checked = checkOwner(binding, row.incarnation, hostId);
       if (checked.reason) owner = ownerRefusal({ sourceId, reason: checked.reason, binding, incarnation: row.incarnation, hostId, remote: opts.remote !== false, work: opts.work ?? 'fence repair' });
       else root = join(checked.binding.local_path, checked.binding.relative_path);
     }
   } else {
     const local = row.local_path ?? (sourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
-    root = local && existsSync(local) ? local : null;
+    root = local && isAbsolute(local) && existsSync(local) ? local : null;
   }
   const busy: RepairBusySet = managed ? await loadRepairBusySet(engine, sourceId, row.incarnation) : { paths: new Set(), slugs: new Set(), unknown: null };
   const config = await repairScreenConfig(engine, sourceId);
@@ -127,7 +130,7 @@ export function pageSha(page: FencePage): string {
   return sha256(`${page.compiled_truth ?? ''}\u0000${page.timeline ?? ''}`);
 }
 
-export type TargetRead = { ok: true; target: FenceTarget } | { ok: false; reason: 'gone' | 'not_utf8' | 'unsafe_path' };
+export type TargetRead = { ok: true; target: FenceTarget } | { ok: false; reason: 'gone' | 'not_utf8' | 'unsafe_path' } | { ok: false; reason: 'origin_conflict'; message: string };
 
 /** Reads a candidate as it is now. A held or walked file is read from the checkout; anything else is read from the page store. */
 export async function readFenceTarget(engine: BrainEngine, src: FenceSource, cand: { key: string; path: string | null }): Promise<TargetRead> {
@@ -144,14 +147,16 @@ export async function readFenceTarget(engine: BrainEngine, src: FenceSource, can
       const content = bytes.toString('utf8');
       if (!Buffer.from(content, 'utf8').equals(bytes)) return { ok: false, reason: 'not_utf8' };
       const sourcePath = hold?.source_path ?? cand.path;
-      const [byOrigin] = await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE source_id=$1 AND source_path=$2 AND deleted_at IS NULL LIMIT 1', [src.id, sourcePath]);
+      const byOrigin = await canonicalOriginPage(engine, src.id, sourcePath);
+      if (byOrigin && 'ambiguous' in byOrigin) return { ok: false, reason: 'origin_conflict', message: originConflictMessage(src.id, sourcePath, byOrigin.ambiguous) };
       const slug = byOrigin?.slug ?? holdSlug ?? resolveSlugForPath(sourcePath);
       const dbOnly = src.managed && isSourceDbOnlySlug(src.root, slug, 'not_db_only');
       if (!dbOnly) {
         const parsed = parseMarkdown(content, cand.path, src.activePack ? { activePack: src.activePack } : undefined);
         return { ok: true, target: { mode: src.mirror ? 'mirror' : src.managed ? 'managed' : 'legacy', sourceId: src.id, key: cand.key, slug, path: cand.path, sourcePath,
           page: { compiled_truth: parsed.compiled_truth, timeline: parsed.timeline ?? '' }, content, before: sha256(bytes),
-          snapshot: await engine.readPageSnapshot(slug, { sourceId: src.id, includeDeleted: true }), hold, ctx: screenFenceCtx(parsed, src.activePack) } };
+          snapshot: await engine.readPageSnapshot(slug, { sourceId: src.id, includeDeleted: true }), hold,
+          ctx: screenFenceCtx({ ...parsed, folder_restricted: await folderRestricted(engine, src.id, slug) }, src.activePack) } };
       }
     }
   }
@@ -161,7 +166,8 @@ export async function readFenceTarget(engine: BrainEngine, src: FenceSource, can
   const page = { compiled_truth: snapshot.page.compiled_truth ?? '', timeline: snapshot.page.timeline ?? '' };
   return { ok: true, target: { mode: src.mirror ? 'mirror' : 'db', sourceId: src.id, key: cand.key, slug: snapshot.page.slug, path: null,
     sourcePath: snapshot.page.source_path ?? null, page, content: null, before: pageSha(page), snapshot, hold,
-    ctx: screenFenceCtx({ type: snapshot.page.type as never, frontmatter: (snapshot.page.frontmatter ?? {}) as Record<string, unknown> }, src.activePack) } };
+    ctx: screenFenceCtx({ type: snapshot.page.type as never, frontmatter: (snapshot.page.frontmatter ?? {}) as Record<string, unknown>,
+      folder_restricted: await folderRestricted(engine, src.id, snapshot.page.slug) }, src.activePack) } };
 }
 
 function indexesOf(lines: readonly string[], needle: readonly string[]): number[] {

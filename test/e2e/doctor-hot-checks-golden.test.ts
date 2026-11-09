@@ -16,7 +16,8 @@ import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { defineNormalizer, expectGolden, expectNormalizerStable } from '../helpers/golden.ts';
 import { doctorJsonNormalizer, makeDoctorHome, networkAttempts, runGbrain, type DoctorHome, type GbrainRun } from '../helpers/doctor-json-golden.ts';
 import { FENCE_TREND_OP } from '../../src/core/fence-repair/census-store.ts';
-import { buildHotCheckFixture, editHotCheckFixture, stampSyncDay, type Sql } from '../helpers/doctor-hot-checks-fixture.ts';
+import { buildHotCheckFixture, editHotCheckFixture, stampFixtureHead, stampSoakDays, stampSyncDay, type Sql } from '../helpers/doctor-hot-checks-fixture.ts';
+import { SOAK_COUNTERS_OP } from '../../src/core/persistence/soak-counters.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const describeE2E = DATABASE_URL ? describe : describe.skip;
@@ -77,10 +78,13 @@ async function capture(adminUrl: string): Promise<PgCaptures> {
   expect(networkAttempts(h)).toEqual([]);
   // Real clock here (the server's now() stamps last_sync_at): the fence trend day is checked against the day the sync stamped, then stored as <sync-day>.
   const db = postgres(url, { max: 1, prepare: false });
-  const stamped = await db.unsafe(`SELECT DISTINCT completed_keys->0->>'day' AS day FROM op_checkpoints WHERE op = $1`, [FENCE_TREND_OP]).finally(() => db.end());
+  const [stamped, soak] = await Promise.all([
+    db.unsafe(`SELECT DISTINCT completed_keys->0->>'day' AS day FROM op_checkpoints WHERE op = $1`, [FENCE_TREND_OP]),
+    db.unsafe(`SELECT fingerprint FROM op_checkpoints WHERE op = $1`, [SOAK_COUNTERS_OP]),
+  ]).finally(() => db.end());
   expect(stamped.length).toBe(1);
   const day = stamped[0]!.day as string;
-  for (const run of [first, second]) run.json = stampSyncDay(run.json, day, syncDays);
+  for (const run of [first, second]) run.json = stampFixtureHead(stampSoakDays(stampSyncDay(run.json, day, syncDays), soak.map(r => String(r.fingerprint))), h);
   return { first, second, url, name };
 }
 

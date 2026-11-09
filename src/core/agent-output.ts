@@ -13,11 +13,12 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { VERSION } from '../version.ts';
-import { OperationError, __registerOperationErrorRenderer } from './ops/contract.ts';
+import { OperationError, __registerOperationErrorRenderer, provesNotAdmitted, type WithdrawnDetail } from './ops/contract.ts';
 import { StructuredAgentError } from './errors.ts';
 import { canonicalCodeFor, codeEntry, codeClass, codeRetryable, exitCodeForCode } from './error-catalogue.ts';
 import { VERB_NAMES } from './verbs.ts';
 import { classifyPgAccessError, formatDbAccessMarker } from './pg-access-classify.ts';
+import { isReadOnlyTransactionError } from './postgres-engine/read-write-transactions.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
 import { redactUrlsInText } from './url-redact.ts';
 import { parseRepoBase } from './repo-base.ts';
@@ -29,6 +30,8 @@ export const CONTRACT_VERSION = 1 as const;
 export type Effect = 'paid' | 'destructive' | 'credentials' | 'egress' | 'persistent_install';
 export type Actor = 'agent' | 'user' | 'host_admin' | 'provider';
 export type Next = 'run' | 'ask_user' | 'tell_user_to_run' | 'wait' | 'report';
+/** A fix expected to run longer than this is the user's or host admin's (`tell_user_to_run`), never the agent's. */
+export const AGENT_TOOL_LIMIT_MS = 120_000;
 export type Transport = 'cli' | 'stdio' | 'http';
 export type Surface = 'verbs' | 'starter' | 'full';
 export type ErrorClass = 'caller' | 'consent' | 'retryable' | 'unavailable' | 'server' | 'host_only';
@@ -76,6 +79,19 @@ export interface Notice {
   fix?: Action;
   user_message?: string;
   decisions?: Decision[];
+  /**
+   * Unrendered: the NoticeLedger's dedupe identity. A per-call code carrying
+   * one is deduped per session under `code` + this key instead of riding
+   * every call; any code carrying one dedupes under it instead of `code`
+   * alone. renderNotice never copies it, so it never reaches the wire.
+   */
+  dedupe_key?: string;
+  /**
+   * Unrendered (#7165): a coverage notice whose repeat of the same state is
+   * suppressed per session (NoticeLedger) and per one-shot CLI window, until
+   * `level` rises materially or the `key` (code, sources, kinds) is new.
+   */
+  escalation?: { key: string; level: number };
 }
 export interface RenderedNotice extends Omit<Notice, 'fix'> { fix?: RenderedAction; contract_version: 1 }
 
@@ -97,6 +113,10 @@ export interface AgentEnvelope {
   detail?: string; protocol_version?: 1; write_request?: unknown; write_error?: string;
   /** #6188: a fence refusal's location and blocking issues (location and class only). */
   fence?: Record<string, unknown>; fence_issues?: Array<Record<string, unknown>>;
+  /** A `fact_withdrawn` refusal's withdrawal (`at`, `subject`, `visibility`). */
+  withdrawn?: WithdrawnDetail;
+  /** A write-grant refusal's writable sources, from the caller's own grant only (GBRA-200). */
+  writable_source_ids?: string[];
 }
 
 export interface RenderContext {
@@ -368,6 +388,8 @@ export interface EnvelopeParts {
   retryable?: boolean;
   fence?: Record<string, unknown>;
   fence_issues?: Array<Record<string, unknown>>;
+  withdrawn?: WithdrawnDetail;
+  writable_source_ids?: string[];
 }
 
 /** Replace each occurrence of `bare` that is a whole command (not followed by a word, path or more flags). */
@@ -416,12 +438,14 @@ export function buildEnvelope(p: EnvelopeParts, ctx: RenderContext): AgentEnvelo
     ...(p.write_error !== undefined ? { write_error: p.write_error } : {}),
     ...(p.fence !== undefined ? { fence: p.fence } : {}),
     ...(p.fence_issues?.length ? { fence_issues: p.fence_issues } : {}),
+    ...(p.withdrawn !== undefined ? { withdrawn: p.withdrawn } : {}),
+    ...(p.writable_source_ids !== undefined ? { writable_source_ids: p.writable_source_ids } : {}),
     ...(p.reason !== undefined ? { reason: p.reason } : {}),
     ...(p.why !== undefined ? { why: p.why } : {}),
     ...(fix ? { fix } : {}),
     docs_cmd: ['gbrain', 'errors', p.code],
-    class: codeClass(p.code),
-    retryable: p.retryable ?? codeRetryable(p.code),
+    class: codeClass(p.code, p.reason),
+    retryable: p.retryable ?? codeRetryable(p.code, p.reason),
     ...(notices ? { notices } : {}),
     contract_version: CONTRACT_VERSION,
   };
@@ -525,7 +549,7 @@ function recoveryFix(p: EnvelopeParts, ctx: AgentErrorContext, fields?: ReceiptF
 
 const REFRESH_REFUSALS: ReadonlySet<string> = new Set([
   'refresh_not_managed', 'refresh_not_owner', 'refresh_no_upstream', 'fetch_failed', 'refresh_diverged', 'refresh_dirty',
-  'sync_in_progress', 'refresh_in_progress', 'refresh_drain_timeout', 'refresh_source_changed', 'refresh_recovery_required',
+  'sync_in_progress', 'refresh_in_progress', 'refresh_drain_timeout', 'refresh_lock_timeout', 'refresh_source_changed', 'refresh_recovery_required',
   'worktree_refreshing',
 ]);
 
@@ -558,6 +582,8 @@ const ROWS: Row[] = [
         protocol_version: e.protocolVersion === 1 ? 1 : undefined,
         write_request: j.write_request, write_error: e.writeError,
         ...(e.fence ? { fence: e.fence } : {}), ...(e.fenceIssues?.length ? { fence_issues: e.fenceIssues } : {}),
+        ...(e.withdrawn ? { withdrawn: e.withdrawn } : {}),
+        ...(e.writableSourceIds ? { writable_source_ids: e.writableSourceIds } : {}),
         ...(e.retryable !== undefined ? { retryable: e.retryable } : {}),
       };
     },
@@ -568,6 +594,11 @@ const ROWS: Row[] = [
       error: e.envelope.code, code: canonicalCodeFor(e.envelope.code), message: e.envelope.message,
       suggestion: e.envelope.hint, docs: e.envelope.docs_url,
     }),
+  },
+  {
+    match: isReadOnlyTransactionError,
+    map: (e: Error) => ({ error: 'connection_inherited_read_only', code: 'connection_inherited_read_only', message: e.message,
+      fix: registryTemplateFix('connection_inherited_read_only', {}) }),
   },
   {
     match: e => e instanceof Error && (e as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED',
@@ -811,7 +842,7 @@ export function toAgentError(e: unknown, ctx: AgentErrorContext): AgentEnvelope 
     if (!parts.fix && (codeClass(parts.code) === 'server' || codeClass(parts.code) === 'unavailable')) {
       parts = { ...parts, fix: diagnosticFix(ctx, 'Doctor reports what is missing or failing on the brain host.') };
     }
-    if (ctx.mutating === true && ctx.idempotent !== true) parts = { ...parts, retryable: false };
+    if (ctx.mutating === true && ctx.idempotent !== true && !provesNotAdmitted(e)) parts = { ...parts, retryable: false };
     const env = buildEnvelope(parts, ctx.render);
     if (env.code === 'internal_error' || env.code === 'internal' || !env.suggestion) {
       recordAgentContractEvent({ transport: ctx.transport, op: ctx.op, command: ctx.command, code: env.code, has_suggestion: !!env.suggestion, outcome: ctx.outcome });
@@ -836,13 +867,16 @@ export function projectionConflictLine(e: unknown, command: string): string | nu
 /** Pure: callers write the strings. TTY order: `Error [code]: msg` / `Fix:` / `Why:` / `Docs:`. */
 export function renderCliError(e: unknown, opts: { json: boolean; command: string; tty: boolean }): CliErrorRender {
   const env = toAgentError(e, { transport: 'cli', command: opts.command, render: cliRenderContext() });
-  const exitCode = exitCodeForCode(env.code);
+  const exitCode = exitCodeForCode(env.code, env.reason);
   if (opts.json) return { stdout: `${JSON.stringify(env, null, 2)}\n`, exitCode };
   const lines = [`Error [${env.code}]: ${env.message}`];
   const relay = env.fix && !env.fix.command && env.fix.mcp ? `call ${env.fix.mcp.tool} over MCP with ${JSON.stringify(env.fix.mcp.arguments)}` : undefined;
   lines.push(`Fix: ${env.fix?.command ?? relay ?? env.suggestion}`);
   if (env.why) lines.push(`Why: ${env.why}`);
   if (env.docs) lines.push(`Docs: ${env.docs}`);
+  // GST-1582: a retryable refusal that names its delay ends with one line saying so, which survives `| tail -1`.
+  const retryAfter = env.retryable === true ? Number(/^retry_after_ms=(\d+)$/.exec(String(env.detail ?? ''))?.[1]) : NaN;
+  if (retryAfter > 0) lines.push(`Nothing was saved; retry the same command in about ${Math.max(1, Math.round(retryAfter / 1000))} s (retry_after_ms=${retryAfter}).`);
   return { stderr: `${lines.join('\n')}\n`, exitCode };
 }
 

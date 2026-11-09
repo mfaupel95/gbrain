@@ -22,6 +22,7 @@ import { withEnv } from './with-env.ts';
 import { createPersistenceIpcProvider } from '../../src/core/persistence/provider.ts';
 import { requestPersistenceOperation, startPersistenceIpcServer, type PersistenceIpcRequest } from '../../src/core/persistence/ipc.ts';
 import type { PersistenceEffect } from '../../src/core/persistence/effect-model.ts';
+import { LATEST_SCHEMA_VERSION } from '../../src/core/schema-migrations/latest.generated.ts';
 
 export const factContractCases = ['publication', 'confined', 'revoked', 'narrowed', 'private_target', 'private_hint', 'owner_unavailable', 'source_replaced', 'deferred', 'worker', 'worker_revoked', 'worker_narrowed', 'unparented', 'ipc'] as const;
 type Case = typeof factContractCases[number];
@@ -34,7 +35,7 @@ export async function exerciseManagedFacts(engine: BrainEngine, scenario: Case):
       await disposePersistenceConsumer(engine);
       configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'test' } });
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
-      await engine.setConfig('version', '162');
+      await engine.setConfig('version', String(LATEST_SCHEMA_VERSION));
       await engine.setConfig('facts.default_visibility', 'private');
       await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
       const firstSlug = 'people/alice-example', secondSlug = 'companies/acme-example';
@@ -116,7 +117,7 @@ export async function exerciseManagedFacts(engine: BrainEngine, scenario: Case):
         expect(jobs[0].data.persistence_request_id).toBeDefined();
         const worker = new MinionWorker(engine, { queue: 'fixture' });
         await registerBuiltinHandlers(worker, engine, { quiet: true });
-        const job: MinionJobContext = { id: Number(jobs[0].id), name: 'facts-absorb', data: jobs[0].data, attempts_made: 0,
+        const job: MinionJobContext = { id: Number(jobs[0].id), name: 'facts-absorb', data: jobs[0].data, attempts_made: 0, idempotency_key: null,
           signal: new AbortController().signal, deadlineAtMs: null, shutdownSignal: new AbortController().signal,
           updateProgress: async () => {}, updateTokens: async () => {}, log: async () => {}, isActive: async () => true, readInbox: async () => [] };
         if (scenario === 'worker_revoked') await engine.executeRaw('UPDATE oauth_clients SET deleted_at=now() WHERE client_id=$1', [clientId]);

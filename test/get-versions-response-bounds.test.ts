@@ -20,6 +20,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { toAgentError } from '../src/core/agent-output.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 
 const SOURCE = 'acme-example';
 const OTHER = 'widget-co';
@@ -37,7 +38,7 @@ beforeAll(async () => {
   }
   for (const { engine: e } of databases) {
     await e.executeRaw('INSERT INTO sources(id, name) VALUES ($1, $1), ($2, $2)', [SOURCE, OTHER]);
-    await seed(e);
+    await asOwner(e, tx => seed(tx));
   }
 }, 120_000);
 
@@ -80,19 +81,19 @@ const getVersions = (e: BrainEngine, remote: boolean, params: Record<string, unk
 const bodies = (rows: Array<Record<string, unknown>>) => rows.map(r => r.compiled_truth);
 
 describe('get_versions limit and include_body (#5234)', () => {
-  test('without params the full history comes back, newest first, pv.id breaking a snapshot tie', async () => {
+  test('with include_body the history comes back newest first, pv.id breaking a snapshot tie', async () => {
     for (const { engine: e } of databases) {
-      expect(bodies(await getVersions(e, false))).toEqual(['body v5 private', 'body v4', 'body v3', 'body v2', 'body v1']);
+      expect(bodies(await getVersions(e, false, { include_body: true }))).toEqual(['body v5 private', 'body v4', 'body v3', 'body v2', 'body v1']);
     }
   });
 
   test('limit is the newest-first prefix of what the caller may read, local and remote', async () => {
     for (const { engine: e } of databases) {
-      expect(bodies(await getVersions(e, false, { limit: 2 }))).toEqual(['body v5 private', 'body v4']);
+      expect(bodies(await getVersions(e, false, { limit: 2, include_body: true }))).toEqual(['body v5 private', 'body v4']);
       // The private newest snapshot and the other source's newer version are
       // filtered in WHERE, so the remote prefix is still two visible versions.
-      expect(bodies(await getVersions(e, true, { limit: 2 }))).toEqual(['body v4', 'body v3']);
-      expect(bodies(await getVersions(e, true, { limit: 50 }))).toEqual(['body v4', 'body v3', 'body v2', 'body v1']);
+      expect(bodies(await getVersions(e, true, { limit: 2, include_body: true }))).toEqual(['body v4', 'body v3']);
+      expect(bodies(await getVersions(e, true, { limit: 50, include_body: true }))).toEqual(['body v4', 'body v3', 'body v2', 'body v1']);
     }
   });
 
@@ -119,13 +120,16 @@ describe('get_versions limit and include_body (#5234)', () => {
     }
   });
 
-  test('limit and include_body combine; include_body must be exactly false to drop bodies', async () => {
+  test('limit and include_body combine; include_body must be exactly true to return bodies', async () => {
     for (const { engine: e } of databases) {
       const [only] = await getVersions(e, true, { limit: 1, include_body: false });
       expect(only.title).toBe('body v4');
       expect(Object.hasOwn(only, 'compiled_truth')).toBe(false);
-      for (const include_body of [true, undefined]) {
-        expect(bodies(await getVersions(e, true, { limit: 1, include_body }))).toEqual(['body v4']);
+      expect(bodies(await getVersions(e, true, { limit: 1, include_body: true }))).toEqual(['body v4']);
+      for (const include_body of [undefined, false, 'true', 1]) {
+        const [row] = await getVersions(e, true, { limit: 1, include_body });
+        expect(row.title).toBe('body v4');
+        expect(Object.hasOwn(row, 'compiled_truth')).toBe(false);
       }
     }
   });

@@ -7,24 +7,41 @@
  */
 import type { Notice } from '../agent-output.ts';
 
-let queued = false;
-const pending: Notice[] = [];
+/** One process's (or one warm CLI request's) first-hop state. */
+export interface FallbackHopQueue { queued: boolean; pending: Notice[] }
+
+const processQueue: FallbackHopQueue = { queued: false, pending: [] };
+let hopScope: (() => FallbackHopQueue | undefined) | undefined;
+
+/**
+ * A serve answering warm CLI requests (src/core/cli-socket/output-capture.ts)
+ * gives each request its own queue, as a one-shot CLI process starts with one;
+ * outside a scope the process queue applies.
+ */
+export function setFallbackHopScope(scope: () => FallbackHopQueue | undefined): void {
+  hopScope = scope;
+}
+
+function activeQueue(): FallbackHopQueue {
+  return hopScope?.() ?? processQueue;
+}
 
 /** Queue the first hop's notice; every later call in this process is a no-op. Returns whether it queued. */
 export function queueFirstFallbackHop(build: () => Notice): boolean {
-  if (queued) return false;
-  queued = true;
-  pending.push(build());
+  const queue = activeQueue();
+  if (queue.queued) return false;
+  queue.queued = true;
+  queue.pending.push(build());
   return true;
 }
 
 /** Drain the queued first-hop notice (at most one per process). */
 export function takeChatFallbackHopNotices(): Notice[] {
-  return pending.splice(0);
+  return activeQueue().pending.splice(0);
 }
 
 /** Test seam: re-arm the once-per-process first-hop notice. */
 export function __resetChatFallbackHopNoticeForTests(): void {
-  queued = false;
-  pending.splice(0);
+  processQueue.queued = false;
+  processQueue.pending.splice(0);
 }

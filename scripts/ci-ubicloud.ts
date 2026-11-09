@@ -3,24 +3,41 @@
  * scripts/ci-ubicloud.ts — the ci:local gate fanned out across ephemeral
  * Ubicloud VMs.
  *
- *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + ALL E2E
+ *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + pg-arms + ALL E2E
  *   bun run ci:ubicloud:diff            # doc-only diff: doc checks + gitleaks; any other diff: the full gate
  *
  * Options:
  *   --vms N            VMs to provision in parallel (default: burst-sized from
  *                      `ubi-runner.sh usage`; 4 when the quota is busy)
  *   --size SIZE        Ubicloud size (default standard-16)
- *   --slots N          concurrent work slots per VM (default: half of --size's vCPUs)
- *   --location LOC     Ubicloud location (default eu-central-h1)
+ *   --slots N          concurrent work slots per VM (default: three per eight of --size's vCPUs)
+ *   --location LOC     Ubicloud location (default eu-central-h1). A full gate
+ *                      runs only there; another location needs --lanes and
+ *                      is a diagnostic run, never gate evidence
  *   --image IMAGE      boot image (default: UBI_CI_IMAGE, else stock Ubuntu 24.04);
  *                      gbrain-ci@latest is the prebaked machine image
  *                      scripts/ubicloud/build-ci-image.sh builds
- *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,e2e (default all)
+ *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,pg-arms,e2e (default all)
+ *   --pg-image IMAGE   Postgres server image of every slot (default
+ *                      pgvector/pgvector:pg16). Another image needs --lanes and
+ *                      is a diagnostic run, never gate evidence: run
+ *                      --lanes pg-arms,e2e --pg-image pgvector/pgvector:pg15 to
+ *                      audit Postgres 15 (#7112); the catalog goldens hold
+ *                      Postgres 16 output and fail on 15 by design
  *   --diff             doc-only diffs run only the doc checks and gitleaks (ci:local --diff)
+ *   --list             print the test files this selection runs (every selected
+ *                      lane's inventory, keyed-only E2E files left out), one per
+ *                      line, and exit; exit 1 when it is empty. Needs no key or
+ *                      VM (scripts/pregate-remote-gate.sh --list)
  *   --record-weights   write measured durations to scripts/ubicloud/weights.json
  *   --keep             leave the VMs running (destroy with ubi-runner.sh down NAME)
+ *   --ttl-hours N      VM TTL written into each name as -t<N> (default 2,
+ *                      at most 999). The operator reaper destroys VMs past their
+ *                      expiry, so a VM a sleeping machine never tore down
+ *                      dies within hours (scripts/ubicloud/reap-expired.ts)
  *
- * Needs UBICLOUD_API_KEY (or UBICLOUD_API_TOKEN) plus bash, curl, python3,
+ * Needs UBI_OWNER (your thread code; every VM name carries it, and the run
+ * refuses without it) and UBICLOUD_API_KEY (or UBICLOUD_API_TOKEN) plus bash, curl, python3,
  * ssh, ssh-keygen and tar locally. The checkout (tracked + untracked-unignored
  * files + .git) is packed once and streamed to every VM, so uncommitted edits
  * are tested.
@@ -29,18 +46,33 @@
  * pgvector server + PgBouncer per slot, PGLite snapshots), streamed over SSH
  * while the checkout uploads. The first VM to
  * finish setup runs the machine-level items in order (gitleaks, verify, the
- * serial lane's machine-exclusive files) and then joins the pool. Every other
+ * serial and slow lanes' machine-exclusive files) and then joins the pool. Every other
  * test file is an item in one global heaviest-first queue that idle slots pull
  * from (scripts/ubicloud/schedule.ts); items run through the same wrappers
- * ci:local uses (scripts/ubicloud/ci-item.sh). Durations of every run are
+ * ci:local uses (scripts/ubicloud/ci-item.sh). The pg-arms lane runs every
+ * file in test/postgres-unit-arms.txt with DATABASE_URL set, the way
+ * persistence-validation's unit-postgres-arms job does, and fails the run when
+ * a shard of that job's partition measures over its step timeout; with the unit
+ * and slow lanes it fails a test.yml unit shard whose mined weight is over
+ * UNIT_SHARD_BUDGET_MS (unitShardCheck) and reports each shard's measured time. Durations of every run are
  * merged into .context/ci-ubicloud/weights.json, which weights the next run.
  *
- * VMs are named ubirun-<owner>-<epoch>-ciNN<hex> (owner: UBI_OWNER or the
- * runner's per-machine id). Each name is appended to <run>/vms.txt before its
+ * VMs are named ubirun-<owner>-<epoch>-ciNN<hex>-t<ttl hours> (owner:
+ * UBI_OWNER), gstack's runner grammar, so
+ * gstack's reap reads the same TTL. Each name is appended to <run>/vms.txt before its
  * create request is sent. On exit, including SIGINT, SIGTERM, SIGHUP (a
  * dropped terminal, a cancelled background operation) and SIGQUIT, in-flight
  * `up` calls are allowed to finish (they destroy their own VM), then every
- * recorded name is destroyed and polled until it is confirmed gone.
+ * recorded name is destroyed and polled until it is confirmed gone. Then the
+ * project's VM list is read once more and the run prints gstack's leftover line,
+ *   UBICLOUD: left=<n|unknown> owner=<owner> vms=<requested> others=<n>
+ * (left: this run's VMs still listed; others: this owner's other VMs, for
+ * information), also appended to UBI_LEFT_FILE when set
+ * (scripts/pregate-remote-gate.sh reads it). A left other than 0 fails a run
+ * that would otherwise pass; --keep reports its VMs as left=<n> kept=1. A run
+ * that exits before it requests any VM (a missing key or owner, a broken
+ * inventory) prints left=0 vms=0, so pregate reads its failure as the gate's,
+ * and a missing line still means a crash after VMs were requested.
  */
 
 import { spawnSync, type ChildProcess } from "node:child_process";
@@ -62,6 +94,10 @@ import {
   type WeightTable,
 } from "./ubicloud/schedule.ts";
 import { runScript, type RunScriptOpts } from "./ubicloud/run-script.ts";
+import { expiringVmName } from "./ubicloud/reap-expired.ts";
+import { buildTypecheckState, portableBuildInfo, typecheckBuildInfo } from "./ubicloud/typecheck-state.ts";
+import { ARM_SHARDS, ARM_STEP_TIMEOUT_MS, ARM_WEIGHTS, ARM_WORKERS, armMakespan, armShards, readArmsList } from "./postgres-unit-arms.ts";
+import { UNIT_SHARD_BUDGET_MS, UNIT_SHARDS, unitShardPlan } from "./sharding.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const RUNNER = join(ROOT, "scripts/ubicloud/ubi-runner.sh");
@@ -71,8 +107,16 @@ const UNPACKED_MARKER = "work/gbrain.unpacked";
 const SETUP_SCRIPT = join(ROOT, "scripts/ubicloud/setup-ci-vm.sh");
 const COMMITTED_WEIGHTS = join(ROOT, "scripts/ubicloud/weights.json");
 const LOCAL_WEIGHTS = join(ROOT, ".context/ci-ubicloud/weights.json");
-const ALL_LANES = ["gitleaks", "verify", "serial", "slow", "unit", "e2e"] as const;
+const ALL_LANES = ["gitleaks", "verify", "serial", "slow", "unit", "pg-arms", "e2e"] as const;
 const BATCH_TIMEOUT_MS = 20 * 60 * 1000;
+const VM_LIST_TIMEOUT_MS = 120_000;
+// Test timeouts and the mined shard weights are calibrated on this location's VMs.
+const GATE_LOCATION = "eu-central-h1";
+// Keyed-only E2E files: e2e.yml's Tier 2 job runs them with the provider keys and
+// openclaw on the nightly schedule. A gate VM has neither (setup-ci-vm.sh drops the
+// keys), so every test in them would skip; the gate leaves them out instead of
+// counting a run that tested nothing (GBRA-237 removed the same keyless run from CI).
+export const KEYED_E2E = ["test/e2e/skills.test.ts"];
 // Items this heavy are the run's long poles: spread them one per VM so two of
 // them never compete for the same VM's CPUs.
 const HEAVY_MS = 60_000;
@@ -98,9 +142,14 @@ interface Opts {
   /** A machine image (NAME@VERSION) or "stock". */
   image: string;
   lanes: Set<string>;
+  /** The Postgres server image of every slot; empty keeps setup-ci-vm.sh's default. */
+  pgImage: string;
   diff: boolean;
   recordWeights: boolean;
   keep: boolean;
+  ttlHours: number;
+  /** Print the gate's test files and exit; starts nothing. */
+  list: boolean;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -108,12 +157,15 @@ function parseArgs(argv: string[]): Opts {
     vms: 0,
     size: "standard-16",
     slots: 0,
-    location: "eu-central-h1",
+    location: GATE_LOCATION,
     image: process.env.UBI_CI_IMAGE || "stock",
     lanes: new Set(ALL_LANES),
+    pgImage: "",
     diff: false,
     recordWeights: false,
     keep: false,
+    ttlHours: 2,
+    list: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -128,24 +180,32 @@ function parseArgs(argv: string[]): Opts {
     else if (arg === "--location") opts.location = value();
     else if (arg === "--image") opts.image = value();
     else if (arg === "--lanes") opts.lanes = new Set(value().split(","));
+    else if (arg === "--pg-image") opts.pgImage = value();
     else if (arg === "--diff") opts.diff = true;
     else if (arg === "--record-weights") opts.recordWeights = true;
     else if (arg === "--keep") opts.keep = true;
+    else if (arg === "--ttl-hours") opts.ttlHours = Number(value());
+    else if (arg === "--list") opts.list = true;
     else usage(`unknown argument ${arg}`);
   }
   for (const lane of opts.lanes) if (!(ALL_LANES as readonly string[]).includes(lane)) usage(`unknown lane ${lane}`);
+  if (opts.location !== GATE_LOCATION && !argv.includes("--lanes")) usage(`a full gate runs only in ${GATE_LOCATION}. Test timeouts and the mined shard weights are calibrated there; on 2026-10-19 us-east-a2 ran about half as fast and timed out tests that pass in ${GATE_LOCATION}, so a full run in ${opts.location} is not gate evidence. Wait for ${GATE_LOCATION} capacity or run bun run ci:local (and report it as local). To run a diagnostic subset in ${opts.location}, pass --lanes.`);
+  if (opts.pgImage && !/^[a-z0-9][a-z0-9._\/-]*(?::[A-Za-z0-9._-]+)?$/.test(opts.pgImage)) usage(`--pg-image ${opts.pgImage} is not an image reference`);
+  if (opts.pgImage && !argv.includes("--lanes")) usage("a full gate runs on the default Postgres image; --pg-image is a diagnostic run, so pass --lanes (for example --lanes pg-arms,e2e).");
+  if (!Number.isInteger(opts.ttlHours) || opts.ttlHours < 1 || opts.ttlHours > 999) usage("--ttl-hours must be a whole number of hours from 1 to 999 (every gate VM carries a TTL; 999 is the longest)");
   if (!Number.isInteger(opts.vms) || opts.vms < 0 || (opts.vms === 0 && argv.includes("--vms"))) usage("--vms must be a positive integer");
-  // One slot per two vCPUs: the whole corpus still fits inside the longest
-  // single file's runtime at the default fleet size, and the headroom keeps
-  // timing-sensitive files (and that longest file) from starving for CPU.
-  if (!opts.slots) opts.slots = Math.max(1, Math.round(vcpusOf(opts.size) / 2));
+  // Three slots per eight vCPUs: each slot's bun process, its children and its
+  // own PostgreSQL and PgBouncer keep about 2.5 threads runnable. One slot per
+  // two vCPUs measured a 1-minute load of 1.11 per vCPU at p50 and 1.39 at p90
+  // and timed out a file that passes at this density (0.79 p50, 0.95 p90).
+  if (!opts.slots) opts.slots = Math.max(1, Math.floor((vcpusOf(opts.size) * 3) / 8));
   if (!Number.isInteger(opts.slots) || opts.slots < 1) usage("--slots must be a positive integer");
   return opts;
 }
 
 function usage(message: string): never {
   console.error(`ci-ubicloud: ${message}`);
-  console.error("usage: bun run scripts/ci-ubicloud.ts [--vms N] [--size SIZE] [--slots N] [--location LOC] [--image IMAGE] [--lanes a,b] [--diff] [--record-weights] [--keep]");
+  console.error("usage: bun run scripts/ci-ubicloud.ts [--vms N] [--size SIZE] [--slots N] [--location LOC] [--image IMAGE] [--lanes a,b] [--pg-image IMAGE] [--diff] [--record-weights] [--keep] [--ttl-hours N] [--list]");
   process.exit(2);
 }
 
@@ -164,6 +224,8 @@ function sh(cmd: string, args: string[]): string {
 const lines = (text: string) => text.split(/\s+/).map((l) => l.trim()).filter(Boolean);
 
 const children = new Map<ChildProcess, string>();
+let vmRequested = false;
+let leftReported = false;
 
 /** Run the runner script; output goes to `out` (a path) or is returned (scripts/ubicloud/run-script.ts). */
 function runner(args: string[], opts: Omit<RunScriptOpts, "cwd" | "onSpawn" | "onClose"> = {}): Promise<{ code: number; stdout: string }> {
@@ -184,50 +246,82 @@ interface Vm {
   control: boolean;
 }
 
+/**
+ * The gate's test selection, the same discovery the ci:local wrappers use: the
+ * lanes that run, each lane's files, and the serial and slow lanes'
+ * machine-exclusive files. --list prints exactly these files.
+ */
+function gateInventory(opts: Opts, note: (message: string) => void) {
+  if (opts.diff) {
+    const classification = spawnSync("bun", ["run", "scripts/select-e2e.ts", "--classify-only"], { cwd: ROOT, encoding: "utf8" }).stdout?.trim();
+    if (classification === "DOC_ONLY") {
+      note("--diff: doc-only diff — running the doc checks locally, then gitleaks (ci:local doc-only fast-path)");
+      if (!opts.list && spawnSync("bash", ["scripts/ci-doc-checks.sh"], { cwd: ROOT, stdio: "inherit" }).status !== 0) {
+        process.exit(1);
+      }
+      opts.lanes = new Set(["gitleaks"]);
+      opts.vms = 1;
+    } else {
+      note(`--diff: E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection). Classification: ${classification || "unknown"}`);
+    }
+  }
+  const exclusive = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list-exclusive"]));
+  const slowExclusive = lines(sh("bash", ["scripts/run-slow-tests.sh", "--dry-run-list-exclusive"]));
+  const arms = readArmsList(ROOT);
+  if (arms.errors.length) throw new Error(`test/postgres-unit-arms.txt: ${arms.errors.join("; ")}`);
+  const inventory: Record<Lane, string[]> = {
+    unit: lines(sh("bash", ["scripts/run-unit-shard.sh", "--dry-run-list"])),
+    serial: lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list"])).filter((f) => !exclusive.includes(f)),
+    slow: lines(sh("bash", ["scripts/run-slow-tests.sh", "--dry-run-list"])).filter((f) => !slowExclusive.includes(f)),
+    "pg-arms": arms.files,
+    e2e: lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"])).filter((f) => !KEYED_E2E.includes(f)),
+  };
+  return { inventory, exclusive, slowExclusive };
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.list) {
+    const { inventory, exclusive, slowExclusive } = gateInventory(opts, (message) => console.error(`ci-ubicloud --list: ${message}`));
+    const files = new Set<string>();
+    for (const [lane, laneFiles] of Object.entries(inventory)) if (opts.lanes.has(lane)) laneFiles.forEach((f) => files.add(f));
+    if (opts.lanes.has("serial")) exclusive.forEach((f) => files.add(f));
+    if (opts.lanes.has("slow")) slowExclusive.forEach((f) => files.add(f));
+    if (!files.size) {
+      console.error(`ci-ubicloud --list: the gate runs no test file on this tree (lanes: ${[...opts.lanes].join(",")})`);
+      process.exit(1);
+    }
+    console.log([...files].sort().join("\n"));
+    return;
+  }
   if (!process.env.UBICLOUD_API_KEY && !process.env.UBICLOUD_API_TOKEN) {
     console.error("ci-ubicloud: UBICLOUD_API_KEY (or UBICLOUD_API_TOKEN) is not set");
     process.exit(2);
   }
+  if (!process.env.UBI_OWNER) {
+    console.error("ci-ubicloud: UBI_OWNER is not set; set it to your thread code in lowercase (e.g. UBI_OWNER=gbra106) so every VM carries its owner (UBI_OWNER_REQUIRED)");
+    process.exit(2);
+  }
+  const owner = sh("bash", [RUNNER, "owner"]).trim();
   const sha = sh("git", ["rev-parse", "HEAD"]).trim();
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha.slice(0, 8)}`;
   const runDir = join(ROOT, ".context/ci-ubicloud", runId);
   mkdirSync(join(runDir, "logs"), { recursive: true });
   mkdirSync(join(runDir, "failures"), { recursive: true });
 
-  // ── Inventory: the same discovery the ci:local wrappers use ───────────────
-  const e2eFiles = lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"]));
-  if (opts.diff) {
-    const classification = spawnSync("bun", ["run", "scripts/select-e2e.ts", "--classify-only"], { cwd: ROOT, encoding: "utf8" }).stdout?.trim();
-    if (classification === "DOC_ONLY") {
-      log("--diff: doc-only diff — running the doc checks locally, then gitleaks (ci:local doc-only fast-path)");
-      if (spawnSync("bash", ["scripts/ci-doc-checks.sh"], { cwd: ROOT, stdio: "inherit" }).status !== 0) process.exit(1);
-      opts.lanes = new Set(["gitleaks"]);
-      opts.vms = 1;
-    } else {
-      log(`--diff: E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection). Classification: ${classification || "unknown"}`);
-    }
-  }
-  const exclusive = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list-exclusive"]));
-  const serialPool = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list"])).filter((f) => !exclusive.includes(f));
-  const inventory: Record<Lane, string[]> = {
-    unit: lines(sh("bash", ["scripts/run-unit-shard.sh", "--dry-run-list"])),
-    serial: serialPool,
-    slow: lines(sh("bash", ["scripts/run-slow-tests.sh", "--dry-run-list"])),
-    e2e: e2eFiles,
-  };
+  const { inventory, exclusive, slowExclusive } = gateInventory(opts, log);
 
   const tables: WeightTable[] = [
     readWeightTable(LOCAL_WEIGHTS),
     readWeightTable(COMMITTED_WEIGHTS),
     readWeightTable(join(ROOT, "scripts/e2e-weights.json"), 1, "e2e:"),
+    readWeightTable(join(ROOT, ARM_WEIGHTS), 1, "pg-arms:"),
     readWeightTable(join(ROOT, "scripts/serial-weights.json"), 1000, "serial:"),
     readWeightTable(join(ROOT, "scripts/test-weights.json"), 1, "unit:"),
     readWeightTable(join(ROOT, "scripts/test-weights.json"), 1, "slow:"),
   ];
   const queue: Item[] = [];
-  for (const lane of ["unit", "serial", "slow", "e2e"] as Lane[]) {
+  for (const lane of ["unit", "serial", "slow", "pg-arms", "e2e"] as Lane[]) {
     if (opts.lanes.has(lane)) queue.push(...buildItems(lane, inventory[lane], tables));
   }
   sortQueue(queue);
@@ -235,6 +329,7 @@ async function main() {
   if (opts.lanes.has("gitleaks")) control.push({ lane: "gitleaks", files: [] });
   if (opts.lanes.has("verify")) control.push({ lane: "verify", files: [] });
   if (opts.lanes.has("serial") && exclusive.length) control.push({ lane: "serial", files: exclusive });
+  if (opts.lanes.has("slow") && slowExclusive.length) control.push({ lane: "slow", files: slowExclusive });
   const totalItems = queue.length + control.reduce((n, c) => n + Math.max(c.files.length, 1), 0);
   const estimate = queue.reduce((s, i) => s + i.weight, 0) / 1000;
   log(`${totalItems} items (${Object.entries(inventory).filter(([l]) => opts.lanes.has(l)).map(([l, f]) => `${l} ${f.length}`).join(", ")}, control ${control.map((c) => c.lane).join("+") || "none"}); ~${Math.round(estimate)}s of weighted work`);
@@ -251,23 +346,31 @@ async function main() {
     opts.vms = decision.vms;
     log(`fleet: ${decision.reason} (pass --vms N to override)`);
   }
-  log(`provisioning ${opts.vms} × ${opts.size} in ${opts.location} (${opts.image === "stock" ? "stock Ubuntu 24.04" : `image ${opts.image}`}), ${opts.slots} slots each; logs in ${runDir}`);
+  log(`provisioning ${opts.vms} × ${opts.size} in ${opts.location} (${opts.image === "stock" ? "stock Ubuntu 24.04" : `image ${opts.image}`}), ${opts.slots} slots each, names expiring ${opts.ttlHours}h after creation; logs in ${runDir}`);
 
   // ── Checkout tarball, packed once while the VMs boot ─────────────────────
   const tarball = join(tmpdir(), `gbrain-ci-ubicloud-${process.pid}.tgz`);
   const packed = runner(["pack", ROOT], { out: tarball, stdoutOnly: true });
+  // verify's typecheck runs warm from a buildinfo of this tree, built while the VMs boot (scripts/ubicloud/typecheck-state.ts).
+  const buildInfo = opts.lanes.has("verify") ? typecheckBuildInfo(ROOT) : null;
+  const typecheckState = buildInfo
+    ? buildTypecheckState(ROOT, join(runDir, "logs", "local-typecheck.log"), (child) => {
+      children.set(child, "typecheck");
+      child.once("close", () => children.delete(child));
+    })
+    : null;
   // Faster create and SSH polling than the runner's interactive default.
   process.env.UBI_POLL_SECONDS ??= "2";
 
   const bunVersion = process.env.GBRAIN_CI_BUN_TAG
     ?? /oven\/bun:\$\{GBRAIN_CI_BUN_TAG:-([^}]+)\}/.exec(readFileSync(join(ROOT, "docker-compose.ci.yml"), "utf8"))?.[1]
-    ?? "1.4.2";
+    ?? "1.4.4";
 
   // ── Teardown on every exit path ──────────────────────────────────────────
-  const owner = sh("bash", [RUNNER, "owner"]).trim();
   const ledger = join(runDir, "vms.txt");
+  const createdAt = Math.floor(Date.now() / 1000);
   const vms: Vm[] = Array.from({ length: opts.vms }, (_, i) => ({
-    name: `ubirun-${owner}-${Math.floor(Date.now() / 1000)}-ci${String(i + 1).padStart(2, "0")}${Math.random().toString(16).slice(2, 6)}`,
+    name: expiringVmName({ owner, createdAt, ttlHours: opts.ttlHours, suffix: `ci${String(i + 1).padStart(2, "0")}${Math.random().toString(16).slice(2, 6).padEnd(4, "0")}` }),
     state: "provisioning",
     requested: false,
     infraErrors: 0,
@@ -287,8 +390,10 @@ async function main() {
     await Promise.all(ups.map((child) => new Promise((done) => (child.exitCode !== null || child.signalCode !== null ? done(null) : child.once("exit", done)))));
     rmSync(tarball, { force: true });
     const live = vms.filter((vm) => vm.requested && vm.state !== "destroyed");
+    const requested = vms.filter((vm) => vm.requested).map((vm) => vm.name);
     if (opts.keep) {
-      log(`--keep: leaving ${live.map((vm) => vm.name).join(" ")} running; destroy with: scripts/ubicloud/ubi-runner.sh down NAME`);
+      log(`--keep: leaving ${live.map((vm) => vm.name).join(" ")} running; destroy with: scripts/ubicloud/ubi-runner.sh down NAME (the operator reaper destroys them ${opts.ttlHours}h after creation; pass --ttl-hours up to 999 for longer)`);
+      await leftover(owner, requested, true);
       return;
     }
     log(`destroying ${live.length} VM(s): ${live.map((vm) => vm.name).join(" ")}`);
@@ -303,7 +408,9 @@ async function main() {
     }));
     const left = live.filter((vm) => vm.state !== "destroyed").length;
     log(left ? `teardown left ${left} VM(s) unconfirmed (names in ${ledger})` : `teardown confirmed ${live.length} VM(s) gone`);
+    leftClean = await leftover(owner, requested, false);
   };
+  let leftClean = true;
   let interrupted = false;
   // After SIGHUP the terminal may be gone: a failed log write must not abort teardown.
   for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
@@ -346,7 +453,7 @@ async function main() {
   };
 
   const runBatch = async (vm: Vm, slot: number, lane: string, files: string[]) => {
-    const logPath = join(runDir, "logs", `${String(++batchSeq).padStart(5, "0")}-${vm.name.slice(-8)}-s${slot}-${lane}.log`);
+    const logPath = join(runDir, "logs", `${String(++batchSeq).padStart(5, "0")}-${vm.name.replace(/-t\d+$/, "").slice(-8)}-s${slot}-${lane}.log`);
     const cmd = `cd ${REMOTE_DIR} && SLOT=${slot} bash scripts/ubicloud/ci-item.sh ${lane} ${files.map(quote).join(" ")}`;
     const r = await runner(["ssh", vm.name, cmd], { out: logPath, timeoutMs: BATCH_TIMEOUT_MS });
     return { code: r.code, parsed: parseItemLog(readFileSync(logPath, "utf8")), logPath };
@@ -371,7 +478,8 @@ async function main() {
       const done = new Set(parsed.map((r) => r.file));
       for (const result of parsed) record(vm, slot, result);
       const lost = batch.filter((item) => !done.has(item.file));
-      if (lost.length) {
+      // The teardown killed this batch: its lost items say nothing about the VM.
+      if (lost.length && !interrupted) {
         vm.infraErrors++;
         log(`batch on ${vm.name} slot ${slot} ended (exit ${code}) with ${lost.length} unfinished item(s); log ${logPath}`);
         for (const item of lost) {
@@ -392,6 +500,22 @@ async function main() {
   const runControl = async (vm: Vm) => {
     vm.control = true;
     for (const step of control) {
+      if (step.lane === "verify" && typecheckState) {
+        const { code, ms } = await typecheckState;
+        const local = `local incremental typecheck (exit ${code}, ${Math.round(ms / 1000)}s)`;
+        const state = join(runDir, "typecheck.tsbuildinfo");
+        let portable: ReturnType<typeof portableBuildInfo> = null;
+        try { portable = portableBuildInfo(ROOT, buildInfo!, state); } catch { /* absent or unreadable: reported below */ }
+        const sent = portable && portable.outside === 0
+          ? await runner(["ssh", vm.name, `mkdir -p ${quote(dirname(`${REMOTE_DIR}/${buildInfo}`))} && cat > ${quote(`${REMOTE_DIR}/${buildInfo}`)}`], { input: state })
+          : null;
+        const rerooted = portable?.moved ? `, ${portable.moved} entries re-rooted from the symlinked node_modules` : "";
+        log(sent?.code === 0
+          ? `typecheck state: ${local} uploaded to ${vm.name}${rerooted}; verify's typecheck runs warm`
+          : `typecheck state: ${!portable ? `no readable ${buildInfo} after the ${local}`
+            : portable.outside ? `${portable.outside} entries of the ${local} resolve outside the checkout, not uploaded`
+            : `upload to ${vm.name} failed (exit ${sent!.code})`}; verify's typecheck runs cold`);
+      }
       log(`control on ${vm.name}: ${step.lane}${step.files.length ? ` (${step.files.length} exclusive files, sequential)` : ""}`);
       const { parsed, logPath } = await runBatch(vm, 1, step.lane, step.files);
       const done = new Set(parsed.map((r) => r.file));
@@ -409,13 +533,14 @@ async function main() {
     const setupLog = join(runDir, "logs", `setup-${vm.name}.log`);
     if (tornDown) return;
     vm.requested = true;
+    vmRequested = true;
     appendFileSync(ledger, `${vm.name} ${opts.location}\n`);
     const up = await runner(["up", "-n", vm.name, "-s", opts.size, "-l", opts.location, ...(opts.image === "stock" ? [] : ["-b", opts.image])], { out: setupLog });
     if (tornDown) return;
     if (up.code !== 0) {
       vm.state = "failed";
       const setupText = readFileSync(setupLog, "utf8").trim();
-      const quota = setupText.indexOf("ubi-runner: quota refused");
+      const quota = setupText.search(/ubi-runner: quota (preflight )?refused/);
       if (quota >= 0) log(`VM ${index + 1} refused by the Ubicloud vCPU quota; the run continues on the VMs that started:\n${setupText.slice(quota)}`);
       else log(`VM ${index + 1} failed to provision (see ${setupLog}): ${setupText.split("\n").slice(-2).join(" | ")}`);
       return;
@@ -423,7 +548,7 @@ async function main() {
     vm.state = "setup";
     // System packages, Bun and image pulls need no checkout: setup starts now
     // and waits for the marker the upload writes when it lands.
-    const env = `SLOTS=${opts.slots} BUN_VERSION=${quote(bunVersion)} GITLEAKS=${opts.lanes.has("gitleaks") ? 1 : 0} CHECKOUT=${REMOTE_DIR} CHECKOUT_MARKER=${UNPACKED_MARKER}`;
+    const env = `SLOTS=${opts.slots} BUN_VERSION=${quote(bunVersion)} GITLEAKS=${opts.lanes.has("gitleaks") ? 1 : 0} CHECKOUT=${REMOTE_DIR} CHECKOUT_MARKER=${UNPACKED_MARKER}${opts.pgImage ? ` PG_IMAGE=${quote(opts.pgImage)}` : ""}`;
     const setupRun = runner(["ssh", vm.name, `${env} bash -s`], { input: SETUP_SCRIPT, out: `${setupLog}.bootstrap`, timeoutMs: 15 * 60 * 1000 });
     const pack = await packed;
     if (pack.code !== 0) throw new Error(`packing the checkout failed: ${pack.stdout.trim().split("\n").slice(-3).join(" | ")}`);
@@ -462,6 +587,7 @@ async function main() {
   try {
     await Promise.race([Promise.all(vms.map((vm, i) => vmLifecycle(vm, i))), recorded]);
     if (control.length && !controlDone) throw new Error("no VM became ready to run gitleaks/verify/exclusive items");
+    if (interrupted) throw new Error(`interrupted: ${totalItems - results.size} item(s) did not run`);
     if (queue.length) throw new Error(`${queue.length} items never ran: every VM failed`);
   } catch (error) {
     console.error(`ci-ubicloud: ${error instanceof Error ? error.message : String(error)}`);
@@ -469,6 +595,10 @@ async function main() {
   } finally {
     clearInterval(progress);
     await teardown();
+  }
+  if (!leftClean) {
+    console.error(`ci-ubicloud: VM cleanup not confirmed (see the UBICLOUD: line above); check with: UBI_OWNER=${owner} scripts/ubicloud/ubi-runner.sh list --mine`);
+    exitCode = 1;
   }
 
   // ── Report ───────────────────────────────────────────────────────────────
@@ -490,8 +620,40 @@ async function main() {
   const ready = vms.filter((vm) => vm.setupMs !== undefined);
   console.log(`  VMs: ${ready.length}/${opts.vms} ready${ready.length ? `, setup ${Math.round(Math.min(...ready.map((v) => v.setupMs!)) / 1000)}-${Math.round(Math.max(...ready.map((v) => v.setupMs!)) / 1000)}s` : ""}`);
   console.log(`  wall ${Math.round(wallMs / 1000)}s, ${Math.round(computeMs / 1000)}s of test compute`);
+  const loads = all.flatMap((r) => (r.load === undefined ? [] : [r.load])).sort((a, b) => a - b);
+  if (loads.length) {
+    const at = (q: number) => loads[Math.min(loads.length - 1, Math.floor(q * loads.length))]!.toFixed(2);
+    console.log(`  VM load (1-minute load average per vCPU as each item ended, ${opts.slots} slots per VM): p50 ${at(0.5)}, p90 ${at(0.9)}, max ${at(1)}`);
+    if (Number(at(0.9)) > 1.1) console.log(`  WARNING: VMs ran oversubscribed (p90 ${at(0.9)} runnable per vCPU), so timing-sensitive tests ran slower than the weights and file caps assume. Lower --slots.`);
+  }
   console.log("  slowest items:");
   for (const r of [...all].sort((a, b) => b.ms - a.ms).slice(0, 8)) console.log(`    ${Math.round(r.ms / 1000)}s ${r.lane} ${r.file}`);
+
+  // The pg-arms lane's proof that unit-postgres-arms fits: each shard of the
+  // workflow's own partition, its ARM_WORKERS workers' makespan over this run's
+  // measured file durations (both arms, as this lane runs them).
+  const armShardReport = opts.lanes.has("pg-arms")
+    ? armShards(ROOT, inventory["pg-arms"], ARM_SHARDS).map((files, i) => ({
+      shard: i + 1,
+      files: files.length,
+      ms: armMakespan(files, (file) => results.get(weightKey("pg-arms", file))?.ms ?? 0),
+    }))
+    : [];
+  if (armShardReport.length) {
+    console.log(`  pg-arms shards (unit-postgres-arms partition, ${ARM_SHARDS} shards of ${ARM_WORKERS} workers, step timeout ${ARM_STEP_TIMEOUT_MS / 1000}s each):`);
+    for (const s of armShardReport) console.log(`    ${s.shard}/${ARM_SHARDS}: ${Math.round(s.ms / 1000)}s across ${s.files} files`);
+  }
+  const overBudget = armShardReport.filter((s) => s.ms > ARM_STEP_TIMEOUT_MS);
+  // test.yml's unit shards: the plan test/scripts/unit-shard-budget.test.ts holds (unitShardCheck).
+  const unitCheck = opts.lanes.has("unit") && opts.lanes.has("slow")
+    ? unitShardCheck(ROOT, (file) => results.get(weightKey("unit", file))?.ms ?? results.get(weightKey("slow", file))?.ms)
+    : null;
+  const unitShardReport = unitCheck?.shards ?? [];
+  const unitOverBudget = unitCheck?.overBudget ?? [];
+  if (unitShardReport.length) {
+    console.log(`  unit shards (test.yml partition, ${UNIT_SHARDS} shards, mined weight at most ${UNIT_SHARD_BUDGET_MS / 1000}s each; measured here for drift only):`);
+    for (const s of unitShardReport) console.log(`    ${s.shard}/${UNIT_SHARDS}: mined ${Math.round(s.mined / 1000)}s, measured ${Math.round(s.ms / 1000)}s across ${s.files} files${s.unmeasured ? ` (${s.unmeasured} not run by this gate)` : ""}`);
+  }
 
   const timings: Record<string, number> = {};
   for (const r of all) if (r.rc === 0 && r.file !== "-") timings[weightKey(r.lane as Lane, r.file)] = r.ms;
@@ -509,6 +671,8 @@ async function main() {
     sha, runId, wallMs, computeMs, opts: { ...opts, lanes: [...opts.lanes] },
     vms: vms.map(({ name, state, setupMs, infraErrors }) => ({ name, state, setupMs, infraErrors })),
     lanes: Object.fromEntries(byLane), failures: failures.map(({ lane, file, rc, ms, vm }) => ({ lane, file, rc, ms, vm })),
+    armShards: armShardReport,
+    unitShards: unitShardReport,
   }, null, 2) + "\n");
 
   if (failures.length) {
@@ -522,13 +686,55 @@ async function main() {
     console.log(`\nFull per-item logs: ${join(runDir, "failures")}`);
     exitCode = 1;
   }
+  if (overBudget.length) {
+    console.log(`\npg-arms: ${overBudget.map((s) => `shard ${s.shard}/${ARM_SHARDS} measured ${Math.round(s.ms / 1000)}s`).join(", ")}, over the ${ARM_STEP_TIMEOUT_MS / 1000}s step timeout of persistence-validation's unit-postgres-arms job, which would cut that shard off mid-list. Fix: raise ARM_SHARDS (and the workflow matrix) or speed up the heaviest files, then re-mine scripts/postgres-arm-weights.json. Docs: docs/TESTING.md#postgres-arm-lanes`);
+    exitCode = 1;
+  }
+  if (unitOverBudget.length) {
+    console.log(`\nunit: ${unitOverBudget.map((s) => `shard ${s.shard}/${UNIT_SHARDS} mined ${Math.round(s.mined / 1000)}s`).join(", ")}, over UNIT_SHARD_BUDGET_MS (${UNIT_SHARD_BUDGET_MS / 1000}s), which test/scripts/unit-shard-budget.test.ts also enforces. Fix: re-mine scripts/test-weights.json, then raise UNIT_SHARDS (and both workflow matrices) or speed up the heaviest files. Docs: docs/TESTING.md#keeping-ci-partitions-balanced`);
+    exitCode = 1;
+  }
   const expected = totalItems;
   if (exitCode === 0 && results.size !== expected) {
     console.error(`ci-ubicloud: ${results.size} results for ${expected} items`);
     exitCode = 1;
   }
   console.log(exitCode === 0 ? `\n[ci-ubicloud] All checks passed in ${clock()}.` : `\n[ci-ubicloud] FAILED after ${clock()}.`);
+  if (opts.location !== GATE_LOCATION) console.log(`[ci-ubicloud] diagnostic run in ${opts.location}: not gate evidence (a full gate runs only in ${GATE_LOCATION}).`);
   process.exit(exitCode);
+}
+
+/**
+ * Print gstack's leftover line after teardown (and append it to UBI_LEFT_FILE):
+ * left counts `names` still in the project's VM list ("unknown" when the list
+ * cannot be read), others this owner's other ubirun VMs. Returns whether left
+ * is 0; a --keep run reports its live VMs as left=<n> kept=1.
+ */
+async function leftover(owner: string, names: string[], kept: boolean): Promise<boolean> {
+  const list = await runner(["cli", "vm", "list", "-N", "-f", "location,name"], { timeoutMs: VM_LIST_TIMEOUT_MS });
+  const listed = list.code === 0 ? new Set(list.stdout.split("\n").map((line) => line.trim().split(/\s+/)[1]).filter(Boolean)) : null;
+  const left = listed ? names.filter((name) => listed.has(name)).length : "unknown";
+  const others = listed ? [...listed].filter((name) => name!.startsWith(`ubirun-${owner}-`) && !names.includes(name!)).length : "unknown";
+  const line = `UBICLOUD: left=${left} owner=${owner} vms=${names.length} ${kept ? "kept=1" : `others=${others}`}`;
+  console.log(line);
+  if (process.env.UBI_LEFT_FILE) appendFileSync(process.env.UBI_LEFT_FILE, line + "\n");
+  leftReported = true;
+  return left === 0;
+}
+
+/**
+ * test.yml's unit shards as this gate checks them: the partition and mined weights of unitShardPlan, failing a
+ * shard over UNIT_SHARD_BUDGET_MS exactly as test/scripts/unit-shard-budget.test.ts does. `measured` (this run's
+ * per-file durations) is reported beside the plan and never gates: each item here is its own wrapper and Bun
+ * process (~0.6 s of startup per file) on a shared 16-vCPU VM, not one Bun process per shard on a 4-vCPU runner,
+ * so recent gates measured the same partition at 1.2-2.5x its mined weight.
+ */
+export function unitShardCheck(root: string, measured: (file: string) => number | undefined) {
+  const shards = unitShardPlan(root).map(({ shard, files, ms }) => {
+    const times = files.map(measured);
+    return { shard, files: files.length, mined: ms, unmeasured: times.filter((t) => t === undefined).length, ms: times.reduce<number>((sum, t) => sum + (t ?? 0), 0) };
+  });
+  return { budgetMs: UNIT_SHARD_BUDGET_MS, shards, overBudget: shards.filter((s) => s.mined > UNIT_SHARD_BUDGET_MS) };
 }
 
 function sortedObject(obj: Record<string, number>): Record<string, number> {
@@ -536,6 +742,12 @@ function sortedObject(obj: Record<string, number>): Record<string, number> {
 }
 
 if (import.meta.main) {
+  process.on("exit", () => {
+    if (leftReported || vmRequested || process.argv.includes("--list")) return;
+    const line = `UBICLOUD: left=0 owner=${process.env.UBI_OWNER ?? ""} vms=0 others=unknown`;
+    console.log(line);
+    if (process.env.UBI_LEFT_FILE) appendFileSync(process.env.UBI_LEFT_FILE, line + "\n");
+  });
   main().catch((error) => {
     console.error(error);
     process.exit(1);

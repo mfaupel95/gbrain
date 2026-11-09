@@ -66,7 +66,8 @@ function captureConsoleError(): { lines: string[]; restore: () => void } {
 }
 
 describe('parseDelegatedSyncArgs (default-deny)', () => {
-  test('bare sync → empty options, no explicit source', () => {
+  // #6712 PR 1: no explicit-processing list crosses the wire any more; a resume inherits the cursor's opt-outs on either side.
+  test('bare sync → no options, no explicit source', () => {
     expect(parseDelegatedSyncArgs([])).toEqual({ ok: true, options: {}, explicitSource: null });
   });
 
@@ -81,8 +82,6 @@ describe('parseDelegatedSyncArgs (default-deny)', () => {
     expect(r.options).toEqual({
       full: true, dryRun: true, noPull: true, noEmbed: true, noExtract: true,
       noSchemaPack: true, skipFailed: true, retryFailed: true, includeGitignored: true,
-      // #6317: the processing flags the caller set, so the managed cursor supplies only the rest (#5632).
-      explicitProcessing: ['noEmbed', 'noExtract', 'noSchemaPack'],
     });
     expect(r.explicitSource).toBe('notes');
   });
@@ -104,7 +103,7 @@ describe('parseDelegatedSyncArgs (default-deny)', () => {
 
   test('#6317: the managed catch-up flags are admitted explicitly (--json is rendered by this client, never forwarded)', () => {
     const r = parseDelegatedSyncArgs(['--source', 'notes', '--no-pull', '--json', '--no-bulk', '--lanes', '4', '--no-embed']);
-    expect(r).toEqual({ ok: true, explicitSource: 'notes', options: { noPull: true, noBulk: true, lanes: 4, noEmbed: true, explicitProcessing: ['noEmbed'] } });
+    expect(r).toEqual({ ok: true, explicitSource: 'notes', options: { noPull: true, noBulk: true, lanes: 4, noEmbed: true } });
     expect(parseDelegatedSyncArgs(['--no-lanes'])).toEqual({ ok: true, explicitSource: null, options: { lanes: 1 } });
     expect(parseDelegatedSyncArgs(['--lanes', '0'])).toEqual({ ok: false, refused: '--lanes (invalid value)' });
     expect(parseDelegatedSyncArgs(['--lanes', '17'])).toEqual({ ok: false, refused: '--lanes (invalid value)' });

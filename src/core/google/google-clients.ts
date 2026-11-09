@@ -12,21 +12,25 @@
  *    under backfill burst load is common and self-clearing; giving up after
  *    two tries used to poison threads that would have succeeded a few
  *    seconds later.
- *  - 403 accessNotConfigured → CredentialError 'api_not_enabled' with the
- *    exact enable deep link (project number extracted from the client id)
+ *  - 403 accessNotConfigured / SERVICE_DISABLED → GoogleApiDisabledError
+ *    ('api_not_enabled') naming the API, the project and the enable link
+ *    Google put in the error body (the client id's project number otherwise)
+ *  - 403 insufficient authentication scopes → CredentialError 'scope_missing'
  *  - uniform pageToken pagination with a safety cap
  *  - fetchImpl injectable for tests
  */
 
 import { CredentialError } from '../creds/errors.ts';
 import type { GoogleAccessProvider } from './access.ts';
-import { apiEnableLink } from '../creds/providers/google.ts';
+import { apiEnableLink, projectNumberFromClientId } from '../creds/providers/google.ts';
 import { parseRetryAfterMs } from '../github-source.ts';
 import { readBoundedHttpBody } from '../guarded-http.ts';
 import {
   bareAddress,
   DEFAULT_CALENDAR_ID,
+  GOOGLE_SERVICE_API,
   splitAddressList,
+  type GoogleService,
   type CalendarEventData,
   type ContactData,
   type GmailMessageMeta,
@@ -78,7 +82,7 @@ interface GoogleErrorBody {
     status?: string;
     message?: string;
     errors?: Array<{ reason?: string }>;
-    details?: Array<{ '@type'?: string; reason?: string }>;
+    details?: Array<{ '@type'?: string; reason?: string; metadata?: Record<string, unknown>; links?: Array<{ url?: unknown }> }>;
   };
 }
 
@@ -127,13 +131,17 @@ export class GoogleApiClient {
       if (res.status === 403) {
         const reason = body.error?.errors?.[0]?.reason ?? '';
         const msg = body.error?.message ?? '';
-        if (reason === 'accessNotConfigured' || /has not been used|is disabled/i.test(msg)) {
-          throw new CredentialError('api_not_enabled', apiEnableLink(apiHint, this.clientId));
+        const errorInfo = body.error?.details?.find(detail => detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo');
+        if (reason === 'accessNotConfigured' || errorInfo?.reason === 'SERVICE_DISABLED' || /has not been used|is disabled/i.test(msg)) {
+          throw googleApiDisabledError(body, apiHint, this.clientId);
+        }
+        if (reason === 'insufficientPermissions' || errorInfo?.reason === 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' || /insufficient authentication scopes/i.test(msg)) {
+          throw new CredentialError('scope_missing', undefined, `HTTP 403 on ${apiHint}: ${msg || reason}`);
         }
         if (reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded' || /rate/i.test(msg)) {
           // fall through to the retry-after sleep below
         } else if (!/quota/i.test(`${reason} ${msg}`)) {
-          throw new CredentialError('upstream', `: HTTP 403 ${reason || msg} on ${apiHint}`);
+          throw new GoogleForbiddenError(`: HTTP 403 ${reason || msg} on ${apiHint}`);
         }
       }
       if (res.status === 403 || res.status === 429) {
@@ -161,6 +169,13 @@ export class GoogleApiClient {
           detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo' && detail.reason === 'EXPIRED_SYNC_TOKEN',
         )) || /^Sync token (?:is )?expired\b/i.test(body.error?.message ?? '');
         if (expired) throw new GoogleCursorExpiredError(res.status, url);
+        throw new GoogleSyncTokenRejectedError(url, body.error?.message ?? 'no detail');
+      }
+      // #8906: a connections pageToken Google no longer honors (a re-list resumed from its checkpoint).
+      if (res.status === 400 && apiHint === 'people') {
+        const u = new URL(url);
+        const pageTokenRejected = /page[ _]?token/i.test(`${body.error?.message ?? ''} ${JSON.stringify(body.error?.details ?? [])}`);
+        if (u.pathname.endsWith('/people/me/connections') && u.searchParams.get('pageToken') && pageTokenRejected) throw new GoogleCursorExpiredError(res.status, url);
       }
       throw new CredentialError('upstream', `: HTTP ${res.status} on ${apiHint} (${body.error?.message ?? 'no detail'})`);
     }
@@ -196,6 +211,45 @@ export class GoogleApiClient {
   }
 }
 
+const SERVICE_FOR_HINT: Record<ApiHint, GoogleService> = { gmail: 'gmail', 'calendar-json': 'calendar', people: 'contacts' };
+
+/** Only a Google Cloud console link is relayed from an error body; anything else falls back to the derived link. */
+function consoleUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && (url.hostname === 'console.developers.google.com' || url.hostname === 'console.cloud.google.com') ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #7073: an API disabled for the OAuth client's project. Carries the API, its
+ * title, the project and the enable link from Google's ErrorInfo (the Help
+ * link or the message when ErrorInfo is absent), so setup, status and doctor
+ * can name every disabled API with its own link.
+ */
+export class GoogleApiDisabledError extends CredentialError {
+  constructor(readonly api: string, readonly apiTitle: string, readonly project: string | null, readonly enableUrl: string) {
+    super('api_not_enabled', enableUrl);
+    this.name = 'GoogleApiDisabledError';
+  }
+}
+
+function googleApiDisabledError(body: GoogleErrorBody, apiHint: ApiHint, clientId: string | undefined): GoogleApiDisabledError {
+  const details = body.error?.details ?? [];
+  const metadata = details.find(detail => detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo')?.metadata ?? {};
+  const text = (key: string): string | null => typeof metadata[key] === 'string' && (metadata[key] as string).trim() ? (metadata[key] as string).trim() : null;
+  const helpUrl = details.flatMap(detail => detail?.links ?? []).map(link => consoleUrl(link?.url)).find(url => url !== null) ?? null;
+  const messageUrl = consoleUrl(body.error?.message?.match(/https:\/\/\S+/)?.[0]?.replace(/[.,;)]+$/, ''));
+  const consumer = text('consumer')?.replace(/^projects\//, '') ?? text('containerInfo');
+  const project = consumer ?? body.error?.message?.match(/in project (\d+)/)?.[1] ?? (clientId ? projectNumberFromClientId(clientId) : null);
+  const fallback = GOOGLE_SERVICE_API[SERVICE_FOR_HINT[apiHint]];
+  return new GoogleApiDisabledError(text('service') ?? fallback.api, text('serviceTitle') ?? fallback.title, project,
+    consoleUrl(metadata.activationUrl) ?? helpUrl ?? messageUrl ?? apiEnableLink(apiHint, clientId));
+}
+
 /** Gmail 404-on-historyId / Calendar-People 410-on-syncToken. */
 export class GoogleCursorExpiredError extends Error {
   constructor(
@@ -205,6 +259,43 @@ export class GoogleCursorExpiredError extends Error {
     super(`Google cursor expired (HTTP ${status}) on ${url}`);
     this.name = 'GoogleCursorExpiredError';
   }
+}
+
+/**
+ * #5012 item 9: a 403 that is neither a disabled API, a rate limit nor a
+ * quota: the token cannot read this resource. Still an upstream
+ * `CredentialError` for every caller that does not classify it; the calendar
+ * sweep and `google status` read it as an unreadable calendar.
+ */
+export class GoogleForbiddenError extends CredentialError {
+  constructor(detail: string) {
+    super('upstream', detail);
+    this.name = 'GoogleForbiddenError';
+  }
+}
+
+/** #5012 item 9: the HTTP status when `e` says the calendar cannot be read by this account (403 or 404), else null. */
+export function calendarUnreadableStatus(e: unknown): 403 | 404 | null {
+  if (e instanceof GoogleForbiddenError) return 403;
+  if (e instanceof GoogleCursorExpiredError && e.status === 404) return 404;
+  return null;
+}
+
+/**
+ * #6324: People answered a syncToken request with a 400 that is NOT the typed
+ * expiry. The People API requires every other parameter of an incremental
+ * request to match the call that minted the token, so a token minted under a
+ * different `personFields` lands here. Still an upstream `CredentialError`
+ * for every caller that does not own a contacts cursor; the contacts sweep
+ * treats it as cursor-invalid and re-lists once.
+ */
+export class GoogleSyncTokenRejectedError extends CredentialError {
+  constructor(url: string, detail: string) {
+    super('upstream', `: HTTP 400 on people (${detail})`);
+    this.name = 'GoogleSyncTokenRejectedError';
+    this.url = url;
+  }
+  readonly url: string;
 }
 
 // ── Gmail ────────────────────────────────────────────────────────────────────
@@ -322,6 +413,12 @@ export function extractCalendarMethod(part: RawGmailPart | undefined): string | 
 export class GmailClient extends GoogleApiClient {
   async getProfile(opts: { signal?: AbortSignal } = {}): Promise<{ emailAddress: string; historyId: string }> {
     return this.fetchJSON(`${GMAIL_BASE}/users/me/profile`, 'gmail', opts);
+  }
+
+  /** The account's labels (system and user), for resolving `g_loops_exclude_labels` names to ids once per sweep (#5445). */
+  async getLabels(opts: { signal?: AbortSignal } = {}): Promise<Array<{ id: string; name: string; type: string }>> {
+    const body = await this.fetchJSON<{ labels?: Array<{ id?: string; name?: string; type?: string }> }>(`${GMAIL_BASE}/users/me/labels`, 'gmail', opts);
+    return (body.labels ?? []).flatMap((l) => typeof l.id === 'string' && typeof l.name === 'string' ? [{ id: l.id, name: l.name, type: l.type ?? 'user' }] : []);
   }
 
   /** Message ids matching a Gmail search query (includes SENT; excludes SPAM/TRASH). */
@@ -451,6 +548,9 @@ export class GmailClient extends GoogleApiClient {
         labelIds: m.labelIds ?? [],
         listUnsubscribe: header(m, 'List-Unsubscribe') !== '',
         autoSubmitted: isAutoSubmittedHeader(header(m, 'Auto-Submitted')),
+        precedence: header(m, 'Precedence').trim().toLowerCase(),
+        listId: header(m, 'List-Id') !== '',
+        replyTo: splitAddressList(header(m, 'Reply-To')),
         calendarMethod: extractCalendarMethod(m.payload),
         bodyText,
         attachmentInspection,
@@ -465,6 +565,7 @@ export class GmailClient extends GoogleApiClient {
 
 interface RawCalendarEvent {
   id: string;
+  etag?: string;
   status?: string;
   summary?: string;
   description?: string;
@@ -475,6 +576,32 @@ interface RawCalendarEvent {
   location?: string;
   hangoutLink?: string;
   htmlLink?: string;
+  visibility?: string;
+}
+
+function calendarEvent(e: RawCalendarEvent, account: string): CalendarEventData {
+  return {
+    id: e.id,
+    ...(e.etag ? { etag: e.etag } : {}),
+    summary: e.summary ?? '(no title)',
+    description: e.description ?? '',
+    startIso: e.start?.dateTime ?? (e.start?.date ? `${e.start.date}T00:00:00Z` : ''),
+    endIso: e.end?.dateTime ?? (e.end?.date ? `${e.end.date}T00:00:00Z` : ''),
+    allDay: Boolean(e.start?.date),
+    organizer: e.organizer?.email?.toLowerCase() ?? null,
+    attendees: (e.attendees ?? []).map((a) => ({
+      email: (a.email ?? '').toLowerCase(),
+      displayName: a.displayName ?? null,
+      self: a.self ?? false,
+      responseStatus: a.responseStatus ?? null,
+    })),
+    location: e.location ?? null,
+    hangoutLink: e.hangoutLink ?? null,
+    htmlLink: e.htmlLink ?? null,
+    status: e.status ?? 'confirmed',
+    account,
+    private: e.visibility === 'private' || e.visibility === 'confidential',
+  };
 }
 
 export class CalendarClient extends GoogleApiClient {
@@ -521,27 +648,21 @@ export class CalendarClient extends GoogleApiClient {
       'calendar-json',
       opts,
     );
-    const events = raw.map((e): CalendarEventData => ({
-      id: e.id,
-      summary: e.summary ?? '(no title)',
-      description: e.description ?? '',
-      startIso: e.start?.dateTime ?? (e.start?.date ? `${e.start.date}T00:00:00Z` : ''),
-      endIso: e.end?.dateTime ?? (e.end?.date ? `${e.end.date}T00:00:00Z` : ''),
-      allDay: Boolean(e.start?.date),
-      organizer: e.organizer?.email?.toLowerCase() ?? null,
-      attendees: (e.attendees ?? []).map((a) => ({
-        email: (a.email ?? '').toLowerCase(),
-        displayName: a.displayName ?? null,
-        self: a.self ?? false,
-        responseStatus: a.responseStatus ?? null,
-      })),
-      location: e.location ?? null,
-      hangoutLink: e.hangoutLink ?? null,
-      htmlLink: e.htmlLink ?? null,
-      status: e.status ?? 'confirmed',
-      account,
-    }));
-    return { events, nextSyncToken };
+    return { events: raw.map((e) => calendarEvent(e, account)), nextSyncToken };
+  }
+
+  /**
+   * GBRA-130 A-3: one event by id, for re-attempting a held event that no
+   * listing of this run returns. Null when the event is gone (404/410).
+   */
+  async getEvent(account: string, calendarId: string, eventId: string, opts: { signal?: AbortSignal } = {}): Promise<CalendarEventData | null> {
+    const calId = encodeURIComponent(calendarId.trim() || DEFAULT_CALENDAR_ID);
+    try {
+      return calendarEvent(await this.fetchJSON<RawCalendarEvent>(`${CALENDAR_BASE}/calendars/${calId}/events/${encodeURIComponent(eventId)}`, 'calendar-json', opts), account);
+    } catch (e) {
+      if (e instanceof GoogleCursorExpiredError) return null;
+      throw e;
+    }
   }
 
   /**
@@ -549,6 +670,23 @@ export class CalendarClient extends GoogleApiClient {
    * only — the sweep still reads ONE calendar per source, so this exists to
    * find the id you pass to `sources add --calendar-id`.
    */
+  /**
+   * #5012 item 9: one cheap read of the calendar's events (`maxResults=1`).
+   * `readable: false` carries the 403/404 that says the account cannot read
+   * it; any other failure throws.
+   */
+  async probeCalendar(calendarId: string, opts: { signal?: AbortSignal } = {}): Promise<{ readable: true } | { readable: false; httpStatus: 403 | 404 }> {
+    try {
+      await this.fetchJSON(`${CALENDAR_BASE}/calendars/${encodeURIComponent(calendarId.trim() || DEFAULT_CALENDAR_ID)}/events?maxResults=1&fields=kind`,
+        'calendar-json', { ...opts, retries: 1, rateLimitRetries: 1 });
+      return { readable: true };
+    } catch (e) {
+      const httpStatus = calendarUnreadableStatus(e);
+      if (httpStatus === null) throw e;
+      return { readable: false, httpStatus };
+    }
+  }
+
   async listCalendars(opts: { signal?: AbortSignal } = {}): Promise<
     Array<{ id: string; summary: string; primary: boolean; accessRole: string }>
   > {
@@ -582,10 +720,66 @@ export class CalendarClient extends GoogleApiClient {
 
 interface RawPerson {
   resourceName: string;
+  etag?: string;
   names?: Array<{ displayName?: string; metadata?: { primary?: boolean } }>;
   emailAddresses?: Array<{ value?: string }>;
+  phoneNumbers?: Array<{ value?: string; canonicalForm?: string }>;
   organizations?: Array<{ name?: string; title?: string; metadata?: { primary?: boolean } }>;
+  memberships?: Array<{ contactGroupMembership?: { contactGroupResourceName?: string } }>;
   metadata?: { deleted?: boolean };
+}
+
+interface RawContactGroup {
+  resourceName?: string;
+  name?: string;
+  formattedName?: string;
+  groupType?: string;
+}
+
+/**
+ * #6324: the People field mask every contacts request carries. A syncToken is
+ * only valid for requests with the parameters that minted it, so the sweep
+ * records this string next to the token (`contacts_person_fields`) and
+ * re-lists when it changes. Change it here and nowhere else.
+ */
+export const CONTACT_PERSON_FIELDS = 'names,emailAddresses,organizations,phoneNumbers,memberships';
+
+/** Google's built-in groups (`contactGroups/myContacts`, `starred`, …) say nothing a page should carry. */
+const SYSTEM_CONTACT_GROUPS = new Set(
+  ['all', 'myContacts', 'starred', 'blocked', 'chatBuddies', 'friends', 'family', 'coworkers'].map((id) => `contactGroups/${id}`),
+);
+
+/** Bounded directory walk: 1000 groups a page, ten pages; past that the result is explicitly incomplete. */
+const CONTACT_GROUP_PAGES = 10;
+
+function contactData(p: RawPerson): ContactData {
+  const primaryName = p.names?.find((n) => n.metadata?.primary) ?? p.names?.[0];
+  const primaryOrg = p.organizations?.find((o) => o.metadata?.primary) ?? p.organizations?.[0];
+  return {
+    resourceName: p.resourceName,
+    ...(p.etag ? { etag: p.etag } : {}),
+    displayName: primaryName?.displayName ?? null,
+    emails: (p.emailAddresses ?? [])
+      .map((e) => (e.value ?? '').trim().toLowerCase())
+      .filter((e) => e.includes('@')),
+    phones: [...new Set((p.phoneNumbers ?? [])
+      .map((n) => (n.canonicalForm ?? n.value ?? '').trim())
+      .filter((n) => n.length > 0))],
+    organization: primaryOrg?.name ?? null,
+    title: primaryOrg?.title ?? null,
+    groups: [...new Set((p.memberships ?? [])
+      .map((m) => m.contactGroupMembership?.contactGroupResourceName ?? '')
+      .filter((g) => g.startsWith('contactGroups/') && !SYSTEM_CONTACT_GROUPS.has(g)))]
+      .map((id) => ({ id, name: null })),
+    deleted: p.metadata?.deleted ?? false,
+  };
+}
+
+function connectionsUrl(syncToken: string | null | undefined, pageToken: string | null): string {
+  const params = new URLSearchParams({ personFields: CONTACT_PERSON_FIELDS, pageSize: '200', requestSyncToken: 'true' });
+  if (syncToken) params.set('syncToken', syncToken);
+  if (pageToken) params.set('pageToken', pageToken);
+  return `${PEOPLE_BASE}/people/me/connections?${params.toString()}`;
 }
 
 export class PeopleClient extends GoogleApiClient {
@@ -596,16 +790,7 @@ export class PeopleClient extends GoogleApiClient {
   }): Promise<{ contacts: ContactData[]; nextSyncToken: string | null }> {
     let nextSyncToken: string | null = null;
     const raw = await this.drainPages<RawPerson>(
-      (t) => {
-        const params = new URLSearchParams({
-          personFields: 'names,emailAddresses,organizations',
-          pageSize: '200',
-          requestSyncToken: 'true',
-        });
-        if (opts.syncToken) params.set('syncToken', opts.syncToken);
-        if (t) params.set('pageToken', t);
-        return `${PEOPLE_BASE}/people/me/connections?${params.toString()}`;
-      },
+      (t) => connectionsUrl(opts.syncToken, t),
       (body) => {
         if (typeof body.nextSyncToken === 'string') nextSyncToken = body.nextSyncToken;
         return {
@@ -616,20 +801,66 @@ export class PeopleClient extends GoogleApiClient {
       'people',
       opts,
     );
-    const contacts = raw.map((p): ContactData => {
-      const primaryName = p.names?.find((n) => n.metadata?.primary) ?? p.names?.[0];
-      const primaryOrg = p.organizations?.find((o) => o.metadata?.primary) ?? p.organizations?.[0];
-      return {
-        resourceName: p.resourceName,
-        displayName: primaryName?.displayName ?? null,
-        emails: (p.emailAddresses ?? [])
-          .map((e) => (e.value ?? '').trim().toLowerCase())
-          .filter((e) => e.includes('@')),
-        organization: primaryOrg?.name ?? null,
-        title: primaryOrg?.title ?? null,
-        deleted: p.metadata?.deleted ?? false,
-      };
-    });
-    return { contacts, nextSyncToken };
+    return { contacts: raw.map(contactData), nextSyncToken };
+  }
+
+  /**
+   * #8906: one page of a full list, so a re-list can checkpoint between pages.
+   * `nextSyncToken` arrives only on the last page; a stale `pageToken` (400 or
+   * 410) is a GoogleCursorExpiredError.
+   */
+  async listConnectionsPage(pageToken: string | null, opts: { signal?: AbortSignal } = {}):
+    Promise<{ contacts: ContactData[]; nextPageToken: string | null; nextSyncToken: string | null }> {
+    const body = await this.fetchJSON<Record<string, unknown>>(connectionsUrl(null, pageToken), 'people', opts);
+    return {
+      contacts: ((body.connections as RawPerson[] | undefined) ?? []).map(contactData),
+      nextPageToken: (body.nextPageToken as string | undefined) ?? null,
+      nextSyncToken: typeof body.nextSyncToken === 'string' ? body.nextSyncToken : null,
+    };
+  }
+
+  /**
+   * GBRA-130 A-3: one contact by resource name, for re-attempting a held
+   * contact that no listing of this run returns. Null when it is gone (404/410).
+   */
+  async getContact(resourceName: string, opts: { signal?: AbortSignal } = {}): Promise<ContactData | null> {
+    const path = resourceName.split('/').map(encodeURIComponent).join('/');
+    try {
+      return contactData(await this.fetchJSON<RawPerson>(`${PEOPLE_BASE}/${path}?personFields=${CONTACT_PERSON_FIELDS}`, 'people', opts));
+    } catch (e) {
+      if (e instanceof GoogleCursorExpiredError) return null;
+      throw e;
+    }
+  }
+
+  /**
+   * #6324: the account's user-created contact groups, resource name → display
+   * name. `complete` is false when the directory has more pages than the
+   * bounded walk read; the caller keeps raw ids for whatever is missing
+   * instead of treating one page as the whole directory.
+   */
+  async listContactGroups(opts: { signal?: AbortSignal } = {}): Promise<{ names: Record<string, string>; complete: boolean }> {
+    let morePages = false;
+    const raw = await this.drainPages<RawContactGroup>(
+      (t) => {
+        const params = new URLSearchParams({ pageSize: '1000', groupFields: 'name,groupType' });
+        if (t) params.set('pageToken', t);
+        return `${PEOPLE_BASE}/contactGroups?${params.toString()}`;
+      },
+      (body) => {
+        const nextPageToken = (body.nextPageToken as string | undefined) ?? null;
+        morePages = nextPageToken !== null;
+        return { items: (body.contactGroups as RawContactGroup[] | undefined) ?? [], nextPageToken };
+      },
+      'people',
+      { ...opts, maxPages: CONTACT_GROUP_PAGES, partialOk: true },
+    );
+    const names: Record<string, string> = {};
+    for (const g of raw) {
+      if (!g.resourceName || g.groupType === 'SYSTEM_CONTACT_GROUP' || SYSTEM_CONTACT_GROUPS.has(g.resourceName)) continue;
+      const name = (g.formattedName ?? g.name ?? '').trim();
+      if (name) names[g.resourceName] = name;
+    }
+    return { names, complete: !morePages };
   }
 }

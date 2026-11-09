@@ -20,6 +20,7 @@ import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
 import { durableGitRepo } from './helpers/git-publication.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
+import { PHYSICAL_ROOT_MARKER } from '../src/core/persistence/physical-root-record.ts';
 
 let engine: PGLiteEngine;
 const roots: string[] = [];
@@ -164,7 +165,7 @@ test('withdrawal redacts a present db_only cache file and keeps it out of a dura
   expect(git(f.root, ['log', '--name-only', '--pretty=format:'])).not.toContain('conversations');
 });
 
-test('a withdrawal Git scan parks a failing target after five failures and still commits the rest (#5612)', async () => {
+test('a withdrawal Git scan parks a gitignored target at once and still commits the rest (#5612, GBRA-133)', async () => {
   const f = await fixture(body(), 'aa/page');
   await engine.putPage('page', page(body()), { sourceId: f.sourceId });
   const later = (await engine.readPageSnapshot('page', { sourceId: f.sourceId }))!;
@@ -181,7 +182,7 @@ test('a withdrawal Git scan parks a failing target after five failures and still
     await runPersistenceEffects(engine, config, { hostId, limit: 1 });
   }
   expect(await effect()).toMatchObject({ state: 'failed', error_code: 'targets_parked', data: { after_slug: 'page',
-    parked: [{ slug: 'aa/page', error_code: 'git_target_unsafe' }] } });
+    parked: [{ slug: 'aa/page', error_code: 'git_target_ignored', rule: '.gitignore:1: aa/' }] } });
   expect(git(f.root, ['log', '-1', '--name-only', '--pretty=format:'])).toBe('page.md');
   expect(await publicEffectsForRequest(engine, row.id)).toContainEqual({ kind: 'git', state: 'failed', reason: 'targets_parked' });
 });
@@ -297,4 +298,54 @@ test('Git retry disables legacy hooks, preserves unrelated staging and never reb
   expect(existsSync(join(root, 'forbidden-hook-ran'))).toBe(false);
   expect(await publishGitEffect(root, 'page.md')).toMatchObject({ git: 'unchanged' });
   expect(git(root, ['rev-parse', 'HEAD'])).toBe(head);
+});
+
+test('#6305: a Git effect this process cannot lock never parks and commits once the lock opens', async () => {
+  const f = await fixture();
+  durableGitRepo(f.root, ['page.md']);
+  const admitted = await admit(f);
+  const row = (await claimNextWrite(engine, hostId))!;
+  expect(row.id).toBe(admitted.id);
+  const published = await publishMutation(engine, row, { observedRevision: f.snapshot.revision, file: { path: f.file, root: f.root, content: 'After' },
+    apply: async tx => { await tx.putPage('page', page('After'), { sourceId: f.sourceId }); return {}; } }, hostId);
+  expect(published.state).toBe('committed');
+  await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE request_id=$1::uuid AND kind<>'git'", [row.id]);
+  rmSync(f.binding.coordination_path!, { force: true }); mkdirSync(f.binding.coordination_path!);
+  const effect = async () => (await engine.executeRaw<{ state: string; error_code: string | null }>(
+    "SELECT state,error_code FROM persistence_effects WHERE request_id=$1::uuid AND kind='git'", [row.id]))[0];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=$1::uuid AND kind='git'", [row.id]);
+    await runPersistenceEffects(engine, config, { hostId, limit: 1 });
+  }
+  expect(await effect()).toMatchObject({ state: 'queued', error_code: 'writer_lock_unavailable' });
+  rmSync(f.binding.coordination_path!, { recursive: true, force: true });
+  await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=$1::uuid AND kind='git'", [row.id]);
+  await runPersistenceEffects(engine, config, { hostId, limit: 1 });
+  expect((await effect())!.state).toBe('committed');
+});
+
+test('#8368: a Git effect whose checkout lost its ownership marker never parks and commits once the marker is back', async () => {
+  const f = await fixture();
+  durableGitRepo(f.root, ['page.md']);
+  const admitted = await admit(f);
+  const row = (await claimNextWrite(engine, hostId))!;
+  expect(row.id).toBe(admitted.id);
+  const published = await publishMutation(engine, row, { observedRevision: f.snapshot.revision, file: { path: f.file, root: f.root, content: 'After' },
+    apply: async tx => { await tx.putPage('page', page('After'), { sourceId: f.sourceId }); return {}; } }, hostId);
+  expect(published.state).toBe('committed');
+  await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE request_id=$1::uuid AND kind<>'git'", [row.id]);
+  const marker = join(f.root, PHYSICAL_ROOT_MARKER);
+  const bytes = readFileSync(marker);
+  rmSync(marker);
+  const effect = async () => (await engine.executeRaw<{ state: string; error_code: string | null }>(
+    "SELECT state,error_code FROM persistence_effects WHERE request_id=$1::uuid AND kind='git'", [row.id]))[0];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=$1::uuid AND kind='git'", [row.id]);
+    await runPersistenceEffects(engine, config, { hostId, limit: 1 });
+  }
+  expect(await effect()).toMatchObject({ state: 'queued', error_code: 'owner_marker_missing' });
+  writeFileSync(marker, bytes, { mode: 0o600 });
+  await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=$1::uuid AND kind='git'", [row.id]);
+  await runPersistenceEffects(engine, config, { hostId, limit: 1 });
+  expect((await effect())!.state).toBe('committed');
 });

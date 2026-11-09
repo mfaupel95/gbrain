@@ -40,11 +40,12 @@ describe('validateDelegatedSyncOptions', () => {
     expect(v.options).not.toBe(raw as never);
   });
 
-  test('#6317: the managed catch-up fields validate by shape (lanes 1..16, explicitProcessing from the three processing keys)', () => {
-    const ok = validateDelegatedSyncOptions({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 });
+  // #6712 PR 1: explicitProcessing is still validated by shape (an older CLI sends it) but dropped: the cursor's opt-outs are inherited.
+  test('#6317: the managed catch-up fields validate by shape (lanes 1..16, explicitProcessing from the three processing keys, accepted and ignored)', () => {
+    const ok = validateDelegatedSyncOptions({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 } as never);
     expect(ok.ok).toBe(true);
     if (!ok.ok) throw new Error('unreachable');
-    expect(ok.options).toEqual({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 });
+    expect(ok.options).toEqual({ noBulk: true, lanes: 4, timeoutSeconds: 60 });
     for (const lanes of [0, 17, 1.5, '4']) expect(validateDelegatedSyncOptions({ lanes, timeoutSeconds: 60 })).toEqual({ ok: false, error: 'invalid_options:lanes' });
     for (const explicitProcessing of ['noEmbed', ['repoPath'], [1], ['noEmbed', 'noEmbed', 'noExtract', 'noSchemaPack']]) {
       expect(validateDelegatedSyncOptions({ explicitProcessing, timeoutSeconds: 60 })).toEqual({ ok: false, error: 'invalid_options:explicitProcessing' });
@@ -123,13 +124,20 @@ describe('validateDelegatedSyncOptions', () => {
     expect(validateDelegatedSyncOptions({ sourceId: 'ok-source', timeoutSeconds: 60 }).ok).toBe(true);
   });
 
+  test('#6696 (A5): origin carries the admission origin and rejects anything else', () => {
+    expect(validateDelegatedSyncOptions({ timeoutSeconds: 0, origin: 'interactive' })).toEqual({ ok: true, options: { timeoutSeconds: 0, origin: 'interactive' } });
+    expect(validateDelegatedSyncOptions({ timeoutSeconds: 0, origin: 'background' })).toMatchObject({ ok: true });
+    expect(validateDelegatedSyncOptions({ timeoutSeconds: 0, origin: 'admin' })).toEqual({ ok: false, error: 'invalid_options:origin' });
+    expect(validateDelegatedSyncOptions({ timeoutSeconds: 0, origin: true })).toEqual({ ok: false, error: 'invalid_options:origin' });
+  });
+
   test('field table and options interface stay in lockstep', () => {
     // The validator iterates the table; if a field is added to the interface
     // but not the table it becomes unreachable from the wire — this pin makes
     // that drift loud.
     expect(Object.keys(DELEGATED_SYNC_OPTION_FIELDS).sort()).toEqual([
       'dryRun',
-      'explicitProcessing',
+      'embedDeferred',
       'full',
       'includeGitignored',
       'lanes',
@@ -138,11 +146,15 @@ describe('validateDelegatedSyncOptions', () => {
       'noExtract',
       'noPull',
       'noSchemaPack',
+      'origin',
       'retryFailed',
       'skipFailed',
       'sourceId',
       'timeoutSeconds',
     ]);
+    // #6712 PR 2: a retired field is not in the table (a newer client never sends it); its window still accepts it.
+    expect(Object.keys(DELEGATED_SYNC_OPTION_FIELDS)).not.toContain('explicitProcessing');
+    expect(validateDelegatedSyncOptions({ explicitProcessing: ['noEmbed'], timeoutSeconds: 0 })).toEqual({ ok: true, options: { timeoutSeconds: 0 }, ignored: ['explicitProcessing'] });
   });
 });
 

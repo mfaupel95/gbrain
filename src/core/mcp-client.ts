@@ -6,18 +6,18 @@
  *   - `gbrain remote ping`   — submits autopilot-cycle, polls get_job
  *   - `gbrain remote doctor` — calls run_doctor MCP op
  *
- * Token caching strategy: in-process Map keyed by mcp_url, value carries the
- * access_token + expires_at. CLI invocations are short-lived; the cache
- * amortizes when a single `gbrain remote ping` makes multiple calls (submit_job
- * + N × get_job). Persisting to disk would create a credential-on-disk
- * surface for marginal benefit — re-mint is a single sub-100ms /token call.
+ * Token caching strategy: an in-process Map in front of a 0600 file under the
+ * gbrain home (remote-token-cache.ts), both keyed by a hash of the issuer, MCP
+ * URL, client id and secret. Each CLI command is its own process, so the file
+ * is what lets a per-prompt caller reuse one token instead of minting one per
+ * command and spending the host's /token budget (#7360).
  *
  * HTTP 401 handling: drop the cached token, mint fresh once, retry the call.
  * Application errors and other HTTP statuses are terminal. If the refreshed
  * attempt is also rejected with HTTP 401, surface auth_after_refresh.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isPersistenceIpcMutation } from './persistence/ipc.ts';
 import { replayWhilePending } from './persistence/write-wait.ts';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -26,22 +26,18 @@ import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { anySignal } from './abort-check.ts';
 import type { GBrainConfig } from './config.ts';
 import { discoverOAuth, mintClientCredentialsToken } from './remote-mcp-probe.ts';
-import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt } from './persistence/types.ts';
+import { clearTokenCacheFile, dropCachedToken, readCachedToken, tokenCacheKey, writeCachedToken, type CachedToken } from './remote-token-cache.ts';
+import { isTerminalWriteState, isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt, type WriteReceipt } from './persistence/types.ts';
 import { GBRAIN_CLIENT_HEADER, GBRAIN_THIN_CLIENT_NAME } from '../mcp/result-rows.ts';
 import { VERSION } from '../version.ts';
 import { RemoteMcpError, extractResponseMeta, type RemoteMcpErrorDetail } from './remote-mcp-error.ts';
+import { FRAME_RESERVE_BYTES } from './egress-budget.ts';
+import { OperationError, opError } from './ops/contract.ts';
 
 // The error class and the envelope-meta readers live in remote-mcp-error.ts so
 // a local CLI command can name them without loading this module's MCP SDK graph.
 export { RemoteMcpError, extractResponseMeta, ignoredRemoteParams } from './remote-mcp-error.ts';
 export type { RemoteMcpErrorReason, RemoteMcpErrorDetail } from './remote-mcp-error.ts';
-
-interface CachedToken {
-  access_token: string;
-  /** Wall-clock ms when this token expires. Conservative: 30s safety margin
-   *  against clock skew so we mint fresh BEFORE the server says expired. */
-  expires_at_ms: number;
-}
 
 const tokenCache = new Map<string, CachedToken>();
 
@@ -49,9 +45,18 @@ const tokenCache = new Map<string, CachedToken>();
  * Test-only escape hatch. Tests that mock the OAuth fixture across multiple
  * runs need to invalidate the cache between runs. Production callers should
  * never need this — the 401 path handles staleness automatically.
+ * `keepDisk` simulates a new CLI process: the in-process map is gone, the file stays.
  */
-export function _clearMcpClientTokenCache(): void {
+export function _clearMcpClientTokenCache(opts: { keepDisk?: boolean } = {}): void {
   tokenCache.clear();
+  if (!opts.keepDisk) clearTokenCacheFile();
+}
+
+function dropAccessToken(config: GBrainConfig): void {
+  const remote = requireRemoteMcp(config);
+  const key = tokenCacheKey(remote, resolveSecret(remote));
+  tokenCache.delete(key);
+  dropCachedToken(key);
 }
 
 /**
@@ -174,6 +179,10 @@ export function extractToolErrorCode(message: string): string | undefined {
 }
 
 /** Keep only validated public receipt fields from a tool's JSON error body. */
+function isBatchErrorBody(text: string): boolean {
+  try { const body = JSON.parse(text) as { items?: unknown; status?: unknown }; return Array.isArray(body?.items) && body.status === 'error'; } catch { return false; }
+}
+
 export function extractToolErrorDetail(message: string): RemoteMcpErrorDetail {
   const code = extractToolErrorCode(message);
   const detail: RemoteMcpErrorDetail = code ? { code } : {};
@@ -196,6 +205,16 @@ export function extractToolErrorDetail(message: string): RemoteMcpErrorDetail {
     if (isWriteErrorCode(envelope.write_error)) detail.write_error = envelope.write_error;
   } catch { /* Older servers can return plain text; preserve existing code extraction. */ }
   return detail;
+}
+
+/** PR B: a server answers a write deferred behind a refresh as a `status: "pending"` success; the CLI treats it as the pending write it is. */
+function deferredPendingReceipt(res: unknown): WriteReceipt | null {
+  const first = (res as { content?: Array<{ text?: unknown }> } | null)?.content?.[0]?.text;
+  if (typeof first !== 'string' || !/^\s*\{\s*"status"\s*:\s*"pending"/.test(first.slice(0, 64))) return null;
+  try {
+    const body = JSON.parse(first) as { receipt?: unknown };
+    return isWriteReceipt(body.receipt) && !isTerminalWriteState(body.receipt.state) ? publicWriteReceipt(body.receipt) : null;
+  } catch { return null; }
 }
 
 function requireRemoteMcp(config: GBrainConfig | null): NonNullable<GBrainConfig['remote_mcp']> {
@@ -226,12 +245,15 @@ function resolveSecret(remote: NonNullable<GBrainConfig['remote_mcp']>): string 
 async function getAccessToken(config: GBrainConfig, force = false, signal?: AbortSignal): Promise<string> {
   signal?.throwIfAborted();
   const remote = requireRemoteMcp(config);
-  const cached = tokenCache.get(remote.mcp_url);
-  if (!force && cached && cached.expires_at_ms > Date.now()) {
-    return cached.access_token;
-  }
-
   const secret = resolveSecret(remote);
+  const key = tokenCacheKey(remote, secret);
+  if (!force) {
+    const cached = tokenCache.get(key) ?? readCachedToken(key);
+    if (cached && cached.expires_at_ms > Date.now()) {
+      tokenCache.set(key, cached);
+      return cached.access_token;
+    }
+  }
 
   const disco = await discoverOAuth(remote.issuer_url, { signal });
   signal?.throwIfAborted();
@@ -263,7 +285,8 @@ async function getAccessToken(config: GBrainConfig, force = false, signal?: Abor
   const ttlSec = tokenRes.token.expires_in ?? 3600;
   const expires_at_ms = Date.now() + Math.max(0, ttlSec * 1000 - 30_000);
   const token: CachedToken = { access_token: tokenRes.token.access_token, expires_at_ms };
-  tokenCache.set(remote.mcp_url, token);
+  tokenCache.set(key, token);
+  writeCachedToken(key, token);
   return token.access_token;
 }
 
@@ -421,6 +444,8 @@ export async function callRemoteTool(
           // block from a newer server never joins the body.
           const first = Array.isArray(res.content) ? (res.content[0] as { text?: unknown } | undefined) : undefined;
           const message = typeof first?.text === 'string' ? first.text : 'unknown tool error';
+          // GST-1387: a remember batch with a failed item is an error whose body keeps every item's receipt; the caller renders it.
+          if (isBatchErrorBody(message)) return res;
           // v0.31.1: extract structured error code (e.g. 'missing_scope') so
           // the dispatcher can produce a pinpoint hint instead of a generic
           // "tool error" message.
@@ -429,6 +454,11 @@ export async function callRemoteTool(
             `Remote tool ${toolName} failed: ${message}`,
             { mcp_url: remote.mcp_url, ...extractToolErrorDetail(message) },
           );
+        }
+        const pending = deferredPendingReceipt(res);
+        if (pending) {
+          throw new RemoteMcpError('tool_error', `Remote tool ${toolName}: request ${pending.request_id} was accepted and publishes after the worktree refresh.`,
+            { mcp_url: remote.mcp_url, code: 'write_pending', write_error: 'write_pending', write_request: pending, request_id: pending.request_id });
         }
         return res;
       } finally {
@@ -448,7 +478,7 @@ export async function callRemoteTool(
       if (!isStreamableHttpError(e) || e.code !== 401) throw e;
       submitted = false; // This attempt was explicitly refused, not accepted.
       // Drop cached token and retry once with a fresh mint.
-      tokenCache.delete(remote.mcp_url);
+      dropAccessToken(config);
       let freshToken: string;
       try {
         freshToken = await getAccessToken(config, true, signal);
@@ -469,7 +499,7 @@ export async function callRemoteTool(
         signal.throwIfAborted();
         if (isStreamableHttpError(e2) && e2.code === 401) {
           submitted = false;
-          tokenCache.delete(remote.mcp_url);
+          dropAccessToken(config);
           throw new RemoteMcpError(
             'auth_after_refresh',
             `Auth failed after token refresh. Verify oauth_client_id and secret are still valid; the host operator may need to re-run \`gbrain auth register-client\`.`,
@@ -491,6 +521,43 @@ export async function callRemoteTool(
         ? { submission_status: submitted ? 'unknown' as const : 'not_sent' as const } : {}),
       ...(toolName === 'remember' || toolName === 'forget' ? { protocol_version: 1 as const } : {}),
     });
+  } finally {
+    cleanup();
+  }
+}
+
+/** One tool a remote serve lists for this token: its name and the parameter names its input schema declares. */
+export interface RemoteToolListing { name: string; params: string[] }
+
+/**
+ * #6696 B2: the tools a remote serve lists for this client's token (tools/list
+ * already filters by the token's scope and surface). Lets the thin client send
+ * a parameter only to a serve that advertises it. Same token handling as
+ * `callRemoteTool`: a cached token, one refresh on an HTTP 401.
+ */
+export async function listRemoteTools(config: GBrainConfig, opts: CallRemoteToolOptions = {}): Promise<RemoteToolListing[]> {
+  const remote = requireRemoteMcp(config);
+  const { signal, cleanup } = buildAbortController(opts);
+  const list = async (token: string): Promise<RemoteToolListing[]> => {
+    const client = await buildClient(remote.mcp_url, token, signal);
+    try {
+      const { tools } = await client.listTools(undefined, buildMcpRequestOptions(opts, signal));
+      return tools.map((t) => ({ name: t.name, params: Object.keys((t.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {}) }));
+    } finally {
+      try { await client.close(); } catch { /* best-effort */ }
+    }
+  };
+  try {
+    try {
+      return await list(await getAccessToken(config, false, signal));
+    } catch (e) {
+      signal.throwIfAborted();
+      if (!isStreamableHttpError(e) || e.code !== 401) throw e;
+      dropAccessToken(config);
+      return await list(await getAccessToken(config, true, signal));
+    }
+  } catch (e) {
+    throw toRemoteMcpError(e, remote.mcp_url, signal);
   } finally {
     cleanup();
   }
@@ -549,3 +616,148 @@ export function extractNotices(res: unknown): Array<Record<string, unknown>> {
   return out;
 }
 
+
+/**
+ * Wave B upload sessions (spec 6.2): the bytes of the JSON-RPC `tools/call`
+ * request that carries `args` to `tool`, measured the way egress-budget.ts
+ * `encodedFrameBytes` measures a result frame: the whole frame stringified
+ * (every string escaped: a control character costs 6 bytes, a quote or
+ * backslash 2), UTF-8 encoded, plus the framing reserve.
+ */
+export function toolCallFrameBytes(tool: string, args: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'tools/call', params: { name: tool, arguments: args } }), 'utf8') + FRAME_RESERVE_BYTES;
+}
+
+/** A part's sha256 is always 64 hex characters, so the cut measures the frame with a stand-in of the same length. */
+const PART_SHA256_STAND_IN = '0'.repeat(64);
+
+const isHighSurrogate = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
+const isLowSurrogate = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
+
+/**
+ * The end (a UTF-16 index) of the longest prefix of `text` whose
+ * `upload_page_part` request frame (`toolCallFrameBytes`) is at most
+ * `maxFrameBytes`. A binary search over code-point boundaries on the exact
+ * stringified length: never splits a surrogate pair. Throws when not even one
+ * code point fits the frame.
+ */
+export function cutUploadPart(text: string, frame: { upload_id: string; part: number }, maxFrameBytes: number): number {
+  const fits = (end: number) => toolCallFrameBytes('upload_page_part',
+    { upload_id: frame.upload_id, part: frame.part, text: text.slice(0, end), part_sha256: PART_SHA256_STAND_IN }) <= maxFrameBytes;
+  const boundary = (i: number) => i > 0 && i < text.length && isHighSurrogate(text.charCodeAt(i - 1)) && isLowSurrogate(text.charCodeAt(i)) ? i - 1 : i;
+  // Every UTF-16 unit costs at least one frame byte, so no longer prefix can fit.
+  let hi = boundary(Math.min(text.length, Math.max(0, maxFrameBytes)));
+  if (fits(hi)) return hi;
+  let lo = 0;
+  while (hi - lo > 1) {
+    let mid = boundary(lo + Math.floor((hi - lo) / 2));
+    if (mid === lo) mid = lo + 2;
+    if (mid >= hi) break;
+    if (fits(mid)) lo = mid;
+    else hi = mid;
+  }
+  if (lo === 0) {
+    throw opError('payload_too_large', `An upload part frame of at most ${maxFrameBytes} bytes cannot carry even one character.`,
+      'The brain host advertised a part frame smaller than the request envelope, so nothing was uploaded. Report it with gbrain remote doctor; the host operator raises its request cap.',
+      { fix: { argv: ['gbrain', 'remote', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Shows the brain host and its connection limits, read-only.' } });
+  }
+  return lo;
+}
+
+/** One tool call of an upload: the parsed tool result, or a thrown error. */
+export type UploadToolCall = (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+/** A body to upload: its UTF-8 size and sha256, and its text from a byte offset (a code-point boundary) on. */
+export interface UploadBody {
+  bytes: number;
+  sha256: string;
+  text(fromByte: number): AsyncIterable<string>;
+}
+
+export interface UploadPageOptions {
+  /** A failure that may have lost only the reply (a dropped connection): the driver asks get_page_upload where the session stands and resumes there. */
+  transient?: (error: unknown) => boolean;
+  /** Attempts after a transient failure, per call. Default 3. */
+  retries?: number;
+  /** commit_page_upload's wait_ms. */
+  wait_ms?: number;
+  /** begin_page_upload's reply when the caller already began the session (with this body's total_bytes and sha256). */
+  begun?: Record<string, unknown>;
+}
+
+/** A body held as one string. */
+export function stringUploadBody(text: string): UploadBody {
+  const bytes = Buffer.from(text, 'utf8');
+  return {
+    bytes: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    async *text(fromByte: number) { yield bytes.subarray(fromByte).toString('utf8'); },
+  };
+}
+
+/**
+ * Upload `body` through an upload session and commit it: begin, the parts in
+ * order (each cut to the session's `part_max_frame_bytes` by
+ * `cutUploadPart`), commit. After a transient failure it reads
+ * get_page_upload and continues at `next_part`; any other failure aborts the
+ * session (releasing its reservation) and rethrows, except a sign that another
+ * client holds the same session (`idempotency_conflict`), which it leaves. Returns the commit's
+ * put_page-shaped receipt.
+ */
+export async function uploadPageBody(call: UploadToolCall, begin: Record<string, unknown>, body: UploadBody, opts: UploadPageOptions = {}): Promise<Record<string, unknown>> {
+  const transient = opts.transient ?? (() => false);
+  const retries = opts.retries ?? 3;
+  const retry = async (fn: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await fn(); } catch (error) { if (attempt >= retries || !transient(error)) throw error; }
+    }
+  };
+  const session = opts.begun ?? await retry(() => call('begin_page_upload', { ...begin, total_bytes: body.bytes, sha256: body.sha256 }));
+  const uploadId = String(session.upload_id);
+  const maxFrame = Number(session.part_max_frame_bytes);
+  let part = Number(session.next_part);
+  let received = Number(session.received_bytes);
+  const moved = (expected: number, state: Record<string, unknown>) => opError('idempotency_conflict',
+    `Upload ${uploadId} holds ${String(state.received_bytes)} bytes at part ${String(state.next_part)}; this client expected ${expected} bytes.`,
+    'Another client is writing this upload session (the same request_id), so this one stopped and committed nothing. Run the command again without --request-id to start a new upload.');
+  try {
+    const chunks = body.text(received)[Symbol.asyncIterator]();
+    let buffer = '';
+    let eof = false;
+    for (;;) {
+      while (!eof && buffer.length <= maxFrame) {
+        const next = await chunks.next();
+        if (next.done) eof = true;
+        else buffer += next.value;
+      }
+      if (buffer.length === 0) break;
+      const end = cutUploadPart(buffer, { upload_id: uploadId, part }, maxFrame);
+      const text = buffer.slice(0, end);
+      const expected = received + Buffer.byteLength(text, 'utf8');
+      const args = { upload_id: uploadId, part, text, part_sha256: createHash('sha256').update(text, 'utf8').digest('hex') };
+      let ack: Record<string, unknown> | undefined;
+      for (let attempt = 0; !ack; attempt++) {
+        try { ack = await call('upload_page_part', args); } catch (error) {
+          if (attempt >= retries || !transient(error)) throw error;
+          const state = await retry(() => call('get_page_upload', { upload_id: uploadId }));
+          if (Number(state.next_part) > part) ack = state;
+          else if (Number(state.next_part) !== part || Number(state.received_bytes) !== received) throw moved(received, state);
+        }
+      }
+      if (Number(ack.received_bytes) !== expected || Number(ack.next_part) <= part) throw moved(expected, ack);
+      part = Number(ack.next_part);
+      received = expected;
+      buffer = buffer.slice(end);
+    }
+    if (received !== body.bytes) {
+      throw opError('source_changed', `The body read back ${received} bytes, not the ${body.bytes} it declared.`,
+        'The input changed while it was uploading, so nothing was committed. Run the command again on the finished file.');
+    }
+  } catch (error) {
+    const code = error instanceof OperationError ? error.code : error instanceof RemoteMcpError ? error.detail?.code : undefined;
+    if (!transient(error) && code !== 'idempotency_conflict') await call('abort_page_upload', { upload_id: uploadId }).catch(() => undefined);
+    throw error;
+  }
+  return retry(() => call('commit_page_upload', { upload_id: uploadId, ...(opts.wait_ms !== undefined ? { wait_ms: opts.wait_ms } : {}) }));
+}

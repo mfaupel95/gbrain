@@ -6,7 +6,10 @@ import type { TaintInput, WriteTrust } from '../trust/tier.ts';
 
 /**
  * Dream-provenance DB stamp (#2569): marks pages a dream child wrote with
- * `dream_generated` and a stable first cycle date. Shared by synthesize and
+ * `dream_generated` and a stable first cycle date: `dream_cycle_date` and
+ * `dream_created_cycle_date` both keep the FIRST cycle that wrote the page, so
+ * a rewrite in a later cycle does not move them (#6642: the cycle summary
+ * states this and counts rewritten pages separately). Shared by synthesize and
  * patterns (#5733); a page that existed before the child's first write to it
  * is not stamped. `seat` (#4618) credits the capturing agent seat; `seat: null`
  * removes a seat the page no longer earns (a pattern whose reflections no
@@ -71,4 +74,36 @@ export async function stampDreamProvenance(
       process.stderr.write(`[dream] provenance stamp ${slug}@${source_id} failed: ${msg}\n`);
     }
   }
+}
+
+/**
+ * #6642: the cycle summary's provenance section. `dream_cycle_date` is
+ * first-write provenance, so the recovery query (`dream_generated: true` and
+ * `dream_cycle_date: <date>` in this source, excluding the summary) misses
+ * pages an earlier cycle wrote first. Reports the count that query returns and,
+ * separately, how many of this cycle's pages keep an earlier cycle's date.
+ */
+export async function summaryProvenanceLines(
+  engine: BrainEngine,
+  opts: { sourceId: string; cycleDate: string; summarySlug: string; writtenSlugs: string[] },
+): Promise<string[]> {
+  const [row] = await engine.executeRaw<{ found: number; earlier: number }>(
+    `SELECT count(*) FILTER (WHERE frontmatter->>'dream_cycle_date' = $2 AND slug <> $3)::int AS found,
+            count(*) FILTER (WHERE slug = ANY($4::text[]) AND COALESCE(frontmatter->>'dream_cycle_date', '') NOT IN ('', $2))::int AS earlier
+       FROM pages
+      WHERE source_id = $1 AND deleted_at IS NULL AND frontmatter->>'dream_generated' = 'true'`,
+    [opts.sourceId, opts.cycleDate, opts.summarySlug, opts.writtenSlugs]);
+  const found = Number(row?.found ?? 0);
+  const earlier = Number(row?.earlier ?? 0);
+  return [
+    '## Full output provenance',
+    '',
+    '`dream_cycle_date` records the first cycle that wrote a page. Querying page frontmatter in this source for ' +
+      `\`dream_generated: true\` and \`dream_cycle_date: ${opts.cycleDate}\`, excluding \`${opts.summarySlug}\`, returns ${found} page(s).` +
+      (earlier > 0
+        ? ` ${earlier} of the ${opts.writtenSlugs.length} pages written this cycle were first written by an earlier cycle and keep that cycle's \`dream_cycle_date\`, so that query does not list them.`
+        : '') +
+      ' This summary links only the deterministic sample above.',
+    '',
+  ];
 }

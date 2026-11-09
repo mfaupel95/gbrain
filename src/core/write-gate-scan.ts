@@ -24,6 +24,7 @@ import {
 } from './write-gate.ts';
 import { WRITE_GATE_REASON_FAMILIES, type WriteGateReasonFamily } from './write-gate-patterns.ts';
 import { minTrust } from './trust/tier.ts';
+import { CONNECTOR_KINDS_SQL } from './persistence/connector-kinds.ts';
 
 export type WriteGateScanTable = 'pages' | 'facts' | 'takes' | 'timeline_entries';
 export const WRITE_GATE_SCAN_TABLES: readonly WriteGateScanTable[] = ['pages', 'facts', 'takes', 'timeline_entries'];
@@ -84,7 +85,7 @@ export function projectTier(signals: ReadonlyArray<string | null | undefined>): 
 
 /** Page-level signal on alias `pg` (with sources alias `src`): connector/webhook/clipper -> external, agent channels -> agent. */
 const PAGE_SIGNAL = (pg: string, src: string) => `CASE
-  WHEN ${src}.config->>'kind' IN ('google','github') OR ${pg}.source_kind = 'webhook' OR COALESCE(${pg}.frontmatter, '{}'::jsonb) ? 'source_url' THEN 'external_untrusted'
+  WHEN ${src}.config->>'kind' IN (${CONNECTOR_KINDS_SQL}) OR ${pg}.source_kind = 'webhook' OR COALESCE(${pg}.frontmatter, '{}'::jsonb) ? 'source_url' THEN 'external_untrusted'
   WHEN ${pg}.source_kind LIKE 'mcp:%' OR ${pg}.ingested_via LIKE 'mcp:%' OR ${pg}.source_kind = 'capture-cli'
     OR ${pg}.frontmatter->>'capturedVia' IS NOT NULL OR COALESCE(${pg}.frontmatter, '{}'::jsonb) ? 'transcript_import' THEN 'agent_written'
   END`;
@@ -95,7 +96,7 @@ const REQUEST_SIGNAL = (pr: string) => `CASE
   WHEN ${pr}.intent->>'kind' LIKE 'connector_%' OR ${pr}.intent->>'kind' LIKE 'managed_connector_%' THEN 'external_untrusted'
   WHEN ${pr}.authority->>'remote' = 'true' THEN 'agent_written'
   WHEN ${pr}.intent->>'kind' LIKE 'managed_sync_%' OR ${pr}.intent->>'kind' IN ('managed_file_import','managed_file_repair','canonical_reconcile','managed_grandfather') THEN 'operator_curated'
-  WHEN ${pr}.operation IN ('put_page','capture','edit_page','remember','takes_add','takes_update','takes_supersede','add_timeline_entry','extract_facts','restore_page','revert_version') THEN 'agent_written'
+  WHEN ${pr}.operation IN ('put_page','capture','edit_page','append_page','remember','takes_add','takes_update','takes_supersede','add_timeline_entry','add_link','remove_link','extract_facts','restore_page','revert_version') THEN 'agent_written'
   END`;
 
 /** Fact provenance tags of agent writes and derivers (extraction, backstop, hooks): capped at agent_written. */

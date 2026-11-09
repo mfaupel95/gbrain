@@ -18,6 +18,12 @@
  *     and a repair that changes them is exactly what makes the next sync
  *     re-screen it.
  *
+ * #6712 PR 4b (design v3.2 §3.7, CEO N4): a non-company source's pass adds
+ * nothing here. A pass freezes and admits under the drain lease and its
+ * freeze re-checks each candidate's revision, so busy means its open
+ * requests (the first arm) only; the cursor arm stays for company brains and
+ * for a legacy cursor the first pass has not retired yet.
+ *
  * The read fails closed: a query that throws, or an unfinished cursor whose
  * manifest cannot be read, makes every candidate busy (`unknown` names why).
  * Callers check once when they plan and again at coordinated admission of
@@ -49,7 +55,7 @@ export async function loadRepairBusySet(engine: BrainEngine, sourceId: string, i
   try {
     const pending = await engine.executeRaw<PendingRow>(`SELECT slug, intent->>'path' AS path, intent->>'sourcePath' AS source_path,
         intent->'renameFrom'->>'slug' AS rename_slug, intent->'renameFrom'->>'sourcePath' AS rename_source_path
-      FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL)`, [sourceId]);
+      FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL)`, [sourceId]);
     for (const row of pending) { add(row.path, row.slug); add(row.source_path); add(row.rename_source_path, row.rename_slug); }
     const cursors = await engine.executeRaw<CursorRow>(`SELECT completed_keys->0->>'runId' AS run_id, completed_keys->0->>'index' AS index
       FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true'

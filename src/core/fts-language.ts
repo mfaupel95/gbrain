@@ -22,6 +22,7 @@
  */
 
 import { CJK_SLUG_CHARS } from './cjk.ts';
+import { requireMaintainerPoliciesSql } from './derived-state-maintainers.ts';
 
 const VALID_CONFIG_NAME = /^[a-z][a-z0-9_]*$/;
 const DEFAULT_LANGUAGE = 'english';
@@ -109,6 +110,23 @@ export function applyFtsLanguagePolicy(sql: string): string {
   return sql.replaceAll(`to_tsvector('${DEFAULT_LANGUAGE}',`, `to_tsvector('${lang}',`);
 }
 
+/**
+ * The facts keyword document: fact text plus the entity slug's words, under
+ * a literal text search configuration so `idx_facts_fts` can serve it (an
+ * expression index matches only the same literal configuration, never a
+ * bound parameter). The index (facts/fts-index.ts) and the question-recall
+ * keyword arm both build it here.
+ */
+export function factsFtsDocument(alias: string | null, lang: string = getFtsLanguage()): string {
+  const col = (c: string) => alias ? `${alias}.${c}` : c;
+  return `to_tsvector('${lang}'::regconfig, ${col('fact')} || ' ' || replace(COALESCE(${col('entity_slug')}, ''), '-', ' '))`;
+}
+
+/** The facts keyword GIN index over active facts under `lang`, named `name` (facts/fts-index.ts builds and swaps it). */
+export function factsFtsIndexSql(name: string, lang: string): string {
+  return `CREATE INDEX IF NOT EXISTS ${name} ON facts USING gin (${factsFtsDocument(null, lang)}) WHERE expired_at IS NULL`;
+}
+
 const CJK_CLASS = `[${CJK_SLUG_CHARS}]`;
 
 /**
@@ -132,15 +150,27 @@ $fn$;`;
 export const FTS_CJK_BOUNDARY_REGEX = `${CJK_CLASS}[A-Za-z0-9]|[A-Za-z0-9]${CJK_CLASS}`;
 
 /**
+ * Characters of the page timeline the page keyword vector indexes, and of
+ * the joined timeline entries the trigger adds. A tsvector's lexeme strings
+ * cap at 1 MB; the densest text measured (hyphenated astral and CJK pairs)
+ * yields about 7.5 lexeme bytes per character under Postgres 16, so 65,536 +
+ * 32,768 characters stay under 750 KB with room for the title, while a
+ * diverse multi-MB timeline used to fail the whole page write. Chunk search
+ * still covers the full timeline.
+ */
+export const PAGE_TIMELINE_FTS_MAX_CHARS = 65_536;
+export const PAGE_TIMELINE_ENTRIES_FTS_MAX_CHARS = 32_768;
+
+/**
  * The page keyword vector every sealed writer stores: the title (weight A) and
- * the SANITIZED timeline (weight C, bound by the caller; never the raw column,
- * which can hold private or withdrawn fence text). `title` and `timeline` are
- * SQL expressions. Shared by the seal, the import seal,
- * `reindex-search-vector` and the fts-cjk-boundary migration, so they cannot
- * drift.
+ * the first PAGE_TIMELINE_FTS_MAX_CHARS characters of the SANITIZED timeline
+ * (weight C, bound by the caller; never the raw column, which can hold
+ * private or withdrawn fence text). `title` and `timeline` are SQL
+ * expressions. Shared by the seal, the import seal, `reindex-search-vector`
+ * and the fts-cjk-boundary migration, so they cannot drift.
  */
 export function pageSearchVectorSql(title: string, timeline: string, lang: string = getFtsLanguage()): string {
-  return `setweight(to_tsvector('${lang}',gbrain_fts_input(COALESCE(${title},''))),'A') || setweight(to_tsvector('${lang}',gbrain_fts_input(${timeline}::text)),'C')`;
+  return `setweight(to_tsvector('${lang}',gbrain_fts_input(COALESCE(${title},''))),'A') || setweight(to_tsvector('${lang}',gbrain_fts_input(left(${timeline}::text,${PAGE_TIMELINE_FTS_MAX_CHARS}))),'C')`;
 }
 
 /** The chunk keyword vector, over a row's own columns (`NEW.` in the trigger, bare in a backfill). */
@@ -156,24 +186,36 @@ export function chunkSearchVectorSql(lang: string, row = ''): string {
  * bodies are byte-identical to src/schema.sql's for 'english' (pinned by
  * test/fts-cjk-boundary.test.ts), so the blob replay that every boot runs
  * after a migration leaves the catalog unchanged. #2704: compiled_truth is not
- * indexed (it overflows the 1MB tsvector cap). `SET search_path = pg_catalog,
+ * indexed (it overflows the 1MB tsvector cap); the timeline and the joined
+ * entries are cut to their FTS caps for the same reason, the entries in id
+ * order so the cut is deterministic. A segmented page (Wave B) has a NULL
+ * timeline and indexes its stored `timeline_lead` prefix instead, read only
+ * then because the column is migration-only (v248). `SET search_path = pg_catalog,
  * public` keeps the v120/#1647 hardening, which CREATE OR REPLACE would
  * otherwise reset.
  */
 export function pageSearchVectorTriggerFnSql(lang: string): string {
-  return `CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $$
+  return `CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
   timeline_text TEXT;
+  timeline_lead_text TEXT;
 BEGIN
-  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  IF TG_OP = 'UPDATE' THEN
+    ${requireMaintainerPoliciesSql('timeline_entries', ['SELECT'], '    ')}
+  END IF;
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
+  IF NEW.timeline IS NULL THEN
+    timeline_lead_text := NEW.timeline_lead;
+  END IF;
+
   NEW.search_vector :=
     setweight(to_tsvector('${lang}', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
-    setweight(to_tsvector('${lang}', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
-    setweight(to_tsvector('${lang}', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
+    setweight(to_tsvector('${lang}', gbrain_fts_input(left(coalesce(NEW.timeline, timeline_lead_text, ''), ${PAGE_TIMELINE_FTS_MAX_CHARS}))), 'C') ||
+    setweight(to_tsvector('${lang}', gbrain_fts_input(left(coalesce(timeline_text, ''), ${PAGE_TIMELINE_ENTRIES_FTS_MAX_CHARS}))), 'C');
 
   RETURN NEW;
 END;

@@ -105,7 +105,7 @@ const JSON_ROWS: Record<string, JsonRow> = {
   errors: { ok: ['errors', 'unknown_flag', '--json'], fail: ['errors', 'definitely_not_a_code', '--json'], okOnEmpty: true },
   init: { ok: ['init', '--pglite', '--no-embedding', '--json'], fail: ['init', '--mcp-only', '--json', '--mcp-url', 'http://127.0.0.1:1/mcp'], okOnEmpty: true },
   doctor: { ok: ['doctor', '--json', '--fast'], fail: ['doctor', '--json'] },
-  sync: { ok: ['sync', '--source', 'notes', '--no-pull', '--json'], fail: ['sync', '--source', 'notes', '--json'], failOnBrain: true },
+  sync: { ok: ['sync', '--source', 'notes', '--no-pull', '--json'], fail: ['sync', '--source', 'no-such-source', '--no-pull', '--json'], failOnBrain: true },
   embed: { ok: ['embed', '--stale', '--json'], fail: ['embed', '--all', '--json'], failOnBrain: true },
   'db-repair': { ok: ['db-repair', '--json'], fail: ['db-repair', '--json'], failOnBrain: true, okE2E: 'test/e2e/cli-json-commands-postgres.test.ts' },
   dream: { ok: ['dream', '--json', '--phase', 'lint'], fail: ['dream', '--json', '--phase', 'garbage'] },
@@ -122,8 +122,14 @@ const JSON_ROWS: Record<string, JsonRow> = {
   'apply-migrations': { ok: ['apply-migrations', '--dry-run', '--json'], fail: ['apply-migrations', '--json', '--migration', '9.9.9'], failOnBrain: true },
   // #5575: the backfill dry run is read-only; explaining a ref that names nothing is a not_found envelope.
   trust: { ok: ['trust', 'backfill', '--dry-run', '--json'], fail: ['trust', 'explain', 'f999999', '--json'], failOnBrain: true },
+  // W1 belief ledger: status is read-only; an unknown source is an invalid_params envelope.
+  beliefs: { ok: ['beliefs', 'status', '--source', 'notes', '--json'], fail: ['beliefs', 'status', '--source', 'no-such-source', '--json'], failOnBrain: true },
+  // GBRA-151: the bundle is read-only and bounded; a budget that is not a positive number is an invalid_params envelope.
+  diag: { ok: ['diag', '--json', '--budget-ms', '20000'], fail: ['diag', '--json', '--budget-ms', '0'], failOnBrain: true },
   // D8: the dry run resolves and prints the target without writing; an unwired harness id is a coded refusal.
   setup: { ok: ['setup', 'claude-code', '--dry-run', '--json', '--gbrain-bin', process.execPath], fail: ['setup', 'codex', '--json'], okOnEmpty: true },
+  // Spring-loaded skills: the catalog listing reads the binary only; an unknown skill name is a skill_not_found envelope.
+  'bundled-skill': { ok: ['bundled-skill', '--json'], fail: ['bundled-skill', 'definitely-not-a-skill', '--json'], okOnEmpty: true },
 };
 
 function parsedShape(mode: 'document' | 'ndjson', stdout: string): unknown[] {

@@ -14,15 +14,18 @@
  * Seams: none (the fault hook stays uninstalled); PGLite.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { descriptor, executeOp, parseDescriptor, SessionDrops } from '../scripts/persistence/ops.ts';
+import { descriptor, executeOp, parseDescriptor, SessionDrops, type OpObservation } from '../scripts/persistence/ops.ts';
 import { ReferenceModel } from '../scripts/persistence/model.ts';
 import { crossBoundarySequences, pageBody, randomSchedule } from '../scripts/persistence/generator.ts';
-import { ROBOT_TOPOLOGY, restrict } from '../scripts/persistence/robot-driver.ts';
+import { ROBOT_CONCURRENCY, ROBOT_RANDOM_SEEDS, ROBOT_ROTATION_SEEDS, ROBOT_TOPOLOGY, explorationSeeds, restrict, runRobotPhase, type RobotRun } from '../scripts/persistence/robot-driver.ts';
+import { robotCeilingUse, robotFailure, robotFullGate, robotOverBudget, runValidation, spawnWorker } from '../scripts/persistence/validate.ts';
+import { faultPoint, installFaultHook, type FaultDetail, type FaultPoint } from '../src/core/persistence/fault-points.ts';
 import { shrinkRun } from '../scripts/persistence/shrink.ts';
-import { runSchedule, runSteps } from '../scripts/persistence/crash-robot.ts';
+import { finish, fixedChunks, LEVEL_CHUNK_BYTES, runSchedule, runSteps, seamCounter } from '../scripts/persistence/crash-robot.ts';
+import type { hardenedGitStream } from '../src/core/hardened-git.ts';
 import { installLockOrderTrace, lockOrderReport } from '../scripts/persistence/lock-order.ts';
 import { prepareTopology } from '../scripts/persistence/history-fixture.ts';
 import { claimPersistenceEffect, releaseAbandonedClaims } from '../src/core/persistence/effect-journal.ts';
@@ -60,7 +63,7 @@ describe('generator', () => {
   test('the cross-boundary sequences are always generated', () => {
     expect(crossBoundarySequences(ROBOT_TOPOLOGY).map(s => s.label)).toEqual(['withdrawal_then_stale_publication',
       'overlapping_slugs_two_sources', 'competing_writers_one_page', 'caller_bound_replay', 'authority_change_pending_effects',
-      'sync_and_connector_race_direct_write']);
+      'sync_and_connector_race_direct_write', 'fence_dropped_then_restored']);
   });
   test('a random schedule is a function of its seed and covers every write op', () => {
     expect(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9))).toBe(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9)));
@@ -127,6 +130,57 @@ describe('concurrent connector publish and direct write', () => {
       model.beginStep(true);
       await model.settleGroup([again, racing], [connector, put]);
       expect(model.violations.map(v => v.class)).toEqual(['lost_write']);
+    });
+  }, 120_000);
+});
+
+describe('a sync op whose user commit did not land (run 41092788952)', () => {
+  // The robot ignored git's exit status: a user commit that never landed still ran the sync and was folded as a
+  // committed write of the user's marker, so the group check called the page lost. Another Git process holding the
+  // index lock is the stand-in for whatever refused the commit (CI kept no stderr).
+  const raceOps = () => {
+    const schedule = crossBoundarySequences(ROBOT_TOPOLOGY).find(s => s.label === 'sync_and_connector_race_direct_write')!;
+    const keep = new Set(['sy0', 'sy1', 'sy2']);
+    return { ...schedule, ops: schedule.ops.filter(d => keep.has(d.id)), groups: schedule.groups.filter(g => g.includes('sy1')) };
+  };
+  const gitIn = (root: string) => (...args: string[]) => Bun.spawnSync(['git', '-C', root, ...args], { stdout: 'pipe', stderr: 'pipe' });
+  const gitPath = (root: string, name: string) => gitIn(root)('rev-parse', '--path-format=absolute', '--git-path', name).stdout.toString().trim();
+
+  test('a commit held off by an index lock lands before the sync runs, and the race leaves no violation', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const sync = schedule.ops.find(d => d.id === 'sy1')!;
+      const root = world.roots![sync.source]; const lock = gitPath(root, 'index.lock');
+      world.onSubmit = d => { if (d.id === 'sy1') { writeFileSync(lock, ''); setTimeout(() => rmSync(lock, { force: true }), 300); } };
+      const model = new ReferenceModel(world);
+      world.descriptors = new Map(schedule.ops.map(d => [d.id, d]));
+      await runSteps(world, model, schedule);
+      expect(model.violations).toEqual([]);
+      expect(world.observations.get('sy1')!.status).toBe('committed');
+      expect(gitIn(root)('show', 'HEAD:./notes/alpha.md').stdout.toString()).toContain('Marker: mk-sy1');
+    });
+  }, 120_000);
+
+  test('a commit that cannot land fails the run; the sync is never reported committed', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const sync = schedule.ops.find(d => d.id === 'sy1')!;
+      const root = world.roots![sync.source]; const hook = join(gitPath(root, 'hooks'), 'pre-commit');
+      writeFileSync(hook, '#!/bin/sh\necho "pre-commit refused" >&2\nexit 1\n'); chmodSync(hook, 0o755);
+      await expect(executeOp(world, sync)).rejects.toThrow(/sy1: the user's commit of notes\/alpha did not land \(git commit exit 1\): pre-commit refused/);
+      expect(world.observations.has('sy1')).toBe(false);
+    });
+  }, 120_000);
+
+  test('a committed sync whose marker the page lacks is still a lost write', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const [put, sync] = schedule.ops;
+      const model = new ReferenceModel(world);
+      world.descriptors = new Map(schedule.ops.map(d => [d.id, d]));
+      await runSteps(world, model, { ...schedule, ops: [put], groups: [] });
+      const claimed: OpObservation = { id: sync.id, kind: sync.kind, actor: sync.actor, source: sync.source, requestId: sync.requestId, status: 'committed', values: {}, raw: { status: 'synced' } };
+      model.beginStep(true);
+      await model.observe(sync, claimed);
+      await model.settleGroup([sync], [claimed]);
+      expect(model.violations.map(v => [v.class, v.detail])).toEqual([['lost_write', 'no committed whole-page write of the group is visible in robot-0/notes/alpha']]);
     });
   }, 120_000);
 });
@@ -290,4 +344,428 @@ describe('PGLite releases claims a dead owner left behind', () => {
       expect(row).toEqual({ state: 'queued', token: null });
     });
   }, 60_000);
+});
+
+describe('requested faults are reported, never silently skipped (#6584)', () => {
+  const replayRun = (fault: { point: FaultPoint; nth: number }): RobotRun =>
+    ({ schedule: 'caller_bound_replay', seed: 5105, length: 0, fault, crashed: false, violations: [], duration_ms: 0 });
+  function fakeSpawn(script: Record<string, Record<string, unknown>>[]) {
+    const spawned: { role: string; killed: boolean }[] = [];
+    const spawn = ((_path: string, _home: string, _mode: string, [role]: string[]) => {
+      const events = script[spawned.length] ?? {}; const entry = { role, killed: false }; spawned.push(entry);
+      const event = (name: string) => name in events ? Promise.resolve({ event: name, ...events[name] }) : new Promise<never>(() => {});
+      return { child: { pid: 0 }, event, done: () => event('done'), failureDiagnostics: () => [], async kill() { entry.killed = true; } };
+    }) as unknown as typeof spawnWorker;
+    return { spawn, spawned };
+  }
+  async function phase(spawn: typeof spawnWorker, fault: { point: FaultPoint; nth: number }) {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-fake-'));
+    try {
+      return await runRobotPhase({ engine: 'pglite', seed: 0, seconds: 0, scratch, home: scratch, databases: [],
+        spawn, track: () => {}, replay: [replayRun(fault)], log: () => {} });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  }
+  const clean = { result: { violations: [], deferred: [] } };
+
+  test('faultPoint hands the hook a Postgres bigserial effect id as its decimal string', async () => {
+    const seen: FaultDetail[] = [];
+    installFaultHook((_point, detail) => { seen.push(detail); });
+    try { await faultPoint('effect:git:mid', { effectId: 9007199254740993n, requestId: 'r1' }); }
+    finally { installFaultHook(undefined); }
+    expect(seen).toEqual([{ effectId: '9007199254740993', requestId: 'r1' }]);
+  });
+
+  async function hookChild(detail: string) {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-hook-'));
+    const path = join(dir, 'hook.ts');
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+installFaultHook(robotFaultHook({ point: 'effect:git:mid', nth: 2 }));
+await faultPoint('effect:git:mid', { effectId: 41n });
+${detail}
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const lines: Record<string, unknown>[] = [];
+    try {
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (!lines.length && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      await Bun.sleep(500);
+      return { lines, alive: child.exitCode === null, stderr: child.exitCode === null ? '' : await new Response(child.stderr).text() };
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test('the run hook freezes at the requested seam with a BigInt effect id and reports it', async () => {
+    const { lines, alive, stderr } = await hookChild(`await faultPoint('effect:git:mid', { effectId: 42n, requestId: 'r1' });`);
+    expect({ lines, alive, stderr }).toEqual({ lines: [{ event: 'fault', point: 'effect:git:mid', nth: 2, detail: { effectId: '42', requestId: 'r1' } }], alive: true, stderr: '' });
+  }, 90_000);
+
+  test('a re-run preparation of the same request does not advance nth: count and run agree', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-prep-'));
+    const path = join(dir, 'prep.ts');
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); const counts: Record<string, number> = {};
+installFaultHook((point, detail) => { if (counted(point, detail)) counts[point] = (counts[point] ?? 0) + 1; });
+for (const requestId of ['a', 'a', 'b', 'b', 'b']) await faultPoint('consumer:preparing', { requestId });
+for (const requestId of ['a', 'a']) await faultPoint('publication:after_commit', { requestId });
+for (const writeId of ['w1', 'w1', 'w2']) await faultPoint('consumer:prepared', { requestId: 'shared', writeId });
+process.stdout.write(JSON.stringify({ event: 'counts', counts }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'consumer:preparing', nth: 2 }));
+await faultPoint('consumer:preparing', { requestId: 'a' });
+await faultPoint('consumer:preparing', { requestId: 'a' });
+await faultPoint('consumer:preparing', { requestId: 'b' });
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', counts: { 'consumer:preparing': 2, 'publication:after_commit': 2, 'consumer:prepared': 2 } },
+        { event: 'fault', point: 'consumer:preparing', nth: 2, detail: { requestId: 'b' } },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('#6896: consumer:claiming counts claim epochs, so a run with fewer idle claim passes still reaches every slot the count role saw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-claim-'));
+    const path = join(dir, 'claim.ts');
+    // Count role: busy and idle claim attempts around two preparations (and a re-run one). Run: the same requests, no idle ticks.
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); let slots = 0;
+installFaultHook((point, detail) => { const advanced = counted(point, detail); if (point === 'consumer:claiming') slots += advanced; });
+const claim = () => faultPoint('consumer:claiming');
+const prepare = (writeId: string) => faultPoint('consumer:preparing', { requestId: writeId, writeId });
+await claim(); await claim(); await prepare('w1'); await claim(); await claim(); await claim(); await prepare('w1'); await prepare('w2'); await claim(); await claim();
+process.stdout.write(JSON.stringify({ event: 'counts', slots }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'consumer:claiming', nth: slots }));
+await claim(); await prepare('w1'); await claim(); await prepare('w2'); await claim();
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', slots: 3 },
+        { event: 'fault', point: 'consumer:claiming', nth: 3, detail: {} },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('#7124: sync round seams count in round slots, so a run whose pass makes one round fewer still reaches every slot the count role saw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-rounds-'));
+    const path = join(dir, 'rounds.ts');
+    // Count role: the direct write lands mid-pass, so pass 1 defers its page to round 2 and confirms in round 3. Run: it
+    // lands before the pass, so pass 1 confirms in round 2. Pass 2 is the same in both. A large read arrives in two chunks.
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); const counts: Record<string, number> = {};
+installFaultHook((point, detail) => { const advanced = counted(point, detail); if (advanced) counts[point] = (counts[point] ?? 0) + advanced; });
+const round = async (n: number, reads: string[], work: boolean) => {
+  await faultPoint('sync:round_start', { sourceId: 'robot-0', round: n });
+  for (const read of reads) await faultPoint('sync:level_chunk', { read });
+  await faultPoint('sync:level_read', { sourceId: 'robot-0', round: n });
+  if (work) await faultPoint('sync:batch_entries', { sourceId: 'robot-0' });
+};
+const pass = async (rounds: boolean[]) => { for (const [i, work] of rounds.entries()) await round(i + 1, i ? ['ls-files'] : ['ls-tree', 'ls-tree', 'ls-files'], work); };
+await pass([true, true, false]); await pass([true, false]);
+process.stdout.write(JSON.stringify({ event: 'counts', counts }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'sync:level_chunk', nth: counts['sync:level_chunk'] }));
+await pass([true, false]); await pass([true, false]);
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', counts: { 'sync:round_start': 4, 'sync:level_chunk': 8, 'sync:level_read': 4, 'sync:batch_entries': 2 } },
+        { event: 'fault', point: 'sync:level_chunk', nth: 8, detail: { read: 'ls-files' } },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('#7124: robot workers cut a Git level read at fixed offsets, so its chunk ordinals do not follow the pipe', async () => {
+    const bytes = Buffer.from(Array.from({ length: 1300 }, (_, i) => i % 251));
+    const cut = async (sizes: number[]) => {
+      const pieces: Buffer[] = [];
+      const runner = (async (_root: string, _args: string[], opts: { onChunk?: (chunk: Buffer) => void | Promise<void> }) => {
+        let at = 0;
+        for (const size of sizes) { await opts.onChunk!(bytes.subarray(at, at + size)); at += size; }
+        return { ok: true, bytes: at, endsWithNul: false } as never;
+      }) as unknown as typeof hardenedGitStream;
+      await fixedChunks(runner)('/', ['ls-tree'], { timeoutMs: 1000, onChunk: async chunk => { await Bun.sleep(1); pieces.push(chunk); } });
+      return pieces.map(piece => piece.length);
+    };
+    expect(await cut([1300])).toEqual([LEVEL_CHUNK_BYTES, LEVEL_CHUNK_BYTES, 1300 - 2 * LEVEL_CHUNK_BYTES]);
+    expect(await cut([7, 600, 1, 692])).toEqual(await cut([1300]));
+  });
+
+  test('#6957: finish waits for the claim pass after its probe, so the last claim epoch a count role sees is reached in every run', async () => {
+    await robotBrain(async ({ world }) => {
+      const counted = seamCounter(); const prepared = new Set<string>(); let slots = 0;
+      world.claimPasses = 0;
+      // Every claim pass is slow to start, so the one the consumer makes after the probe commits lands only when finish waits for it.
+      installFaultHook(async (point, detail) => {
+        if (point === 'consumer:preparing' && detail.writeId) prepared.add(detail.writeId);
+        if (point !== 'consumer:claiming') { counted(point, detail); return; }
+        await Bun.sleep(1000);
+        world.claimPasses!++; slots += counted(point, detail);
+      });
+      try { await finish(world, new ReferenceModel(world), 'probe only'); }
+      finally { installFaultHook(undefined); }
+      expect({ prepared: prepared.size, slots }).toEqual({ prepared: 1, slots: 2 });
+    });
+  }, 90_000);
+
+  test('seed 5105: finish drains its probe\'s effects, so the probe\'s effect:git:mid a count role may see is reached in every run', async () => {
+    await robotBrain(async ({ world }) => {
+      const reached: string[] = [];
+      world.claimPasses = 0;
+      // Every effect seam is slow, so the probe's git effect reaches its seam only when finish waits for it.
+      installFaultHook(async (point, detail) => {
+        if (point === 'consumer:claiming') { world.claimPasses!++; return; }
+        if (!point.startsWith('effect:')) return;
+        await Bun.sleep(1500);
+        reached.push(`${point}:${detail.requestId}`);
+      });
+      try { await finish(world, new ReferenceModel(world), 'probe only'); }
+      finally { installFaultHook(undefined); }
+      expect(reached.filter(seam => seam.startsWith('effect:git:mid:'))).toHaveLength(1);
+    });
+  }, 90_000);
+
+  test('a hook that cannot report its fault emits fault_hook_error and still freezes', async () => {
+    const { lines, alive } = await hookChild(`const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never });`);
+    expect(alive).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ event: 'fault_hook_error', point: 'effect:git:mid', nth: 2 });
+    expect(String(lines[0].message)).toMatch(/cyclic|circular/i);
+  }, 90_000);
+
+  test('a worker that finishes before its requested fault fails the run and the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ done: clean }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned.map(s => s.role)).toEqual(['run']);
+    expect(robot.runs[0]).toMatchObject({ crashed: false, fault_not_reached: true });
+    expect({ crashed: robot.crashed_runs, unreached: robot.faults_not_reached.length, failing: robot.failing_runs.length })
+      .toEqual({ crashed: 0, unreached: 1, failing: 1 });
+    expect(robotFullGate(robot, 'full')).toBe(false);
+    expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_not_reached');
+  });
+
+  test('a fault_hook_error kills the worker and fails the run and the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ fault_hook_error: { point: 'effect:git:mid', nth: 1, message: 'JSON.stringify cannot serialize BigInt.' } }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned).toEqual([{ role: 'run', killed: true }]);
+    expect(robot.fault_hook_errors.map(r => r.hook_error)).toEqual(['JSON.stringify cannot serialize BigInt.']);
+    expect(robot.failing_runs).toHaveLength(1);
+    expect(robotFullGate(robot, 'full')).toBe(false);
+    expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_hook_error: JSON.stringify cannot serialize BigInt.');
+  });
+
+  test('control: a reached fault that recovers cleanly keeps the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ fault: { point: 'effect:git:mid', nth: 1 } }, { done: clean }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned).toEqual([{ role: 'run', killed: true }, { role: 'recover', killed: false }]);
+    expect({ crashed: robot.crashed_runs, failing: robot.failing_runs.length }).toEqual({ crashed: 1, failing: 0 });
+    expect(robotFullGate(robot, 'full')).toBe(true);
+  });
+
+  test('hung_git fails loudly when its hung commit never starts, instead of passing without the fault (#8062)', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-hung-'));
+    const children: ReturnType<typeof spawnWorker>[] = [];
+    try {
+      // No ops: nothing commits, so the hung git child never starts.
+      const schedule = crossBoundarySequences(ROBOT_TOPOLOGY, 0)[1]!.label;
+      const robot = await runRobotPhase({ engine: 'pglite', seed: 0, seconds: 0, scratch, home: scratch, databases: [], spawn: spawnWorker,
+        track: child => { children.push(child); }, log: () => {},
+        replay: [{ schedule, seed: 0, length: 0, ops: [], process: 'hung_git', crashed: false, violations: [], duration_ms: 0 }] });
+      expect(robot.violations.map(v => `${v.class}: ${v.detail}`)).toEqual(['wedge: hung_git: the hung commit never started']);
+      expect(robot.failing_runs).toHaveLength(1);
+    } finally {
+      await Promise.allSettled(children.map(child => child.kill()));
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  test('validation exits nonzero when a replayed fault is never reached by a real worker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-unreached-'));
+    try {
+      const manifest = join(dir, 'manifest.json');
+      writeFileSync(manifest, JSON.stringify({ engine: 'pglite', robot: { runs: [replayRun({ point: 'effect:git:mid', nth: 9999 })] } }));
+      const out = join(dir, 'out.json');
+      const error = await runValidation({ engine: 'pglite', replay: manifest, manifest: out }).then(() => null, (e: Error) => e);
+      expect(error?.message).toContain('fault_not_reached');
+      expect(JSON.parse(readFileSync(out, 'utf8'))).toMatchObject({ status: 'failed', full_gate: false });
+      rmSync(JSON.parse(readFileSync(`${out}.retained.json`, 'utf8')).scratch_root, { recursive: true, force: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
+});
+
+describe('every robot run covers a fixed schedule list (reuse of a passed run is sound)', () => {
+  const COUNTS = { 'consumer:claiming': 2, 'effect:git:mid': 1 };
+  const clean = { violations: [], deferred: [] };
+  /** A small deterministic hash, so each schedule (and each run) gets its own counts and delay. */
+  const hash = (text: string) => [...text].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7);
+  /** Seams and counts that differ by schedule: a run planned from another schedule's counts crashes a different seam or nth. */
+  const countsByLabel = (label: string): Record<string, number> => {
+    const h = hash(label);
+    return { 'consumer:claiming': 1 + (h % 3), 'effect:git:mid': 1 + ((h >>> 3) % 2), ...(h % 2 ? { 'publication:prepared': 1 + ((h >>> 5) % 4) } : {}) };
+  };
+  async function plan(o: { engine?: 'pglite' | 'postgres'; seconds: number; scope?: 'pr' | 'full'; extraSeeds?: number[]; concurrency?: number;
+    workerMs?: number | ((call: { schedule: string; role: string; point?: string; process?: string }) => number); counts?: (label: string) => Record<string, number> }) {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-plan-'));
+    const calls: { schedule: string; role: string; point?: string; process?: string }[] = [];
+    const finished: string[] = [];
+    let inFlight = 0; let widest = 0;
+    const spawn = ((path: string, _home: string, _mode: string, [role]: string[]) => {
+      const config = JSON.parse(readFileSync(path, 'utf8'));
+      const call = { schedule: config.schedule.label, role, ...(config.fault ? { point: config.fault.point } : {}), ...(config.process ? { process: config.process } : {}) };
+      calls.push(call);
+      if (role !== 'recover') widest = Math.max(widest, ++inFlight);
+      const events: Record<string, unknown> = role === 'count' ? { done: { result: { ...clean, counts: (o.counts ?? (() => COUNTS))(config.schedule.label) } } }
+        : role === 'run' && config.fault ? { fault: config.fault } : { done: { result: clean } };
+      const event = async (name: string) => {
+        if (!(name in events)) return new Promise<never>(() => {});
+        await Bun.sleep(typeof o.workerMs === 'function' ? o.workerMs(call) : o.workerMs ?? 0);
+        if (name === 'done' && role !== 'recover' || name === 'fault') { inFlight--; finished.push(JSON.stringify(call)); }
+        return { event: name, ...(events[name] as object) };
+      };
+      return { child: { pid: 0 }, event, done: () => event('done'), failureDiagnostics: () => [], async kill() {} };
+    }) as unknown as typeof spawnWorker;
+    try {
+      const robot = await runRobotPhase({ engine: o.engine ?? 'pglite', seed: 0, seconds: o.seconds, scope: o.scope, extraSeeds: o.extraSeeds,
+        concurrency: o.concurrency, scratch, home: scratch, databases: [], spawn, track: () => {}, log: () => {} });
+      return { robot, calls, widest, finished };
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  }
+  const randomLabels = (calls: { schedule: string; role: string }[]) => [...new Set(calls.filter(c => c.schedule.startsWith('random-')).map(c => c.schedule))];
+
+  test('the random sequences are ROBOT_RANDOM_SEEDS, each counted and crashed (and recovered) once, whatever the ceiling', async () => {
+    const short = await plan({ seconds: 1 });
+    const long = await plan({ seconds: 600 });
+    expect(randomLabels(short.calls)).toEqual(ROBOT_RANDOM_SEEDS.map(seed => `random-${seed}`));
+    expect(short.calls).toEqual(long.calls);
+    for (const label of randomLabels(short.calls)) expect(short.calls.filter(c => c.schedule === label).map(c => c.role)).toEqual(['count', 'run', 'recover']);
+  });
+
+  test('a full PGLite run crashes every seam of every sequence; a pr run and Postgres crash each seam once', async () => {
+    const fixed = crossBoundarySequences(ROBOT_TOPOLOGY, 0).map(s => s.label);
+    const fixedCrashes = (calls: { schedule: string; role: string; point?: string; process?: string }[]) => calls.filter(c => fixed.includes(c.schedule) && c.role === 'run' && c.point && !c.process);
+    expect(fixedCrashes((await plan({ seconds: 1 })).calls)).toHaveLength(fixed.length * Object.keys(COUNTS).length);
+    expect(fixedCrashes((await plan({ seconds: 1, scope: 'pr' })).calls)).toHaveLength(Object.keys(COUNTS).length);
+    expect(fixedCrashes((await plan({ engine: 'postgres', seconds: 1 })).calls)).toHaveLength(Object.keys(COUNTS).length);
+  });
+
+  test('Postgres random crashes avoid the lease-bound seams; a pr run skips them in the fixed sequences', async () => {
+    const full = await plan({ engine: 'postgres', seconds: 1 });
+    expect(full.calls.filter(c => c.schedule.startsWith('random-') && c.role === 'run').map(c => c.point)).toEqual(ROBOT_RANDOM_SEEDS.map(() => 'consumer:claiming'));
+    expect((full.robot as { lease_bound_seams_skipped?: string[] }).lease_bound_seams_skipped).toEqual([]);
+    expect(((await plan({ engine: 'postgres', seconds: 1, scope: 'pr' })).robot as { lease_bound_seams_skipped?: string[] }).lease_bound_seams_skipped).toEqual(['effect:git:mid']);
+  });
+
+  test('runs execute ROBOT_CONCURRENCY at a time and cover exactly the runs, faults and manifest order of one at a time (#8036)', async () => {
+    const key = (r: RobotRun) => JSON.stringify([r.schedule, r.seed, r.fault ?? null, r.process ?? null]);
+    // Each schedule reports its own seams and counts, and each run takes its own time, so runs finish out of order
+    // and a result stored against the wrong schedule or index changes the plan (#8062).
+    const workerMs = (call: { schedule: string; role: string; point?: string; process?: string }) => hash(JSON.stringify(call)) % 7;
+    for (const o of [{ engine: 'pglite' as const }, { engine: 'postgres' as const }, { engine: 'postgres' as const, scope: 'pr' as const }]) {
+      const serial = await plan({ ...o, seconds: 600, extraSeeds: explorationSeeds(20_000), concurrency: 1, workerMs, counts: countsByLabel });
+      const parallel = await plan({ ...o, seconds: 600, extraSeeds: explorationSeeds(20_000), workerMs, counts: countsByLabel });
+      expect({ serial: serial.widest, parallel: parallel.widest }).toEqual({ serial: 1, parallel: ROBOT_CONCURRENCY });
+      expect(parallel.finished).not.toEqual(parallel.calls.filter(c => c.role !== 'recover').map(c => JSON.stringify(c)));
+      expect(parallel.robot.runs.map(key)).toEqual(serial.robot.runs.map(key));
+      expect([...parallel.calls].map(c => JSON.stringify(c)).sort()).toEqual([...serial.calls].map(c => JSON.stringify(c)).sort());
+    }
+  });
+
+  test('a failing run stops every lane from taking another job (#8062)', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-failfast-'));
+    const [first, second] = crossBoundarySequences(ROBOT_TOPOLOGY, 0).map(s => s.label);
+    const spawned: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const spawn = ((path: string, _home: string, _mode: string, [role]: string[]) => {
+      const label = JSON.parse(readFileSync(path, 'utf8')).schedule.label as string;
+      spawned.push(`${label}:${role}`);
+      const result = { event: 'done', result: { ...clean, counts: COUNTS } };
+      const done = label === first ? held.then(() => result) : label === second ? Promise.reject(new Error('worker crashed')) : Promise.resolve(result);
+      done.catch(() => {});
+      return { child: { pid: 0 }, event: () => done, done: () => done, failureDiagnostics: () => [], async kill() {} };
+    }) as unknown as typeof spawnWorker;
+    try {
+      const error = await runRobotPhase({ engine: 'pglite', seed: 0, seconds: 600, concurrency: 2, scratch, home: scratch, databases: [], spawn, track: () => {}, log: () => {} })
+        .then(() => null, (e: Error) => e);
+      expect(error?.message).toBe('worker crashed');
+      // The other lane's run finishes after the failure; it must not start the next job.
+      release();
+      // gstack-timing-ok: an absence check (the released lane must not start a job); there is no event to await
+      await Bun.sleep(100);
+      expect(spawned).toEqual([`${first}:count`, `${second}:count`]);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  test('a run past its ceiling is over_budget, and validation fails it loudly', async () => {
+    expect((await plan({ seconds: 0.001 })).robot).toMatchObject({ over_budget: true });
+    expect((await plan({ seconds: 600 })).robot).toMatchObject({ over_budget: false });
+    expect(robotOverBudget(1_234_000, 960)).toMatch(/over its ceiling: ran 1234 s against --robot-seconds=960/);
+  });
+
+  test('each cell reports its elapsed time as a share of its ceiling for the job summary', () => {
+    expect(robotCeilingUse('pglite', 'full', 880_400, 1200)).toBe('Crash robot pglite (full): 880 s of its 1200 s ceiling (73%)\n');
+    expect(robotCeilingUse('postgres', 'pr', 1_900_000, 1800)).toBe('Crash robot postgres (pr): 1900 s of its 1800 s ceiling (106%)\n');
+  });
+
+  test('the nightly adds one rotation seed (each within four nights) and one never-run seed after the fixed list', async () => {
+    const days = [0, 1, 2, 3].map(d => explorationSeeds(20_000 + d));
+    expect(new Set(days.map(([rotation]) => rotation))).toEqual(new Set(ROBOT_ROTATION_SEEDS));
+    expect(new Set(days.map(([, fresh]) => fresh)).size).toBe(4);
+    for (const [, fresh] of days) expect(fresh).toBeGreaterThan(Math.max(...ROBOT_RANDOM_SEEDS, ...ROBOT_ROTATION_SEEDS));
+    const { calls } = await plan({ seconds: 1, extraSeeds: days[0] });
+    expect(randomLabels(calls)).toEqual([...ROBOT_RANDOM_SEEDS, ...days[0]!].map(seed => `random-${seed}`));
+  });
 });

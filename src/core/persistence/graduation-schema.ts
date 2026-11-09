@@ -118,6 +118,30 @@ export async function readGraduationRow(engine: BrainEngine, opts: { forUpdate?:
   };
 }
 
+/**
+ * The connect gate's read of the custody row in one statement (#7147): every CLI call pays this read before its
+ * work, so it reads the row directly and treats only an undefined table (42P01, a brain before the migration) as "no
+ * row" instead of probing for the table first. Outside a transaction only: a failed statement would abort one.
+ */
+export async function readGraduationConnectRow(engine: BrainEngine): Promise<Pick<GraduationRow, 'role' | 'run_id' | 'state' | 'source_data_dir'> | null> {
+  let row: Record<string, unknown> | undefined;
+  try {
+    [row] = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT role, run_id::text AS run_id, state, source_data_dir FROM persistence_graduation WHERE singleton = 1`);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return null;
+    throw error;
+  }
+  tablePresent.add(rootEngine(engine));
+  if (!row) return null;
+  return {
+    role: row.role as GraduationRow['role'],
+    run_id: String(row.run_id),
+    state: row.state as GraduationRow['state'],
+    source_data_dir: (row.source_data_dir as string | null) ?? null,
+  };
+}
+
 /** Run `fn` in one transaction that carries the run's identity, so the fence admits its writes. */
 export async function withGraduationRun<T>(engine: BrainEngine, runId: string, fn: (tx: BrainEngine) => Promise<T>): Promise<T> {
   return engine.transaction(async tx => {

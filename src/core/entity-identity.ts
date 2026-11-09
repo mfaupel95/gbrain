@@ -14,6 +14,8 @@
  *   - MANUAL-ONLY. Rows come exclusively from the entity_identity_link op.
  *     No auto-matching, no name-similarity heuristics — a wrong identity
  *     merge silently corrupts retrieval, so v1 keeps a human in the loop.
+ *     Near names are only flagged for review (entities/near-name.ts,
+ *     extraction_pending possible_duplicates); nothing here is written from them.
  *   - A page belongs to at most one identity (UNIQUE (source_id, page_id));
  *     re-linking MOVES it.
  *   - Retrieval union is OFF by default, gated by the
@@ -28,8 +30,8 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { Link } from './types.ts';
-import { isUndefinedTableError } from './utils.ts';
-import { privatePagesFilterFragment } from './search/private-visibility.ts';
+import { isMissingSchemaObject } from './utils.ts';
+import { privatePagesFilterForCaller } from './search/private-visibility.ts';
 
 /** Config key for the flag-gated retrieval union. Default OFF. */
 export const ENTITY_IDENTITY_UNION_CONFIG_KEY = 'entity_identity.union';
@@ -176,7 +178,7 @@ export async function listEntityIdentities(
   const params: unknown[] = [];
   const allowedSources = opts.allowedSources?.length ? opts.allowedSources
     : opts.sourceId ? [opts.sourceId] : undefined;
-  if (opts.excludePrivate) where.push(privatePagesFilterFragment('p'));
+  if (opts.excludePrivate) where.push(privatePagesFilterForCaller('p'));
   if (opts.entityId) {
     params.push(validateEntityId(opts.entityId));
     where.push(`ei.entity_id = $${params.length}`);
@@ -200,7 +202,7 @@ export async function listEntityIdentities(
       });
       seedScope += ` AND ei2.source_id IN (${ph.join(', ')})`;
     }
-    if (opts.excludePrivate) seedScope += ` AND ${privatePagesFilterFragment('p2')}`;
+    if (opts.excludePrivate) seedScope += ` AND ${privatePagesFilterForCaller('p2')}`;
     where.push(`ei.entity_id IN (
       SELECT ei2.entity_id FROM entity_identities ei2
       JOIN pages p2 ON p2.id = ei2.page_id AND p2.source_id = ei2.source_id
@@ -245,7 +247,7 @@ export async function listEntityIdentities(
     }));
   } catch (e) {
     // Pre-v137 brain (table missing): identity is simply "not set up yet".
-    if (isUndefinedTableError(e)) return [];
+    if (isMissingSchemaObject(e, 'table', 'entity_identities')) return [];
     throw e;
   }
 }
@@ -270,7 +272,7 @@ export async function identityIdsForPages(
     );
     return new Map(rows.map((r): [string, string] => [`${r.source_id}:${r.slug}`, r.entity_id]).filter(([k]) => wanted.has(k)));
   } catch (e) {
-    if (isUndefinedTableError(e)) return new Map();
+    if (isMissingSchemaObject(e, 'table', 'entity_identities')) return new Map();
     throw e;
   }
 }
@@ -307,7 +309,11 @@ export async function unionLinksAcrossIdentity(
   slug: string,
   links: Link[],
   direction: 'out' | 'in',
-  opts: { sourceId?: string; allowedSources?: string[]; excludePrivate?: boolean; temporal?: import('./link-validity.ts').EdgeTemporalOpts } = {},
+  opts: {
+    sourceId?: string; allowedSources?: string[]; excludePrivate?: boolean; temporal?: import('./link-validity.ts').EdgeTemporalOpts;
+    /** #6876: the caller's keyset page, applied to each member read; `onMemberRead` sees each member's rows before the merge. */
+    page?: import('./link-validity.ts').LinkReadPage; onMemberRead?: (rows: Link[]) => void;
+  } = {},
 ): Promise<Link[]> {
   if (!(await isIdentityUnionEnabled(engine))) return links;
   let members: EntityIdentityMember[];
@@ -346,10 +352,12 @@ export async function unionLinksAcrossIdentity(
         ...(opts.allowedSources?.length ? { sourceIds: opts.allowedSources } : {}),
         excludePrivate: opts.excludePrivate,
         ...(opts.temporal ? { temporal: opts.temporal } : {}),
+        ...(opts.page ? { page: opts.page } : {}),
       };
       const memberLinks = direction === 'out'
         ? await engine.getLinks(m.slug, memberScope)
         : await engine.getBacklinks(m.slug, memberScope);
+      opts.onMemberRead?.(memberLinks);
       for (const l of memberLinks) {
         // Federated engine reads span same-slug pages across the grant. Keep
         // this identity member's concrete pair, not a same-slug non-member.

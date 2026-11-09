@@ -26,7 +26,7 @@
  * `shutdownSignal` so deploy restarts don't interrupt them mid-flight.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from '../../spawn.ts';
 import { StringDecoder } from 'node:string_decoder';
 import type { MinionJobContext } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
@@ -34,7 +34,7 @@ import { deriveEnvKey, resolveInheritValue } from './shell-inherit.ts';
 import { validateShellJobParams } from './shell-validate.ts';
 import { redactSecretsInText } from './shell-redact.ts';
 import { loadConfig } from '../../config.ts';
-import { killProcessGroup, processGroupAlive } from '../job-isolation.ts';
+import { killProcessGroup, processGroupAlive, signalProcessTree } from '../job-isolation.ts';
 
 /** Environment variables passed through to shell children by default. Callers
  *  that need additional keys (e.g. a specific API token for a cron) must name
@@ -49,6 +49,11 @@ const STDERR_TAIL_MAX_BYTES = 16 * 1024;
 /** Grace period between SIGTERM and SIGKILL. Well-behaved scripts catch SIGTERM,
  *  flush state, exit cleanly; non-behaving scripts get reaped. */
 const KILL_GRACE_MS = 5000;
+
+/** After the job's process group is gone, how long to wait for stdout/stderr to reach EOF. `'exit'`
+ *  can fire before the last chunk is read; only `'close'` means the pipes ended. A process that left
+ *  the group (setsid) and still holds a pipe gets this long before the tails are taken without it. */
+const STDIO_DRAIN_MS = 2000;
 
 export interface ShellJobParams {
   /** Shell command. Spawned via `/bin/sh -c cmd`. Exactly one of cmd or argv is required. */
@@ -266,7 +271,8 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
 
   // #5062: on POSIX the job runs in its own process group, so termination
   // reaches every descendant (a shell's children and grandchildren), not
-  // only the direct child. Windows keeps the direct-child kill path.
+  // only the direct child. Windows signals the tree under the direct child
+  // with taskkill (signalProcessTree), and liveness is the direct child's.
   const ownGroup = process.platform !== 'win32';
   let proc: ChildProcess;
   try {
@@ -304,6 +310,7 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
       killProcessGroup(pgid, signal);
       return;
     }
+    if (process.platform === 'win32' && (signalProcessTree(pid, signal) !== 'failed' || signal === 'SIGTERM')) return;
     try { proc.kill(signal); } catch { /* proc already exited */ }
   };
   const stdoutTail = new TailBuffer(STDOUT_TAIL_MAX_BYTES);
@@ -311,6 +318,7 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
 
   proc.stdout?.on('data', (c: Buffer) => stdoutTail.append(c));
   proc.stderr?.on('data', (c: Buffer) => stderrTail.append(c));
+  const stdioClosed = new Promise<void>(resolve => proc.on('close', () => resolve()));
 
   // Wire BOTH signals to the kill sequence. `ctx.signal` fires on timeout /
   // cancel / lock-loss; `ctx.shutdownSignal` fires only on worker SIGTERM/SIGINT.
@@ -356,6 +364,9 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
     // SIGTERM) is terminated and confirmed gone before the job settles.
     await reapTree(treeAlive, signalTree);
   });
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([stdioClosed, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, STDIO_DRAIN_MS); })]);
+  clearTimeout(drainTimer);
 
   const duration_ms = Date.now() - startedAt;
   // Assemble tails, then optionally scrub resolved inherit values out before

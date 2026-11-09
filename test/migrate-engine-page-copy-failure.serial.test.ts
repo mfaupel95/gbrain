@@ -56,9 +56,11 @@ describe('copyPageToTarget — undefined-column normalization (#3194)', () => {
       // #4527: copyPageToTarget restores the source row's timestamps via a
       // raw UPDATE right after putPage.
       executeRaw: async () => [],
+      setPageAliases: async () => {}, // #6286: frontmatter aliases travel with the page
     } as unknown as BrainEngine;
     const source = {
       getChunksWithEmbeddings: async () => [],
+      executeRaw: async () => [], // #6286: the copier reads the source row's origin and provenance columns
       getTags: async () => [],
       getTimeline: async () => [],
       getRawData: async () => [],
@@ -101,9 +103,11 @@ describe('copyPageToTarget — undefined-column normalization (#3194)', () => {
       // #4527: copyPageToTarget restores the source row's timestamps via a
       // raw UPDATE right after putPage.
       executeRaw: async () => [],
+      setPageAliases: async () => {}, // #6286: frontmatter aliases travel with the page
     } as unknown as BrainEngine;
     const source = {
       getChunksWithEmbeddings: async () => [],
+      executeRaw: async () => [], // #6286: the copier reads the source row's origin and provenance columns
       getTags: async () => [],
       getTimeline: async () => [],
       getRawData: async () => [],
@@ -227,7 +231,7 @@ describe('runMigrateEngine — per-page failures are surfaced, not swallowed (#3
       if (source) await source.disconnect();
       if (verifyEngine) await verifyEngine.disconnect();
       _resetCliExitVerdictForTests();
-      process.exitCode = prevExitCode;
+      process.exitCode = prevExitCode ?? 0;
       if (prevGbrainHome !== undefined) process.env.GBRAIN_HOME = prevGbrainHome; else delete process.env.GBRAIN_HOME;
       if (prevDatabaseUrl !== undefined) process.env.DATABASE_URL = prevDatabaseUrl;
       if (prevGbrainDatabaseUrl !== undefined) process.env.GBRAIN_DATABASE_URL = prevGbrainDatabaseUrl;
@@ -307,7 +311,7 @@ describe('runMigrateEngine — per-page failures are surfaced, not swallowed (#3
       if (source) await source.disconnect();
       if (verifyEngine) await verifyEngine.disconnect();
       _resetCliExitVerdictForTests();
-      process.exitCode = prevExitCode;
+      process.exitCode = prevExitCode ?? 0;
       if (prevGbrainHome !== undefined) process.env.GBRAIN_HOME = prevGbrainHome; else delete process.env.GBRAIN_HOME;
       if (prevDatabaseUrl !== undefined) process.env.DATABASE_URL = prevDatabaseUrl;
       if (prevGbrainDatabaseUrl !== undefined) process.env.GBRAIN_DATABASE_URL = prevGbrainDatabaseUrl;
@@ -372,7 +376,7 @@ describe('runMigrateEngine — per-page failures are surfaced, not swallowed (#3
       if (source) await source.disconnect();
       if (verifyEngine) await verifyEngine.disconnect();
       _resetCliExitVerdictForTests();
-      process.exitCode = prevExitCode;
+      process.exitCode = prevExitCode ?? 0;
       if (prevGbrainHome !== undefined) process.env.GBRAIN_HOME = prevGbrainHome; else delete process.env.GBRAIN_HOME;
       if (prevDatabaseUrl !== undefined) process.env.DATABASE_URL = prevDatabaseUrl;
       if (prevGbrainDatabaseUrl !== undefined) process.env.GBRAIN_DATABASE_URL = prevGbrainDatabaseUrl;

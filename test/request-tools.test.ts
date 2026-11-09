@@ -158,7 +158,7 @@ describe('request_tools catalog (no args)', () => {
     // catalog includes them alongside the submit_agent/get_agent_job pair.
     expect(names).toEqual([
       'cancel_job', 'get_agent_job', 'get_job', 'get_job_progress',
-      'list_jobs', 'request_tools', 'submit_agent',
+      'list_jobs', 'request_tools', 'submit_agent', 'wait_job',
     ]);
   });
 
@@ -198,6 +198,18 @@ describe('request_tools {tools: [...]} descriptor fetch (D5)', () => {
     expect(body.tools[0].inputSchema.properties.slug).toBeDefined();
     const raw = res.content[0].text;
     expect(raw).not.toContain('no_such_tool_xyz');
+  });
+
+  test('a starter ceiling still returns every parameter the starter tool list omits (GBRA-156)', async () => {
+    const res = await dispatchToolCall(engine, 'request_tools', { tools: ['get_page', 'capture', 'query'] }, {
+      ...HTTP, surfaceCeiling: 'starter',
+    });
+    const body = parsed(res);
+    const byName = new Map(body.tools.map((t: { name: string; inputSchema: { properties: Record<string, unknown> } }) => [t.name, t.inputSchema.properties]));
+    for (const name of ['get_page', 'capture', 'query']) {
+      const op = operations.find(o => o.name === name)!;
+      expect(Object.keys(byName.get(name) as Record<string, unknown>).sort(), name).toEqual(Object.keys(op.params).sort());
+    }
   });
 });
 

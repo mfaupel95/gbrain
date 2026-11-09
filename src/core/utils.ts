@@ -6,6 +6,8 @@ import type { StaleTakeRow } from './takes-row-types.ts';
 // truth for the hash-ephemeral frontmatter keys shared with the importer.
 import { QUARANTINE_KEY, CONTENT_FLAG_KEY } from './quarantine.ts';
 import { EMBED_SKIP_KEY } from './embed-skip.ts';
+import { guardSegmentedBody } from './page-body/page-shape.ts';
+import type { BodyStorage } from './page-body/types.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -117,21 +119,34 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
  * callers usually leave them inside — both now hash identically).
  */
 export function contentHash(page: PageInput): string {
-  const fm: Record<string, unknown> = { ...(page.frontmatter || {}) };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete fm[k];
-  const rawTags = page.tags ?? fm.tags;
-  delete fm.tags;
-  const tags = Array.isArray(rawTags) ? rawTags.map(t => String(t)).sort() : [];
+  const { frontmatter, tags } = contentHashFrontmatterAndTags(page);
   return createHash('sha256')
     .update(JSON.stringify({
       title: page.title,
       type: page.type,
       compiled_truth: page.compiled_truth,
       timeline: page.timeline || '',
-      frontmatter: fm,
+      frontmatter,
       tags,
     }))
     .digest('hex');
+}
+
+/**
+ * The `frontmatter*` and `tags*` members of the content hash envelope: a copy
+ * of the frontmatter without HASH_EPHEMERAL_FRONTMATTER_KEYS and `tags`, and
+ * `page.tags ?? frontmatter.tags` as sorted strings. Shared with the streamed
+ * form (page-body/content-hash-stream.ts) so both hash identical bytes.
+ */
+export function contentHashFrontmatterAndTags(page: Pick<PageInput, 'frontmatter' | 'tags'>): {
+  frontmatter: Record<string, unknown>;
+  tags: string[];
+} {
+  const fm: Record<string, unknown> = { ...(page.frontmatter || {}) };
+  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete fm[k];
+  const rawTags = page.tags ?? fm.tags;
+  delete fm.tags;
+  return { frontmatter: fm, tags: Array.isArray(rawTags) ? rawTags.map(t => String(t)).sort() : [] };
 }
 
 /**
@@ -217,15 +232,17 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
     ? undefined
     : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
-  return {
+  const segmented = row.body_storage === 'segmented';
+  const page: Page = {
     id: row.id as number,
     slug: row.slug as string,
     type: row.type as string,
     title: row.title as string,
-    compiled_truth: row.compiled_truth as string,
-    timeline: row.timeline as string,
+    compiled_truth: segmented ? '' : row.compiled_truth as string,
+    timeline: segmented ? '' : row.timeline as string,
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
+    ...(segmented && { body_storage: row.body_storage as BodyStorage, body_bytes: row.body_bytes == null ? null : Number(row.body_bytes) }),
     ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
     ...(row.knowledge_revision != null && { knowledge_revision: String(row.knowledge_revision) }),
     ...(row.text_projection_revision !== undefined && { text_projection_revision: row.text_projection_revision as string | null }),
@@ -245,6 +262,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // optional read; absent SELECT projections compile unchanged.
     ...(sourceKind !== undefined && { source_kind: sourceKind }),
     ...(sourceUri !== undefined && { source_uri: sourceUri }),
+    ...(row.withheld_source_path !== undefined && { withheld_source_path: row.withheld_source_path as string | null }),
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
@@ -260,6 +278,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // silently mis-attribute).
     source_id: (row.source_id as string | undefined) ?? 'default',
   };
+  return segmented ? guardSegmentedBody(page, 'rowToPage') : page;
 }
 
 /**
@@ -382,6 +401,34 @@ export function isUndefinedTableError(error: unknown): boolean {
 }
 
 /**
+ * #6599: strict old-schema predicate. True only when the error names exactly
+ * one of `names` as a missing table (42P01) or column (42703). With a SQLSTATE
+ * present, the code must match and the named object must too (driver metadata
+ * `table_name`/`column_name` wins over message text); a driver that drops the
+ * code is accepted only on the exact PostgreSQL/PGLite diagnostic. Unlike
+ * `isUndefinedColumnError`, a different missing object, a permission error or
+ * a data error that merely mentions the name never reads as "not migrated yet".
+ */
+export function isMissingSchemaObject(error: unknown, kind: 'table' | 'column', names: string | readonly string[]): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const wanted = new Set(typeof names === 'string' ? [names] : names);
+  const err = error as Record<string, unknown>;
+  const code = err.code === undefined || err.code === null ? '' : String(err.code);
+  if (code && code !== (kind === 'table' ? '42P01' : '42703')) return false;
+  if (code) {
+    const identifiers = (kind === 'table' ? ['table_name', 'table'] : ['column_name', 'column'])
+      .map(field => err[field]).filter((value): value is string => typeof value === 'string');
+    if (identifiers.length) return identifiers.every(identifier => wanted.has(identifier));
+  }
+  const message = typeof err.message === 'string' ? err.message.trim() : '';
+  const match = kind === 'table'
+    ? /^relation "([^"]+)" does not exist$/.exec(message)
+    : /^column (?:"([^"]+)"|([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?))(?: of relation "[^"]+")? does not exist$/.exec(message);
+  const identifier = match?.[1] ?? match?.[2];
+  return identifier !== undefined && wanted.has(identifier.split('.').pop()!);
+}
+
+/**
  * SQLSTATE 22007 / 22008: a date or timestamp the database could not parse.
  * On a read path that is the caller's input, never a degraded result or a
  * server fault: list_pages reports it as invalid_params and the hybrid
@@ -402,9 +449,21 @@ const _warnedKeys = new Set<string>();
  * Test seam: `_resetWarnOnceForTests()` clears the set so per-process
  * warn-once contracts can be reasserted across test cases.
  */
+let warnOnceScope: (() => Set<string> | undefined) | null = null;
+
+/**
+ * A resident serve answering for a one-shot CLI (the warm CLI socket) gives
+ * each request its own once-set, so the CLI sees the warnings its own process
+ * would have printed.
+ */
+export function setWarnOnceScope(scope: () => Set<string> | undefined): void {
+  warnOnceScope = scope;
+}
+
 export function warnOncePerProcess(key: string, message: string): void {
-  if (_warnedKeys.has(key)) return;
-  _warnedKeys.add(key);
+  const warned = warnOnceScope?.() ?? _warnedKeys;
+  if (warned.has(key)) return;
+  warned.add(key);
   console.warn(message);
 }
 
@@ -457,6 +516,10 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
     modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
+    ...(includeEmbedding && row.embedding_image != null && { embedding_image: parseEmbedding(row.embedding_image) }),
+    // v244: projected UTF-8 span (bigint on Postgres); only when the SELECT carried the column.
+    ...(row.projected_byte_start !== undefined && { projected_byte_start: row.projected_byte_start == null ? null : Number(row.projected_byte_start) }),
+    ...(row.projected_byte_end !== undefined && { projected_byte_end: row.projected_byte_end == null ? null : Number(row.projected_byte_end) }),
     // Only present when the SELECT included it (getChunks); undefined elsewhere
     // so callers can tell "not selected" from "vector present".
     ...(row.embedding_is_null !== undefined && { embedding_is_null: Boolean(row.embedding_is_null) }),
@@ -626,4 +689,19 @@ export function staleTakeRowToRow(row: Record<string, unknown>): StaleTakeRow {
  */
 export function bigintToStringReplacer(_key: string, value: unknown): unknown {
   return typeof value === 'bigint' ? value.toString() : value;
+}
+
+/**
+ * A strict ISO 8601 date or time in years 0001-9999: YYYY-MM-DD, or that with THH:MM[:SS[.fraction]] and an optional
+ * Z or ±HH:MM offset, naming a real calendar day and time. Date.parse alone admits '2026-02-30', 'March 3' and year
+ * 10000, which the database refuses or moves.
+ */
+export function isStrictIsoDateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-](\d{2}):(\d{2}))?)?$/.exec(value);
+  if (!m) return false;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const days = [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1]!) return false;
+  return Number(m[4] ?? 0) <= 23 && Number(m[5] ?? 0) <= 59 && Number(m[6] ?? 0) <= 59 && Number(m[7] ?? 0) <= 23 && Number(m[8] ?? 0) <= 59;
 }

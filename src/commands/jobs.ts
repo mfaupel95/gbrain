@@ -38,6 +38,7 @@ import { makeSyncHandler } from '../core/minions/handlers/sync.ts';
 import { makeUnifyTypesHandler } from '../core/minions/handlers/unify-types.ts';
 import { runJobsAuthorizeLegacy } from './jobs/authorize-legacy.ts';
 import { runJobsSubmit } from './jobs/submit.ts';
+import { runJobsWait } from './jobs/wait.ts';
 import { runJobsList } from './jobs/list.ts';
 import { runJobsGet } from './jobs/get.ts';
 import { runJobsCancel } from './jobs/cancel.ts';
@@ -52,6 +53,7 @@ import { runJobsWork } from './jobs/work.ts';
 import { runJobsSupervisor } from './jobs/supervisor.ts';
 import { runJobsWatch } from './jobs/watch.ts';
 import type { JobsCommandContext } from './jobs/shared.ts';
+import { withLocalScope } from '../core/engine-scope-store.ts';
 
 // Moved to src/core/minions/handlers/ (refactor wave 1); re-exported so importers keep this path.
 export { resolveJobPull } from '../core/minions/handlers/job-pull.ts';
@@ -166,8 +168,10 @@ USAGE
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
   gbrain jobs list [--status S] [--queue Q] [--limit N] [--json]
+  gbrain jobs list --finished-since ISO|CURSOR [--queue Q] [--name N] [--json]
   gbrain jobs list --group SPEND_GROUP [--json]
   gbrain jobs get <id> [--json]
+  gbrain jobs wait <id> [--timeout 10m] [--json]  (exit 0 completed, 1 failed/dead/cancelled, 124 still running)
   gbrain jobs cancel <id> | --group SPEND_GROUP
   gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--expect <hash> --yes] [--json]
   gbrain jobs retry <id>
@@ -233,7 +237,7 @@ USAGE
       gbrain jobs supervisor --json --allow-shell-jobs  # JSONL events + shell-exec on
 
 HANDLER TYPES (built in)
-  sync              Pull and embed new pages from the repo
+  sync              Pull and import new pages from the repo; on a managed brain it drains to the job's deadline (--timeout-ms)
   embed             (Re-)embed pages; --params '{"slug":...}' or '{"all":true}'
   lint              Run page linter; --params '{"dir":"...","fix":true}'
   import            Bulk import markdown; --params '{"dir":"..."}'
@@ -412,6 +416,22 @@ parents that return to waiting, and the preview hash. The apply cancels exactly
 the previewed set; a selection that would cascade to a job outside it refuses.
 Stop producers and workers and cancel active jobs (gbrain jobs cancel <id>) first.
 `,
+  wait: `gbrain jobs wait — block until a job is completed, failed, dead or cancelled
+
+USAGE
+  gbrain jobs wait <id> [--timeout 10m] [--json]
+
+OPTIONS
+  --timeout DUR  Stop waiting after DUR (60, 60s, 10m, 1h; default 24h). The
+                 job is never cancelled; it keeps running.
+  --json         Print the final row like \`jobs get --json\`.
+
+EXIT CODES
+  0    completed
+  1    failed, dead or cancelled (error_text on stderr), or no such job
+  2    usage error
+  124  the timeout elapsed and the job is still running
+`,
   prune: `gbrain jobs prune — delete old terminal jobs
 
 USAGE
@@ -431,6 +451,7 @@ const JOBS_SUBCOMMANDS: Record<string, (ctx: JobsCommandContext) => Promise<void
   submit: runJobsSubmit,
   list: runJobsList,
   get: runJobsGet,
+  wait: runJobsWait,
   cancel: runJobsCancel,
   retry: runJobsRetry,
   delete: runJobsDelete,
@@ -444,7 +465,12 @@ const JOBS_SUBCOMMANDS: Record<string, (ctx: JobsCommandContext) => Promise<void
   watch: runJobsWatch,
 };
 
-export async function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
+/** `gbrain jobs` (the worker included) runs in a local scope, so its own AI calls use the process gateway (engine-scope.ts). */
+export function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
+  return withLocalScope(() => runJobsCommand(engineOrNull, args));
+}
+
+async function runJobsCommand(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
 
   // Help guards run BEFORE the thin-client refusal below: cli.ts routes
@@ -470,7 +496,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
   // routing bug upstream of this function — refuse instead of crashing
   // inside MinionQueue.
   const localSupervisorStatus = sub === 'supervisor' && args[1] === 'status';
-  if (!engineOrNull && sub !== 'list' && sub !== 'get' && !localSupervisorStatus) {
+  if (!engineOrNull && sub !== 'list' && sub !== 'get' && sub !== 'wait' && !localSupervisorStatus) {
     console.error(`\`gbrain jobs ${sub ?? ''}\` needs a local engine and cannot run on a thin client.`);
     process.exit(1);
   }
@@ -599,6 +625,7 @@ export async function registerBuiltinHandlers(
   worker.register('reindex', makeReindexHandler(engine));
   worker.register('repair-jsonb', repairJsonbHandler);
   worker.register('orphans', makeOrphansHandler(engine));
+  worker.register('doctor-refresh', async () => (await import('./doctor/last-known.ts')).runDoctorRefresh(engine));
   worker.register('integrity', integrityHandler);
   worker.register('purge', makePurgeHandler(engine));
 

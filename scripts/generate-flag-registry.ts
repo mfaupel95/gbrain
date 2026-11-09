@@ -55,6 +55,8 @@ const EXTRA_FLAGS: Record<string, string[]> = {
   // Deferred persistence routing reaches runForget in recall.ts two levels deep;
   // `forget --purge` hands off from there to src/commands/forget-purge.ts.
   forget: ['--reason', '--request-id', '--purge', '--dry-run', '--yes', '--match', '--status', '--vacuum', '--all-subjects'],
+  // sources add reads the meetings and slack options as bare names in src/commands/sources-lifecycle-args.ts (its valued set).
+  sources: ['--provider', '--transcript', '--lookback-days', '--sync-interval-min', '--record', '--visibility', '--channels', '--timezone', '--max-requests', '--skip'],
 };
 
 /**
@@ -70,6 +72,11 @@ const DELEGATED_MODULES: Record<string, string[]> = {
   // `forget --purge` (and forget --help) hand the argv to runForgetPurge, which
   // parses --dry-run itself; a plain forget refuses --dry-run (recall.ts).
   forget: ['src/commands/forget-purge.ts'],
+  // `upgrade --restart-only --dry-run` is parsed by restartDryRun in
+  // upgrade-restart.ts, which refuses --dry-run without --restart-only;
+  // post-upgrade shares upgrade.ts and never takes it. A plain `upgrade --dry-run`
+  // is the channel preview, parsed by runUpgradeDryRun in upgrade-channel.ts.
+  upgrade: ['src/commands/upgrade-restart.ts', 'src/commands/upgrade-channel.ts'],
 };
 
 /**
@@ -84,9 +91,14 @@ const DELEGATED_MODULES: Record<string, string[]> = {
  * declares both flags in its own source. strict-args.ts is the strict-argument
  * table for several commands' destructive subcommands (#6114): its literals
  * belong to pages, cache, schema, integrity and search, each of which reads
- * its own flags in its own source.
+ * its own flags in its own source. flag-equals.ts (#7619) names flags as
+ * arity data for the `=` split; each handler reads its own flags.
+ * direct-pool-profile.ts reads other commands'
+ * argv to pick the process's pool profile (`sync --watch`, `serve --access`):
+ * serve imports it for the read-only check, and its `--watch` made
+ * `gbrain serve --watch` pass validation.
  */
-const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts'];
+const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts', 'direct-pool-profile.ts', 'flag-equals.ts'];
 
 function isExcludedModule(p: string): boolean {
   // Basename comparison is path-separator agnostic: on Windows p ends in
@@ -360,9 +372,10 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
  * - `--brain` when the command opens its brain through the connect terminator
  *   (phase other than `pre-connect`), or its own code reads the global brain
  *   option;
- * - `--source` when the record declares `routes_source` (its source resolves
- *   through the ambient chain). The declaration needs consumption evidence (the
- *   tight-quoted `'--source'` literal in the command's own code, the
+ * - `--source` when the record declares `routes_source: true` (its source resolves
+ *   through the ambient chain), or the flag it declares instead (`'--source-id'`
+ *   for extract, whose `--source` selects fs|db). The declaration needs consumption
+ *   evidence (the tight-quoted flag literal in the command's own code, the
  *   SAFETY_FLAGS rule); a declaration without it fails the generator.
  */
 export function buildRoutingFlags(root: string = ROOT): Record<string, string[]> {
@@ -415,6 +428,8 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
     reindex: ['--type'],
     upgrade: ['--type', '--aliases'],
     'post-upgrade': ['--type', '--aliases'],
+    // bundled-skill's skill_not_found hint names setup's refresh command; it parses its own flags strictly.
+    'bundled-skill': ['--skill-loading', '--skills-index-only', '--install'],
   };
   const consumes = (text: string, flag: string): boolean =>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);
@@ -485,12 +500,12 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
     }
     registry[command] = [...flags].sort();
     const record = records.find(r => r.name === command);
-    if (record?.routesSource && !consumes(depthZeroText, '--source')) {
-      throw new Error(`generate-flag-registry: ${command} declares routes_source but its code never reads '--source'`);
+    if (record?.routesSource && !consumes(depthZeroText, record.routesSource)) {
+      throw new Error(`generate-flag-registry: ${command} declares routes_source but its code never reads '${record.routesSource}'`);
     }
     const routed = [
       ...(record?.phase !== 'pre-connect' || /getCliOptions\(\)\.brain|cliOpts\.brain/.test(depthZeroText) ? ['--brain'] : []),
-      ...(record?.routesSource ? ['--source'] : []),
+      ...(record?.routesSource ? [record.routesSource] : []),
     ];
     if (routed.length) routing[command] = routed;
   }
@@ -525,7 +540,8 @@ ${entries}
 // Routing flags a fix naming each CLI-only command carries (A1 render-time pin,
 // src/core/fix-routing.ts): '--brain' when the command opens its brain (not a
 // pre-connect command, or its code reads the global brain option); '--source'
-// when the command-table record declares routes_source (consumption-checked).
+// (or the declared '--source-id') when the command-table record declares
+// routes_source (consumption-checked).
 export const CLI_ROUTING_FLAGS: Record<string, readonly string[]> = {
 ${render(routing)}
 };

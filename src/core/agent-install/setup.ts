@@ -15,6 +15,11 @@ import {
   readFileConfigState, readInstallReceipt, sha256, writeInstallReceipt,
   type AgentHarness, type AgentInstallReceipt, type InstallArtifact,
 } from './state.ts';
+import { bunSpawn, bunSpawnSync } from '../spawn.ts';
+import { MINIMUM_BUN_VERSION, bunVersionMeets } from '../runtime-version.ts';
+import { INSTALL_RAW_BASE } from '../install-ref.ts';
+
+const SETUP_HELPER_URL = `${INSTALL_RAW_BASE}/scripts/setup-in-agent.sh`;
 
 export interface AgentSetupOptions {
   root: string;
@@ -25,6 +30,8 @@ export interface AgentSetupOptions {
   adopt?: boolean;
   upgrade?: boolean;
   skills?: 'follow' | 'memory-only';
+  /** The caller reads JSON output; a refusal's rerun command keeps `--json`. */
+  json?: boolean;
 }
 export interface AgentSetupResult {
   status: 'installed' | 'repaired' | 'unchanged';
@@ -41,7 +48,7 @@ export interface AgentSetupResult {
 
 async function cli(root: string, artifact: InstallArtifact, args: string[]): Promise<void> {
   const commandArgs = args.includes('--migrate-only') || args[0] === 'apply-migrations' ? [...args, '--json'] : args;
-  const child = Bun.spawn([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--brain', 'host', ...commandArgs], {
+  const child = bunSpawn([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--brain', 'host', ...commandArgs], {
     cwd: root, env: { ...isolatedAgentEnv(root), DATABASE_URL: '', GBRAIN_DATABASE_URL: '', ...(args[0] === 'init' ? { GBRAIN_IN_AGENT_SETUP: '1' } : {}) },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   });
@@ -80,7 +87,7 @@ function artifactFromBundle(bundle: string, sourceRef: string): Omit<InstallArti
     throw new AgentInstallError('invalid_artifact', 'Setup bundle does not contain the GBrain package and setup helper.');
   }
   if (!/^[a-f0-9]{40}$/.test(sourceRef)) throw new AgentInstallError('invalid_artifact_ref', 'A resolved 40-character source commit is required.');
-  const version = Bun.spawnSync([bun, '--version'], { stdout: 'pipe', stderr: 'pipe' });
+  const version = bunSpawnSync([bun, '--version'], { stdout: 'pipe', stderr: 'pipe' });
   if (version.exitCode !== 0) throw new AgentInstallError('runtime_unusable', 'The staged Bun runtime is not executable on this machine.');
   return { source_ref: sourceRef, version: pkg.version, bun_version: version.stdout.toString().trim(), bun_sha256: sha256(readFileSync(bun)), package_sha256: sha256(readFileSync(join(packageDir, 'package.json'))) };
 }
@@ -109,7 +116,7 @@ function installArtifact(root: string, options: AgentSetupOptions, identity: Ret
 function artifactUsable(root: string, artifact: InstallArtifact): boolean {
   try {
     if (!existsSync(confinedPath(root, artifact.cli)) || sha256(readFileSync(confinedPath(root, `${artifact.directory}/bun`))) !== artifact.bun_sha256) return false;
-    const probe = Bun.spawnSync([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--version'], {
+    const probe = bunSpawnSync([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--version'], {
       cwd: root, env: { ...isolatedAgentEnv(root), DATABASE_URL: '', GBRAIN_DATABASE_URL: '' }, stdout: 'pipe', stderr: 'pipe', timeout: 15_000,
     });
     return probe.exitCode === 0;
@@ -177,11 +184,24 @@ Restore with \`backup restore /absolute/path/archive.gbrain-backup --into /absol
 `;
 }
 
+function refuseBelowFloor(identity: ReturnType<typeof artifactFromBundle>, options: AgentSetupOptions, root: string, outcome: string): void {
+  if (bunVersionMeets(identity.bun_version, MINIMUM_BUN_VERSION)) return;
+  const rerunArgs = ['--root', root, '--harness', options.harness, ...(options.adopt ? ['--adopt'] : []), ...(options.upgrade ? ['--upgrade'] : []),
+    ...(options.skills ? ['--skills', options.skills] : []), ...(options.json ? ['--json'] : [])];
+  const rerun = `curl --fail --silent --show-error --location ${SETUP_HELPER_URL} --output /tmp/gbrain-setup.sh && bash /tmp/gbrain-setup.sh ${rerunArgs.map(shellQuote).join(' ')}`;
+  const next = options.upgrade ? 'Make a verified backup first (docs/guides/in-agent-setup.md), then fetch' : 'Fetch';
+  throw new AgentInstallError('runtime_below_floor', `This GBrain release needs Bun ${MINIMUM_BUN_VERSION} or newer, but the setup bundle carries Bun ${identity.bun_version || 'of unknown version'}, so the helper that staged it is out of date. ${outcome} ${next} the current helper and rerun setup: ${rerun}`);
+}
+
 export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSetupResult> {
   if (options.skills !== undefined && !['follow', 'memory-only'].includes(options.skills)) throw new AgentInstallError('usage', 'The skills policy must be follow or memory-only.');
   const root = checkedRoot(options.root);
   const adapter = harnessAdapter(options.harness);
   if (!['grok-bot', 'muse'].includes(adapter.id) || !adapter.modes.includes('local-cli')) throw new AgentInstallError('unsupported_harness', 'This local setup supports Grok Bot and Muse personal agents.');
+  // A bundle that cannot be read is reported inside the install below, where the receipt journals it.
+  let identity: ReturnType<typeof artifactFromBundle> | undefined;
+  try { identity = artifactFromBundle(options.bundle, options.sourceRef); } catch { identity = undefined; }
+  if (identity) refuseBelowFloor(identity, options, root, 'Nothing was changed.');
   if (!existsSync(dirname(root))) throw new AgentInstallError('parent_missing', 'Create and verify the persistent parent directory first.');
   const existed = existsSync(root);
   if (!existed) mkdirSync(root, { mode: 0o700 });
@@ -238,7 +258,8 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
     writeInstallReceipt(receipt);
     delete receipt.last_failure;
     let changed = false;
-    const identity = artifactFromBundle(options.bundle, options.sourceRef);
+    identity ??= artifactFromBundle(options.bundle, options.sourceRef);
+    refuseBelowFloor(identity, options, root, 'No runtime was installed.');
     if (receipt.artifact && !options.upgrade && identity.source_ref !== receipt.artifact.source_ref) throw new AgentInstallError('artifact_version_mismatch', 'Repair must use the recorded source commit; use --upgrade to explicitly change versions.');
     const upgrade = !!options.upgrade && receipt.artifact?.source_ref !== identity.source_ref;
     if (!receipt.artifact || upgrade || !artifactUsable(root, receipt.artifact)) {

@@ -25,7 +25,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { renderAction, type Action } from '../src/core/agent-output.ts';
 import { __setConfirmationIoForTests } from '../src/core/trust/confirm.ts';
 import { frontmatterTrustCaps, frontmatterTrustCapsSql } from '../src/core/trust/channel.ts';
-import { claimSourcesFix, listClaimSources, liftClaimedSources, recordSourceClaims, readUnclaimedLegacySources } from '../src/core/trust/claim.ts';
+import { claimSourcesFix, hasUnclaimedLegacySources, listClaimSources, liftClaimedSources, recordSourceClaims, readUnclaimedLegacySources } from '../src/core/trust/claim.ts';
 import { TRUST_CLAIM_LIFTED_AT_KEY, TRUST_CLAIMED_AT_KEY } from '../src/core/trust/claim-state.ts';
 import { trustClaimUpgradeNotice } from '../src/core/trust/claim-notice.ts';
 import { runTrustBackfill } from '../src/core/trust/backfill.ts';
@@ -33,6 +33,7 @@ import { explainTrust } from '../src/core/trust/review.ts';
 import { TRUST_TIER_RANK } from '../src/core/trust/tier.ts';
 import { runTrustScan } from '../src/core/eligibility/scan.ts';
 import { runTrustClaimSources } from '../src/commands/trust-claim.ts';
+import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { runSetTrust } from '../src/commands/sources-trust.ts';
 import { trustSourcesUnclaimedEntry } from '../src/commands/doctor/checks/trust-sources-unclaimed.ts';
 import { trustScanEntry } from '../src/commands/doctor/checks/trust-scan.ts';
@@ -55,7 +56,7 @@ beforeAll(async () => {
   fresh = empty;
 }, 120_000);
 afterAll(async () => { await engine.disconnect(); await fresh.disconnect(); });
-afterEach(() => { __setConfirmationIoForTests(null); process.exitCode = 0; });
+afterEach(() => { __setConfirmationIoForTests(null); process.exitCode = 0; _resetCliExitVerdictForTests(); });
 
 const cli = { transport: 'cli' as const, isCallable: () => false, preapproved: () => true };
 const render = (fix: unknown) => renderAction(fix as Action, cli);
@@ -105,6 +106,7 @@ async function seed() {
   await page('marker', src, null, { trust_tier: 'agent_written' });
   await page('confirmed-marker', src, null, { trust_tier: 'user_confirmed' });
   await page('connector-stamp', src, null, { ingested_via: 'connector:gmail' });
+  await page('atom', src, null, { type: 'atom', extracted_by: 'extract_atoms-v0.41.2.1', source_slug: 'p/plain' });
   await page('gh-plain', gh, null);
   const fact = async (source: string, fenced: string | null) => {
     const [row] = await engine.executeRaw<{ id: number }>(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,source_markdown_slug,row_num)
@@ -138,6 +140,8 @@ describe('trust claim-sources', () => {
       { transcript_import: 'yes' }, { source_url: 'https://x', clipped_at: '2026' }, { source_url: 'https://x' }, { source_url: ' ', clipper: 'x' },
       { source_url: 'https://x', captured_via: 'clipper' }, { source_url: 'https://x', type: 'clipping' }, { provenance: 'auto-extracted' },
       { dream_generated: true }, { dream_generated: 'true' }, { dream_generated: false }, { provenance: 'manual', source_kind: 'inbox-folder', trust_tier: 'tool_observed' },
+      { extracted_by: 'extract_atoms-v0.41.2.1' }, { extracted_by: ' extract_atoms-v0.42 ' }, { extracted_by: 'extractXatoms-v1' },
+      { extracted_by: 'gpt-extractor' }, { extracted_by: 5 }, { extracted_by: 'extract_atoms-v0.41.2.1', trust_tier: 'external_untrusted' },
     ];
     const sql = `SELECT LEAST(${frontmatterTrustCapsSql('v.fm').join(', ')}) AS r FROM (SELECT $1::text::jsonb AS fm) v`;
     for (const fm of samples) {
@@ -155,12 +159,12 @@ describe('trust claim-sources', () => {
     const { out } = await runCli(['--dry-run']);
     expect(await snapshot(s.src)).toBe(before);
     const own = listing.sources.find(x => x.id === s.src)!;
-    expect(own).toMatchObject({ local_path: '/home/alice-example/notes', pages: 9, claimable: true, claimed: false });
+    expect(own).toMatchObject({ local_path: '/home/alice-example/notes', pages: 10, claimable: true, claimed: false });
     expect(own.current!.unknown).toBe(own.legacy_unknown);
     expect(own.projected_if_claimed.user_confirmed).toBe(0);
     expect(own.projected_if_claimed.operator_curated).toBe(5);
     expect(listing.sources.find(x => x.id === s.gh)).toMatchObject({ claimable: false, blocker: 'connector' });
-    expect(out).toContain(`${s.src} (/home/alice-example/notes): 9 page(s)`);
+    expect(out).toContain(`${s.src} (/home/alice-example/notes): 10 page(s)`);
     expect(out).toContain('github connector: cannot be claimed');
   });
 
@@ -193,13 +197,13 @@ describe('trust claim-sources', () => {
       plain: await tierOf('pages', p.plain!), mcp: await tierOf('pages', p.mcp!), capture: await tierOf('pages', p.capture!),
       ownTranscript: await tierOf('pages', p['own-transcript']!), otherTranscript: await tierOf('pages', p['other-transcript']!),
       clipped: await tierOf('pages', p.clipped!), marker: await tierOf('pages', p.marker!), confirmedMarker: await tierOf('pages', p['confirmed-marker']!),
-      connectorStamp: await tierOf('pages', p['connector-stamp']!), gh: await tierOf('pages', p['gh-plain']!),
+      connectorStamp: await tierOf('pages', p['connector-stamp']!), atom: await tierOf('pages', p.atom!), gh: await tierOf('pages', p['gh-plain']!),
       factPlain: await tierOf('facts', s.facts.plain), factBackstop: await tierOf('facts', s.facts.backstop),
       factOnPlain: await tierOf('facts', s.facts.onPlain), factOnMcp: await tierOf('facts', s.facts.onMcp),
       take: await tierOf('takes', s.take), entry: await tierOf('timeline_entries', s.entry),
     }).toEqual({
       plain: 'operator_curated', mcp: 'agent_written', capture: 'agent_written', ownTranscript: 'agent_written', otherTranscript: 'external_untrusted',
-      clipped: 'external_untrusted', marker: 'agent_written', confirmedMarker: 'operator_curated', connectorStamp: 'external_untrusted', gh: 'unknown',
+      clipped: 'external_untrusted', marker: 'agent_written', confirmedMarker: 'operator_curated', connectorStamp: 'external_untrusted', atom: 'agent_written', gh: 'unknown',
       factPlain: 'operator_curated', factBackstop: 'agent_written', factOnPlain: 'operator_curated', factOnMcp: 'agent_written',
       take: 'operator_curated', entry: 'external_untrusted',
     });
@@ -298,6 +302,18 @@ describe('the asks around claiming', () => {
     expect(fix.consent).toEqual([]);
     expect(fix.argv).toEqual(['gbrain', 'trust', 'scan']);
     expect(fix.user_message).toContain('claim');
+  });
+
+  test('the claim ask reads row tables only for unclaimed sources, and agrees with the doctor read', async () => {
+    const s = await seed();
+    expect(await hasUnclaimedLegacySources(engine)).toBe(true);
+    expect((await readUnclaimedLegacySources(engine)).unclaimed.map(u => u.id)).toContain(s.src);
+    const seen: string[] = [];
+    const allClaimed = { executeRaw: async (sql: string) => { seen.push(sql); return /FROM sources/.test(sql) ? [{ id: 'a', claimed: true, lifted: true }] as never[] : []; } };
+    expect(await hasUnclaimedLegacySources(allClaimed as never)).toBe(false);
+    expect(await readUnclaimedLegacySources(allClaimed as never)).toEqual({ unclaimed: [], pending: [] });
+    expect(seen.length).toBe(2);
+    expect(seen.some(sql => /\b(pages|facts|takes|timeline_entries)\b/.test(sql))).toBe(false);
   });
 
   test('post-upgrade and the behavior-change notice carry the tell_user_to_run block', async () => {

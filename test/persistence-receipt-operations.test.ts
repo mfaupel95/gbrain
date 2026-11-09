@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
-import { withVerifiedLocalRegistration, type LocalGrant, type LocalRegistration } from '../src/core/persistence/identity.ts';
+import { localHostId, withVerifiedLocalRegistration, type LocalGrant, type LocalRegistration } from '../src/core/persistence/identity.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, getWriteRequest } from '../src/core/persistence/journal.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
@@ -97,7 +97,7 @@ describe('own-principal write receipt operations', () => {
     const first = await accept(foreign, 'PRIVATE_OTHER_SOURCE_HEAD', otherSource);
     const own = await accept();
     const worktree = randomUUID();
-    await engine.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id) VALUES($1,$2)', [worktree, randomUUID()]);
+    await engine.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id) VALUES($1,$2)', [worktree, localHostId()]);
     await engine.executeRaw('UPDATE persistence_requests SET worktree_id=$2 WHERE id=ANY($1::uuid[])', [[first.id, own.id], worktree]);
     const result = await call('list_write_requests', {});
     expect(result.requests).toHaveLength(1);
@@ -258,6 +258,10 @@ describe('own-principal write receipt operations', () => {
     for (const params of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { source_id: '__all__' }, { before: '-1' }, { before: '9999999999999999999' }]) {
       await expect(call('list_write_requests', params)).rejects.toMatchObject({ code: 'invalid_params' });
     }
-    await expect(call('get_write_request', { request_id: '../other' })).rejects.toMatchObject({ code: 'invalid_params' });
+    // F6: any 1-128 printable ASCII id is a client request id (mapped to its UUIDv5), so only ids outside that set refuse.
+    for (const request_id of ['', 'two words', 'x'.repeat(129), 42]) {
+      await expect(call('get_write_request', { request_id })).rejects.toMatchObject({ code: 'invalid_params' });
+    }
+    await expect(call('get_write_request', { request_id: '../other' })).rejects.toMatchObject({ code: 'not_found' });
   });
 });

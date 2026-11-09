@@ -48,8 +48,15 @@ const whoami: Operation = {
       const entries = configReadiness(ctx.config, { transport }).entries;
       return transport === 'http' ? readinessHttpView(entries) : entries;
     };
+    const { accessView, appliedAccessSummary, credentialAccessView, stdioAccessView } = await import('../access/caller.ts');
+    // GBRA-231: the view this call is answered under (the shared-agent audience when the harness asserted one), so a
+    // model can check it when its harness does not forward _meta.access.
+    const withApplied = async <T extends object>(view: T) => ({ ...view, applied: await appliedAccessSummary(ctx.engine, ctx.auth, [ctx.sourceId, ...(ctx.localFederatedSourceIds ?? [])]) });
     if (ctx.remote === false) {
-      return { transport: 'local', scopes: [], readiness: readiness('cli') };
+      // GBRA-218: a local --as <member> preview reports the member it reads as; the plain local CLI reads every page.
+      const access = ctx.applyRemoteReadPolicy && ctx.accessIdentity?.length ? accessView(ctx.accessIdentity, 'as')
+        : accessView([], 'none', null, 'The local CLI reads every page; pass --as <member> to preview what a member can read.');
+      return { transport: 'local', scopes: [], access, readiness: readiness('cli') };
     }
     // #1061: stdio MCP is remote/untrusted by design but has no per-token
     // auth (local pipe) — a known transport, not a bug. Report it instead of
@@ -63,7 +70,7 @@ const whoami: Operation = {
         if (verified.remote) scopes = verified.grant.scopes;
       } catch { /* no registration: no scopes */ }
       const session = ctx.stdioSurface;
-      return { transport: 'stdio', scopes, ...(session ? { surface: session.surface, surface_source: session.source } : {}), readiness: readiness('stdio') };
+      return { transport: 'stdio', scopes, ...(session ? { surface: session.surface, surface_source: session.source } : {}), access: await withApplied(await stdioAccessView(ctx.engine)), readiness: readiness('stdio') };
     }
     if (!ctx.auth) {
       throw opError(
@@ -82,6 +89,7 @@ const whoami: Operation = {
         client_id: ctx.auth.clientId,
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
         ...await resolveAuthCapabilities(ctx.auth, ctx.engine, ctx.config, { surfaceCeiling: ctx.surfaceCeiling }),
+        access: await withApplied(await credentialAccessView(ctx.engine, ctx.auth)),
       };
     }
     return {
@@ -89,6 +97,7 @@ const whoami: Operation = {
       token_name: ctx.auth.clientName ?? ctx.auth.clientId,
       scopes: ctx.auth.scopes,
       expires_at: null,
+      access: await withApplied(await credentialAccessView(ctx.engine, ctx.auth)),
       grant_diagnosis: await resolveGrantDiagnosis(ctx.auth, ctx.engine, ctx.config, { surfaceCeiling: ctx.surfaceCeiling }),
       readiness: readiness('http'),
     };
@@ -132,7 +141,7 @@ const sources_add: Operation = {
   mutating: true,
   scope: 'sources_admin',
   handler: async (ctx, p) => {
-    const { addSource } = await import('../sources-ops.ts');
+    const { addSource, SourceOpError } = await import('../sources-ops.ts');
     if(ctx.remote!==false&&await (await import('../persistence/ownership.ts')).managedPersistenceEnabled(ctx.engine))
       throw managedLifecycleRefusal(ctx, ['sources', 'add', ...sourceIdArg(p.id), ...(typeof p.url === 'string' && /^https:\/\/\S+$/.test(p.url) ? ['--url', p.url] : [])]);
 
@@ -171,9 +180,15 @@ const sources_add: Operation = {
       name: p.name as string | undefined,
       localPath: remotePath,
       remoteUrl: p.url as string | undefined,
+      addedByRemoteCaller: !isLocal,
       federated:
         p.federated === undefined ? null : (p.federated as boolean),
       cloneDir: remoteCloneDir,
+    }).catch((err: unknown) => {
+      // git's own error names the far end and how it answered; a remote caller gets a fixed message, the host log keeps it.
+      if (isLocal || !(err instanceof SourceOpError) || err.code !== 'clone_failed') throw err;
+      console.error(`[gbrain] sources_add ${String(p.id)}: ${err.message}`);
+      throw new SourceOpError('clone_failed', 'git clone failed for this URL. The brain host\'s log has the reason.', err);
     });
     const { redactSourceConfig } = await import('../source-config-redact.ts');
     const { parseSourceConfig } = await import('../sources-load.ts');
@@ -300,7 +315,9 @@ const sources_status: Operation = {
     const status = await getSourceStatus(ctx.engine, p.id as string);
     const { readCompanyBrainSourceStatus } = await import('../company-brain/status.ts');
     const ingestion = await readCompanyBrainSourceStatus(ctx.engine, p.id as string);
-    return ingestion ? { ...status, ingestion } : status;
+    const { readAppliedWatermark } = await import('../persistence/applied-watermark.ts');
+    const watermark = await readAppliedWatermark(ctx.engine, p.id as string, { remote: ctx.remote !== false }).catch(() => null);
+    return { ...status, ...(ingestion ? { ingestion } : {}), ...(watermark ? { watermark } : {}) };
   },
   cliHints: { name: 'sources_status', hidden: true },
 };
@@ -333,6 +350,29 @@ const sources_inspect: Operation = {
   cliHints: { name: 'sources_inspect', hidden: true },
 };
 
+const sources_resolve_path: Operation = {
+  name: 'sources_resolve_path',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether ' +
+    'sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether ' +
+    'search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its ' +
+    'origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller\'s source scope.',
+  params: {
+    id: { type: 'string', required: true, description: "Source id, as listed by sources_list (e.g. 'default')." },
+    paths: { type: 'array', items: { type: 'string' }, required: true, description: 'File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    assertSourceInCallerScope(ctx, p.id as string);
+    const { resolveSourcePaths } = await import('../persistence/resolve-paths.ts');
+    return resolveSourcePaths(ctx.engine, p.id as string, (p.paths as unknown[] ?? []).map(String));
+  },
+  cliHints: { name: 'sources_resolve_path', hidden: true },
+};
+
 export const sourcesOperations: Operation[] = [
-  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect, sources_resolve_path,
 ];

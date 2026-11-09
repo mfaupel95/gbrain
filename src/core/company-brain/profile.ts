@@ -15,6 +15,7 @@ import type { CompanyBrainPlan, InspectionEntry } from './types.ts';
 import type { SourceIngestionCheckpoint } from './receipts.ts';
 import { companyBrainProfile, companyBrainPolicyFingerprint, type CompanyBrainProfile } from './policy.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { syncDispatchRow } from '../sync-dispatch-read.ts';
 export { companyBrainProfile, type CompanyBrainProfile } from './policy.ts';
 
 function statusFix(sourceId: string): Action {
@@ -26,11 +27,15 @@ function resumeCommand(sourceId: string): string {
 }
 
 export async function getCompanyBrainProfile(engine: BrainEngine, sourceId: string): Promise<CompanyBrainProfile | null> {
-  const [source] = await engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1', [sourceId]);
+  // The receipt a source without a policy is checked for (of the source's current incarnation) is read beside it.
+  // GBRA-133: inside a CLI sync's routing scope the source's routing row answers both (sync-dispatch-read.ts).
+  const routing = await syncDispatchRow(engine, sourceId);
+  const [[source], [receipt]] = routing ? [routing.id === null ? [] : [routing], routing.company_receipt ? [true] : []] : await Promise.all([engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1', [sourceId]),
+    engine.executeRaw(`SELECT r.id FROM source_ingestion_receipts r JOIN sources s ON s.id=r.source_id AND s.incarnation=r.source_incarnation
+      WHERE r.source_id=$1 AND r.profile='company-brain' LIMIT 1`, [sourceId])]);
   if (!source) return null;
   const profile = companyBrainProfile(source.config);
   if (!profile) {
-    const [receipt] = await engine.executeRaw("SELECT id FROM source_ingestion_receipts WHERE source_id=$1 AND source_incarnation=$2::uuid AND profile='company-brain' LIMIT 1", [sourceId, source.incarnation]);
     if (receipt) {
       throw opError('profile_incompatible', 'The durable company approval has no source policy. Reconnect explicitly; sync cannot fall back to an unrestricted profile.',
         `Source ${sourceId} has a company-brain receipt but no stored source policy. Check its status; reconnecting means previewing removal with gbrain sources remove ${sourceId} --dry-run and connecting again, a destructive step the user approves. Do not edit stored policy fields.`,
@@ -109,7 +114,7 @@ export async function importCompanyBrainFile(engine: BrainEngine, filePath: stri
   const snapshot = await engine.readPageSnapshot(entry.page.slug, { sourceId });
   const canonical = (page: Pick<typeof parsed, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) => ({ type: page.type, title: page.title, body: page.compiled_truth,
     timeline: page.timeline ?? '', frontmatter: page.frontmatter, tags: [...new Set(tags)].sort() });
-  return importFromContent(engine, entry.page.slug, content, { sourceId, noEmbed: true, remote: false,
+  return importFromContent(engine, entry.page.slug, content, { sourceId, noEmbed: true, remote: false, holdNoncanonicalPrivate: true,
     activePack: pack.manifest, filename: basename(path).replace(/\.mdx?$/i, ''), sourcePath: path,
     prepare: async ready => {
       const tags = [...(snapshot?.tags ?? []), ...ready.parsedPage.tags];

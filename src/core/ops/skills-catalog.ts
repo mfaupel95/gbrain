@@ -29,27 +29,46 @@ const list_skills: Operation = {
   description: LIST_SKILLS_DESCRIPTION,
   publishGateKey: 'mcp.publish_skills',
   params: {
-    schema_version: { type: 'number', description: '2 for the source-qualified catalog.' },
-    limit: { type: 'number', description: 'Version 2 page size (1-100).' },
-    cursor: { type: 'string', description: 'Version 2 cursor.' },
-    source_id: { type: 'string', description: 'Version 2: one source.' },
+    schema_version: { type: 'number', minimum: 1, description: '2 for the source-qualified catalog.', fullSurfaceOnly: true },
+    limit: { type: 'number', description: 'Page size or rank cap (1-100).' },
+    cursor: { type: 'string', description: 'Version 2 cursor.', fullSurfaceOnly: true },
+    source_id: { type: 'string', description: 'Version 2: one source.', fullSurfaceOnly: true },
     section: {
       type: 'string',
       description: 'Only this routing section.',
+      fullSurfaceOnly: true,
+    },
+    query: {
+      type: 'string',
+      description: 'Version 1 host catalog: rank skills by word overlap with this task (name, triggers, description), drop the rest, cap at limit (default 10). Refused on a shared catalog.',
+      fullSurfaceOnly: true,
     },
   },
   handler: async (ctx, p) => {
-    if (p.schema_version === 2) return (await import('../shared-skills/catalog.ts')).listSharedSkills(ctx, p);
+    if (p.query !== undefined && typeof p.query !== 'string') throw invalidParam(ctx, 'list_skills', 'query', 'query must be a string naming the task.', { example: 'prepare for a meeting' });
+    const query = typeof p.query === 'string' && p.query.trim().length > 0 ? p.query : undefined;
+    // #6471: the shared catalogs do not rank yet; refusing beats a silently unranked list.
+    const refuseQueryOnSharedCatalog = (which: string) => opError('invalid_params',
+      `query ranks the version 1 host skill catalog only; ${which} does not support it yet.`,
+      'Drop query and narrow the shared catalog with section (and source_id for version 2) instead; rank the host catalog by calling list_skills with query on a brain that serves it.');
+    if (p.schema_version === 2) {
+      if (query) throw refuseQueryOnSharedCatalog('the version 2 catalog');
+      return (await import('../shared-skills/catalog.ts')).listSharedSkills(ctx, p);
+    }
     if (p.schema_version !== undefined && p.schema_version !== 1) throw invalidParam(ctx, 'list_skills', 'schema_version', 'Supported skill catalog schema versions are 1 and 2.', { choices: ['1', '2'], example: 2 });
     const compatibility = await import('../shared-skills/compatibility.ts');
-    if (await compatibility.sharedCatalogActive(ctx)) return compatibility.listLegacySharedSkills(ctx, typeof p.section === 'string' ? p.section : undefined);
+    if (await compatibility.sharedCatalogActive(ctx)) {
+      if (query) throw refuseQueryOnSharedCatalog("this brain's shared catalog");
+      return compatibility.listLegacySharedSkills(ctx, typeof p.section === 'string' ? p.section : undefined);
+    }
     const sc = await import('../skill-catalog.ts');
     const publish = await sc.readMcpPublishSkills(ctx);
     sc.assertPublishEnabled(ctx, publish);
     const override = await sc.readMcpSkillsDir(ctx);
     const { dir, source } = sc.resolveSkillsDir(ctx, override);
     const section = typeof p.section === 'string' ? p.section : undefined;
-    return sc.buildSkillCatalog(ctx, dir, source, { section, gateDisabled: await sc.readSkillToolGates(ctx) });
+    const limit = typeof p.limit === 'number' ? p.limit : undefined;
+    return sc.buildSkillCatalog(ctx, dir, source, { section, query, limit, gateDisabled: await sc.readSkillToolGates(ctx) });
   },
   scope: 'read',
   cliHints: { name: 'skills', positional: [] },
@@ -63,19 +82,19 @@ const get_skill: Operation = {
   description: GET_SKILL_DESCRIPTION,
   publishGateKey: 'mcp.publish_skills',
   params: {
-    schema_version: { type: 'number', description: '2 for an exact canonical revision.' },
-    qualified_id: { type: 'string', description: 'Version 2 skill id.' },
-    expected_brain_id: { type: 'string', description: 'Version 2 brain id to assert.' },
-    source_incarnation: { type: 'string', description: 'From discovery.' },
-    pack_id: { type: 'string', description: 'Pack id.' },
-    revision: { type: 'string', description: 'Exact revision (default: head).' },
+    schema_version: { type: 'number', minimum: 1, description: '2 for an exact canonical revision.', fullSurfaceOnly: true },
+    qualified_id: { type: 'string', description: 'Version 2 skill id.', fullSurfaceOnly: true },
+    expected_brain_id: { type: 'string', description: 'Brain id to assert.', fullSurfaceOnly: true },
+    source_incarnation: { type: 'string', description: 'From discovery.', fullSurfaceOnly: true },
+    pack_id: { type: 'string', description: 'Pack id.', fullSurfaceOnly: true },
+    revision: { type: 'string', description: 'Exact revision (default: head).', fullSurfaceOnly: true },
     name: {
       type: 'string',
       description: 'Skill name from list_skills.',
     },
     source_id: {
       type: 'string',
-      description: 'Fetch a brain-resident pack skill from this source.',
+      description: 'Brain-resident pack skill from this source.',
     },
   },
   handler: async (ctx, p) => {
@@ -91,8 +110,7 @@ const get_skill: Operation = {
     // skill (confined to that source's pack root) rather than the host catalog.
     if (typeof p.source_id === 'string' && p.source_id.length > 0) {
       const brl = await import('../skillpack/brain-resident-locate.ts');
-      const slug = typeof p.name === 'string' ? p.name : '';
-      return brl.getResidentSkillDetail(ctx, p.source_id, slug);
+      return brl.getResidentSkillDetail(ctx, p.source_id, typeof p.name === 'string' ? p.name : '');
     }
     const override = await sc.readMcpSkillsDir(ctx);
     const { dir } = sc.resolveSkillsDir(ctx, override);
@@ -121,17 +139,17 @@ const sharedSkillMutationParams: Operation['params'] = {
   expected_revision: { type: 'string', description: 'Current revision UUID; JSON null for creation.' },
 };
 const get_skill_asset: Operation = {
-  name: 'get_skill_asset', description: 'Read an approved file from an exact skill revision (data only; never executed).',
+  name: 'get_skill_asset', description: 'Read an approved file from an exact skill revision (data, never executed).',
   mutating: false,
   idempotent: true,
   outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
   scope: 'read', publishGateKey: 'mcp.publish_skills',
   cliHints: { name: 'skill-asset', positional: [] },
-  params: { source_id: sharedSkillKeyParams.source_id, source_incarnation: sharedSkillKeyParams.source_incarnation,
+  params: { source_id: sharedSkillKeyParams.source_id, source_incarnation: { ...sharedSkillKeyParams.source_incarnation, fullSurfaceOnly: true },
     name: { type: 'string', description: 'Skill name.' },
-    pack_id: { type: 'string', description: 'Pack id.' },
-    qualified_id: { type: 'string', description: 'Version 2 skill id.' },
-    expected_brain_id: { type: 'string', description: 'Brain id to assert.' },
+    pack_id: { type: 'string', description: 'Pack id.', fullSurfaceOnly: true },
+    qualified_id: { type: 'string', description: 'Version 2 skill id.', fullSurfaceOnly: true },
+    expected_brain_id: { type: 'string', description: 'Brain id to assert.', fullSurfaceOnly: true },
     revision: { type: 'string', required: true, description: 'Revision from get_skill.' },
     path: { type: 'string', required: true, description: 'Path in that revision manifest.' } },
   handler: async (ctx, p) => (await import('../shared-skills/catalog.ts')).getSharedSkillAsset(ctx, { ...sharedSkillReadSelector(p), path: String(p.path ?? '') }),
@@ -223,7 +241,7 @@ const list_brain_skillpack: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
-  description: 'Skillpacks this brain ships, with skills and a scaffold spec to offer the user.',
+  description: 'Skillpacks this brain ships: skills and a scaffold spec to offer the user.',
   publishGateKey: 'mcp.publish_skills',
   params: {},
   handler: async (ctx) => {

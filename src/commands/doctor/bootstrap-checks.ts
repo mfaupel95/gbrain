@@ -5,7 +5,7 @@
  */
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { execFileSync } from '../../core/spawn.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { LATEST_VERSION } from '../../core/migrate.ts';
 // Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
@@ -149,7 +149,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
 
   const receipt = readReceipt(home);
   // One reader for every push-status surface [D8]; per-root files [D13].
-  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace } = await import('../../core/workspace-push.ts');
+  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace, pushStatusRecordCounts } = await import('../../core/workspace-push.ts');
   const pushStatuses = readPushStatuses();
   const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
@@ -172,6 +172,8 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   // --status`'s job; doctor stays offline-cheap.
   if (harnessState.state === 'ok') {
     const hr = harnessState.receipt;
+    const { cleanupDoctorMessage, harnessCleanupReport, tokenStatesWith } = await import('../../core/bootstrap/harness-cleanup.ts');
+    let cleanup: Awaited<ReturnType<typeof harnessCleanupReport>> = [];
     const failed = hr.targets.filter((t) => t.state === 'failed');
     const pending = hr.targets.filter((t) => t.state === 'pending');
     if (failed.length > 0 || pending.length > 0) {
@@ -182,11 +184,13 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
           `harness wiring incomplete: ${failed.length} failed / ${pending.length} pending target(s)` +
           ` — re-run \`gbrain bootstrap harness\` to converge (details: gbrain bootstrap harness --status).`,
       });
-    } else if (hr.token.previous_ids && hr.token.previous_ids.length > 0) {
+    } else if ((cleanup = await harnessCleanupReport(hr, ids => engine ? tokenStatesWith(engine, ids) : Promise.resolve({}))).length > 0) {
+      // #6743: per id, a revoked credential awaiting enrollment cleanup reads apart from an active one (leave before revoke).
       checks.push({
         name: 'bootstrap_harness_health',
         status: 'fail',
-        message: `${hr.token.previous_ids.length} previous harness token(s) were never revoked (ids ${hr.token.previous_ids.join(', ')}) — re-run \`gbrain bootstrap harness\`, or run \`gbrain auth revoke\` with the id flag per id.`,
+        message: cleanupDoctorMessage(cleanup),
+        details: { code: 'bootstrap_cleanup_pending', cleanup },
       });
     } else if (hr.targets.length === 0 && hr.token.minted && hr.token.id !== undefined) {
       // Half-removed state: a remove under a live PGLite serve strips every
@@ -404,7 +408,11 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
     } else if (statusFilesOnDisk) {
       // Files exist but none parsed — the tolerant reader skips corrupt
       // records; doctor must not let that read as "no news is good news".
-      checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
+      // #7377: records kept for workspaces that no longer exist are history.
+      const counts = pushStatusRecordCounts();
+      checks.push(counts.unreadable === 0 && counts.gone > 0
+        ? { name: 'bootstrap_push_health', status: 'ok', message: `push status is kept only for ${counts.gone} workspace(s) that no longer exist; no tracked workspace to check` }
+        : { name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
     }
   } catch {
     checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });

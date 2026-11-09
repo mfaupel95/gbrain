@@ -17,12 +17,13 @@
  */
 import type { BrainEngine } from '../../core/engine.ts';
 import type { currentCompanyBrainSync } from '../../core/company-brain/profile.ts';
-import type { SyncManifest, isSyncable } from '../../core/sync.ts';
+import type { MetafilePagesMode, SyncManifest, isSyncable } from '../../core/sync.ts';
 import type { TypeWarningCount } from '../../core/schema-pack/type-usage.ts';
 import { appendCompleted, appendCompletedOnce, type OpCheckpointKey } from '../../core/op-checkpoint.ts';
 import { registerCleanup } from '../../core/process-cleanup.ts';
 import { DB_ACCESS_MARKER_PREFIX, shouldEmitDbAccessMarker } from '../../core/pg-access-classify.ts';
 import { serr } from '../../core/console-prefix.ts';
+import { ItemRun } from '../../core/item-failure.ts';
 import { buildPartialResult } from '../../core/sync-lock.ts';
 import type { createProgress } from '../../core/progress.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
@@ -30,7 +31,8 @@ import type { LegacyHolds } from './holds.ts';
 import { resolveSyncCheckpointSeconds, resolveSyncMaxCheckpointFailures, resolveSyncYieldEvery } from './checkpoint.ts';
 
 export type SyncActivePack = { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
-export type SyncFailedFile = { path: string; error: string; line?: number };
+/** `code`: the import path's structured ledger code (GBRA-130 A-18); absent, the gate classifies `error`. */
+export type SyncFailedFile = { path: string; error: string; line?: number; code?: string };
 export type SyncOptionsForFilter = Parameters<typeof isSyncable>[1];
 export type SyncProgress = ReturnType<typeof createProgress>;
 
@@ -68,11 +70,17 @@ export interface SyncPlan {
   readonly uncommittedDrift: { added: number; modified: number; deleted: number } | undefined;
   readonly inScope: (p: string) => boolean;
   readonly isSelectedForRun: (path: string, options?: SyncOptionsForFilter) => boolean;
-  readonly syncOpts: { strategy: SyncOpts['strategy']; includeHidden: SyncOpts['includeHidden'] };
+  readonly syncOpts: { strategy: SyncOpts['strategy']; includeHidden: SyncOpts['includeHidden']; metafilePage: (path: string) => boolean };
+  /** GBRA-150: the run's `sync.metafile_pages`, recorded with the bookmark so a mode the source has not applied backfills once. */
+  readonly metafilePages: MetafilePagesMode;
   /** Manifest path -> the mode's canonical page path (slug/source_path base). */
   readonly modePath: (p: string) => string;
   /** #5988: the run's content holds (null for company-brain sources); its re-screen paths join the import drain. */
   readonly holds: LegacyHolds | null;
+  /** GBRA-133: gitlinks that appeared in this run's range (reported once, never followed). */
+  readonly gitlinks: string[];
+  /** GBRA-217: the pass's reason-trailer scan (null when it imports nothing); set after preflight, read by the import and rename drains. */
+  readonly reasons?: import('../../core/reason-trailers.ts').SyncReasonScan | null;
 }
 
 export interface SyncRun {
@@ -97,6 +105,8 @@ export interface SyncRun {
   readonly succeededPaths: string[];
   /** Every failure that gates `last_commit` (imports, deletes, renames, `<head>`). */
   readonly failedFiles: SyncFailedFile[];
+  /** GBRA-130 A-18: classifies each thrown import failure (a run-scoped one stops the sync) and trips when most files fail. */
+  readonly itemRun: ItemRun;
   readonly typeWarningCounts: Map<string, TypeWarningCount>;
   /** @checkpoint Files flushed since the last checkpoint write (count cadence). */
   sinceFlush: number;
@@ -116,6 +126,8 @@ export interface SyncRun {
   sinceYield: number;
   /** Add/modify files persisted this run (partial `filesImported`). */
   filesImported: number;
+  /** GBRA-130 A-18: add/modify files of this drain an earlier run banked (held paths excluded); isolation evidence with `filesImported`. */
+  bankedImports: number;
   /** Chunks written this run. */
   chunksCreated: number;
   /** The stall watchdog fired (partial reason `stall_timeout`). */
@@ -157,6 +169,7 @@ export function createSyncRun(
     deletedSlugs: new Set<string>(),
     succeededPaths: [],
     failedFiles: [],
+    itemRun: new ItemRun('sync.import_files'),
     typeWarningCounts: new Map<string, TypeWarningCount>(),
     sinceFlush: 0,
     lastFlushAt: Date.now(),
@@ -173,6 +186,7 @@ export function createSyncRun(
     // this as `filesImported` so cron operators can see how much work the
     // aborted run completed before --timeout fired.
     filesImported: 0,
+    bankedImports: 0,
     chunksCreated: 0,
     stallAborted: false,
   };

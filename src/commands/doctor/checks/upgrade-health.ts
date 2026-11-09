@@ -10,12 +10,13 @@ import { existsSync, readFileSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import { gbrainPath } from '../../../core/config.ts';
 import { LATEST_VERSION } from '../../../core/migrate.ts';
-import { MINIMUM_BUN_VERSION, unsupportedBunMessage } from '../../../core/runtime-version.ts';
-import { isNewerVersion } from '../../../core/semver.ts';
+import { MINIMUM_BUN_VERSION, SECURE_BUN_VERSION, bunVersionMeets, unsupportedBunMessage } from '../../../core/runtime-version.ts';
+import { isNewerVersion, isValidVersionString } from '../../../core/semver.ts';
 import type { SelfUpgradeAction } from '../../../core/self-upgrade.ts';
 import type { SelfUpgradeAuditEvent } from '../../../core/audit/self-upgrade-audit.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../../../version.ts';
 import type { Check } from '../../doctor.ts';
+import { agentFix, doctorVerify } from '../check-fix.ts';
 
 /**
  * #4517: is the latest upgrade-errors.jsonl record superseded? True when the
@@ -24,15 +25,22 @@ import type { Check } from '../../doctor.ts';
  * (or retried) upgrade demonstrably finished the job. Pure + exported for
  * tests. Compares ALL dot-segments (the canonical `compareVersions` stops at
  * 3, which would treat 0.31.4.1 == 0.31.4.0); a malformed version fails
- * closed (keeps warning).
+ * closed (keeps warning), except a non-version target with a `from` version.
  */
 export function upgradeErrorResolved(
   failedToVersion: string,
   binaryVersion: string,
   schemaCurrent: boolean,
+  failedFromVersion?: string,
 ): boolean {
   if (!schemaCurrent) return false;
   if (typeof failedToVersion !== 'string' || typeof binaryVersion !== 'string') return false;
+  // #6718: a record with no installable target (`latest` from a pinned install
+  // with no newer published tag, `unknown` from a binary swap) can never be
+  // reached; the binary moving past the version it failed FROM supersedes it.
+  if (!isValidVersionString(failedToVersion) && typeof failedFromVersion === 'string') {
+    return isNewerVersion(failedFromVersion, binaryVersion);
+  }
   const a = binaryVersion.replace(/^v/, '').split('.');
   const b = failedToVersion.replace(/^v/, '').split('.');
   if (a.length === 0 || b.length === 0) return false;
@@ -54,7 +62,7 @@ export function upgradeErrorResolved(
  * in ts order.
  */
 function heldAutoUpgrade(recent: SelfUpgradeAuditEvent[], runningVersion: string): SelfUpgradeAuditEvent | null {
-  const last = recent.filter((e) => e.channel === 'autopilot').at(-1);
+  const last = recent.filter((e) => e.channel === 'autopilot' && e.action !== 'restart_serve').at(-1);
   if (last?.action !== ('unsupported_runtime' satisfies SelfUpgradeAction) || !last.latest) return null;
   return isNewerVersion(runningVersion, last.latest) ? last : null;
 }
@@ -85,16 +93,61 @@ export function checkSelfUpgradeHealth(): Check {
       };
     }
 
+    // GBRA-224: the effective release channel and where it came from (env > self_upgrade.channel > default stable).
+    const { resolveReleaseChannel, invalidChannelMessage, readUpdateCache } = require('../../../core/self-upgrade.ts');
+    const resolution = resolveReleaseChannel(cfg);
+    if (!resolution.ok) {
+      return {
+        name: 'self_upgrade_health',
+        status: 'warn',
+        message: `${invalidChannelMessage(resolution)} Update checks are off until it is fixed (mode=${mode}).`,
+        fix: agentFix(['gbrain', 'config', 'get', 'self_upgrade.channel'], 'Read-only: shows the configured channel; set stable or alpha with gbrain config set self_upgrade.channel <name>.', 'self_upgrade_health'),
+      };
+    }
     const parts: string[] = [`mode=${mode}`];
+    if (resolution.source !== 'default') parts.push(`channel=${resolution.channel} (${resolution.source})`);
     // Shared stale/foreign-cache guard: only report an upgrade strictly newer
     // than the RUNNING binary (pendingUpgradeVersion owns the rule).
-    const pendingLatest = pendingUpgradeVersion(GBRAIN_BINARY_VERSION, Date.now());
+    const pendingLatest = pendingUpgradeVersion(GBRAIN_BINARY_VERSION, Date.now(), resolution.channel);
+    const stableError = readUpdateCache(resolution.channel)?.error;
+    if (stableError) {
+      const { stableFailureMessage, stableFailureFix } = require('../../../core/stable-channel.ts');
+      return {
+        name: 'self_upgrade_health',
+        status: 'warn',
+        message: `${stableError.code}: ${stableFailureMessage(stableError)} ${stableFailureFix(stableError, resolution)} (${parts.join('; ')}).`,
+        fix: agentFix(['gbrain', 'self-upgrade', '--check-only', '--json'], 'Read-only: looks up the stable channel again and reports the channel, its source and any error code.', 'self_upgrade_health', { docs: 'docs/guides/upgrades-auto-update.md#stable-channel-errors' }),
+      };
+    }
     if (pendingLatest) {
       parts.push(`update available: ${GBRAIN_BINARY_VERSION} -> ${pendingLatest} (run: gbrain self-upgrade)`);
     }
     const failedVersions: string[] = cfg?.self_upgrade?.failed_versions ?? [];
     if (failedVersions.length > 0) {
       parts.push(`skipping known-bad: ${failedVersions.join(', ')}`);
+    }
+
+    // #6828: a known-bad entry the audit proves was never installed blocks
+    // that release forever; the fix is the preview of the clearing step.
+    if (failedVersions.length > 0) {
+      const { findNeverInstalledFailures, CLEAR_NEVER_INSTALLED_PREVIEW, CLEAR_NEVER_INSTALLED_APPLY } = require('../../../core/self-upgrade-recovery.ts');
+      const { clearable } = findNeverInstalledFailures() as { clearable: Array<{ version: string; running: string }> };
+      if (clearable.length > 0) {
+        const versions = clearable.map((e) => e.version).join(', ');
+        return {
+          name: 'self_upgrade_health',
+          status: 'warn',
+          message: `Auto-upgrade skips ${versions} as known-bad, but ${clearable.length === 1 ? 'it was' : 'they were'} never installed: a swap that installed nothing was reported as swapped (#6828) (${parts.join('; ')}).`,
+          fix: agentFix([...CLEAR_NEVER_INSTALLED_PREVIEW, '--json'],
+            'The preview lists each entry with the swap that recorded it and changes nothing; its --apply removes exactly those entries.',
+            'self_upgrade_health', {
+              docs: 'docs/guides/upgrades-auto-update.md#known-bad-never-installed',
+              then: agentFix([...CLEAR_NEVER_INSTALLED_APPLY],
+                'Removes exactly the entries the preview proved were never installed; gbrain config set self_upgrade.failed_versions puts one back.',
+                'self_upgrade_health'),
+            }),
+        };
+      }
     }
 
     // readRecent lists the current week before the previous one; order by ts.
@@ -171,7 +224,7 @@ export async function checkUpgradeErrors(
         schemaCurrent = v >= LATEST_VERSION;
       } catch { /* unverifiable → keep warning */ }
     }
-    if (upgradeErrorResolved(latest.to_version, GBRAIN_BINARY_VERSION, schemaCurrent)) {
+    if (upgradeErrorResolved(latest.to_version, GBRAIN_BINARY_VERSION, schemaCurrent, latest.from_version)) {
       return {
         name: 'upgrade_errors',
         status: 'ok',
@@ -192,10 +245,31 @@ export async function checkUpgradeErrors(
 /**
  * The running Bun against the supported floor. The CLI refuses to start below
  * it, so a local doctor normally reports ok; the fail row keeps the fix
- * command for any caller that reaches doctor on an older runtime.
+ * command for any caller that reaches doctor on an older runtime. A supported
+ * runtime below SECURE_BUN_VERSION warns (#7373; none today, as the floor is
+ * not below it, until a later Bun fix raises SECURE_BUN_VERSION): a standalone binary embeds
+ * the Bun it was built with, so its fix is a new gbrain binary, while a bun
+ * install runs on the user's Bun and `bun upgrade` fixes it.
  */
-export function checkBunRuntime(version = typeof Bun === 'undefined' ? '' : Bun.version): Check {
+export function checkBunRuntime(version = typeof Bun === 'undefined' ? '' : Bun.version, executable = process.execPath): Check {
   const refusal = unsupportedBunMessage(version);
   if (refusal) return { name: 'bun_runtime', status: 'fail', message: refusal.replaceAll('\n', ' ') };
-  return { name: 'bun_runtime', status: 'ok', message: `Bun ${version} (minimum ${MINIMUM_BUN_VERSION})` };
+  if (bunVersionMeets(version, SECURE_BUN_VERSION)) return { name: 'bun_runtime', status: 'ok', message: `Bun ${version} (minimum ${MINIMUM_BUN_VERSION})` };
+  const standalone = !/^bun(-[\w.-]+)?(\.exe)?$/i.test(executable.split(/[\\/]/).pop() ?? '');
+  return {
+    name: 'bun_runtime',
+    status: 'warn',
+    message: `Bun ${version} carries the Brotli decoder flaw CVE-2026-111497, fixed in Bun ${SECURE_BUN_VERSION} (reachable through fetch() with Content-Encoding: br and the decompression APIs). `
+      + (standalone
+        ? 'This gbrain binary embeds that Bun: install the latest gbrain binary (`gbrain upgrade`), then restart GBrain services. Upgrading a separately installed bun does not change it.'
+        : 'Run `bun upgrade`, then restart GBrain services.'),
+    fix: {
+      argv: standalone ? ['gbrain', 'upgrade'] : ['bun', 'upgrade'],
+      consent: [],
+      actor: 'user',
+      why: `Bun ${SECURE_BUN_VERSION} carries the Brotli fix for CVE-2026-111497; GBrain services pick it up on restart.`,
+      verify: doctorVerify('bun_runtime'),
+      requires_exclusive: false,
+    },
+  };
 }

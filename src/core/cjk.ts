@@ -209,3 +209,42 @@ export function splitCJKQueryTerms(query: string): string[] {
   return Array.from(new Set(terms));
 }
 
+
+/**
+ * Korean postpositions (조사), longest first so `endsWith` takes the longest
+ * particle ("에서" before "에"/"서", "으로" before "로").
+ */
+const KO_PARTICLES: readonly string[] = [
+  '에서는', '에게서', '으로는', '으로서',
+  '에서', '에게', '한테', '까지', '부터', '보다', '처럼', '마다',
+  '조차', '라도', '이나', '으로', '로서',
+  '은', '는', '이', '가', '을', '를', '에', '의', '로', '와', '과', '도', '만',
+];
+
+/** One-syllable stems ("회의" → "회") match almost everything, so a stem keeps 2+ characters. */
+const KO_MIN_STEM_LENGTH = 2;
+
+/**
+ * The noun stem of a Korean term with a trailing particle ("혈당에서" →
+ * "혈당"), or the term unchanged. Korean attaches particles to the noun, so
+ * the substring match would otherwise miss a page that says "혈당 수치". The
+ * stem is a substring of the inflected form, so matching the stem alone
+ * covers both spellings. Stripping is lexical (고양이 → 고양), which only
+ * widens a fallback match.
+ */
+export function stripKoreanParticle(term: string): string {
+  for (const p of KO_PARTICLES) {
+    if (term.length - p.length >= KO_MIN_STEM_LENGTH && term.endsWith(p)) return term.slice(0, -p.length);
+    if (term.endsWith(p)) return term;
+  }
+  return term;
+}
+
+/**
+ * The terms every CJK keyword builder matches: whitespace-split, Korean
+ * particles stripped, deduplicated in order. The count, the keyword pages and
+ * the chunk search all read this, so a count never disagrees with the rows.
+ */
+export function cjkMatchTerms(query: string): string[] {
+  return Array.from(new Set(splitCJKQueryTerms(query).map(stripKoreanParticle)));
+}

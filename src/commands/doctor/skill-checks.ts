@@ -4,6 +4,7 @@
  * symbol (tests and scripts/live-brain-first-check.ts import them from
  * doctor.ts) and buildChecks consumes them.
  */
+import { isManagedFilesystemPath } from '../../core/persistence/filesystem-guard.ts';
 import { join, resolve as resolvePath } from 'path';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import type { BrainEngine } from '../../core/engine.ts';
@@ -15,6 +16,8 @@ import {
 import { loadOrDeriveManifest } from '../../core/skill-manifest.ts';
 import { computeSkillCurrency } from '../../core/skillpack/skill-currency.ts';
 import { findGbrainRoot } from '../../core/skillpack/bundle.ts';
+import { findAllResolverFiles } from '../../core/resolver-filenames.ts';
+import { skillsIndexedIn } from '../../core/skills/index-block.ts';
 import { checkPreconditions, type PreconditionContext } from '../../core/skillpack/preconditions.ts';
 import { parseSkillFrontmatter } from '../../core/skill-frontmatter.ts';
 import {
@@ -159,21 +162,29 @@ export function skillCurrencyCheck(skillsDir: string): Check {
     const msg = err instanceof Error ? err.message : String(err);
     return { name, status: 'ok', message: `skill currency check skipped (${msg})` };
   }
-  const { counts, skills } = report;
+  const { counts } = report;
+  const indexed = new Set(findAllResolverFiles(targetWorkspace).flatMap(p => skillsIndexedIn(readFileSync(p, 'utf-8'))));
+  const skills = report.skills.filter(k => k.status !== 'new' || !indexed.has(k.slug));
+  const onDemand = report.skills.length - skills.length;
+  const newCount = counts.new - onDemand;
   const sample = (status: 'new' | 'drifted'): string => {
     const s = skills.filter(k => k.status === status).map(k => k.slug);
     return s.slice(0, 8).join(', ') + (s.length > 8 ? `, … +${s.length - 8} more` : '');
   };
-  if (counts.new === 0) {
+  if (newCount === 0) {
     const drift = counts.drifted > 0 ? ` (${counts.drifted} drifted — local edits are fine)` : '';
-    return { name, status: 'ok', message: `${counts.current}/${counts.total} built-in skills current${drift}` };
+    const spring = onDemand > 0 ? `; ${onDemand} more load on demand through the spring-loaded skill index` : '';
+    return { name, status: 'ok', message: `${counts.current}/${counts.total} built-in skills current${spring}${drift}` };
   }
   return {
     name,
     status: 'warn',
     message:
-      `${counts.new} new built-in skill(s) available that this workspace hasn't installed: ${sample('new')}. ` +
-      `Add them with \`gbrain skillpack sync\`.` +
+      `${newCount} new built-in skill(s) available that this workspace hasn't installed: ${sample('new')}. ` +
+      (isManagedFilesystemPath(skillsDir)
+        // #5606: on a managed canonical worktree skillpack sync is refused; name the route that works there.
+        ? 'This is a managed canonical worktree, where `gbrain skillpack sync` is refused: publish each reviewed bundle through `gbrain call --source <source> import_skill_proposal` (docs/guides/shared-brain-skills.md#publish-reviewed-filesystem-edits).'
+        : `Add them with \`gbrain skillpack sync\`.`) +
       (counts.drifted > 0 ? ` (${counts.drifted} drifted from the bundle — local edits are fine.)` : ''),
     details: {
       new: skills.filter(k => k.status === 'new').map(k => k.slug),

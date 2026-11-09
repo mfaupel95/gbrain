@@ -6,8 +6,9 @@
  * `brain-repo-durability.ts` re-exports it for its older callers.
  */
 import { readFileSync } from 'fs';
-import { execFile, type ChildProcess, type ExecFileException } from 'child_process';
+import { execFile, type ChildProcess, type ExecFileException } from './spawn.ts';
 
+/** Default time a stopped child gets to exit after SIGTERM before SIGKILL; a caller passes `termGraceMs` for children that need longer to clean up. */
 const BOUNDED_EXEC_TERM_GRACE_MS = 2_000;
 
 /**
@@ -31,6 +32,9 @@ export interface BoundedExecOptions {
   env?: NodeJS.ProcessEnv;
   maxBuffer?: number;
   signal?: AbortSignal;
+  termGraceMs?: number;
+  /** 'buffer' returns stdout and stderr as raw bytes (NUL-delimited git listings); default 'utf8'. */
+  encoding?: 'utf8' | 'buffer';
 }
 
 /**
@@ -45,13 +49,18 @@ export interface BoundedExecOptions {
  * Stopping sends SIGTERM first so git can remove its lockfiles (a SIGKILLed
  * `git add`/`commit` leaves `.git/index.lock` behind and every later git call
  * in that worktree fails), then SIGKILLs after a short grace period and
- * settles from the timer even if the exit event never arrives.
+ * settles from the timer even if the exit event never arrives. A git stalled in
+ * uninterruptible I/O or memory reclaim acts on SIGTERM only seconds later, so
+ * git callers pass a longer `termGraceMs` (#6932).
  */
-export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string; stderr: string }> {
-  const { timeout, signal, ...rest } = options;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions & { encoding: 'buffer' }): Promise<{ error: ExecFileException | null; stdout: Buffer; stderr: Buffer }>;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string; stderr: string }>;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string | Buffer; stderr: string | Buffer }> {
+  const { timeout, signal, termGraceMs = BOUNDED_EXEC_TERM_GRACE_MS, encoding = 'utf8', ...rest } = options;
+  const empty = encoding === 'buffer' ? Buffer.alloc(0) : '';
   return new Promise(resolve => {
     let settled = false;
-    const finish = (error: ExecFileException | null, stdout: string, stderr = '') => {
+    const finish = (error: ExecFileException | null, stdout: string | Buffer, stderr: string | Buffer = empty) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -64,12 +73,12 @@ export function execFileBounded(file: string, args: string[], options: BoundedEx
     const settleStopped = () => {
       clearTimeout(escalation);
       clearInterval(poll);
-      finish(stopped, '', '');
+      finish(stopped, empty, empty);
     };
-    const child = execFile(file, args, { ...rest, encoding: 'utf8' }, (error, stdout, stderr) => {
+    const child = execFile(file, args, { ...rest, encoding: encoding as BufferEncoding }, (error: ExecFileException | null, stdout: string | Buffer, stderr: string | Buffer) => {
       clearTimeout(escalation);
       clearInterval(poll);
-      if (stopped) finish(stopped, '', '');
+      if (stopped) finish(stopped, empty, empty);
       else finish(error, stdout, stderr);
     });
     const stop = (message: string, code: string) => {
@@ -80,7 +89,7 @@ export function execFileBounded(file: string, args: string[], options: BoundedEx
       escalation = setTimeout(() => {
         child.kill('SIGKILL');
         settleStopped();
-      }, BOUNDED_EXEC_TERM_GRACE_MS);
+      }, termGraceMs);
     };
     const timer = setTimeout(() => stop(`${file} did not finish within ${timeout}ms`, 'ETIMEDOUT'), timeout);
     const onAbort = () => stop(`${file} was aborted`, 'ABORT_ERR');

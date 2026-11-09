@@ -12,20 +12,34 @@ import { join } from 'path';
 export interface StorageConfig {
   db_tracked: string[];
   db_only: string[];
+  /**
+   * #6696 C7: opt-in policy, present only when declared. Drifted pages under these prefixes are reconciled with
+   * the database copy by the trusted local maintenance worker on the canonical owner host (repair/keep-db-policy.ts).
+   */
+  keep_db?: string[];
+  /**
+   * #8007/#8015: the directories of a deprecated `supabase_only` list that sat next to canonical keys and was ignored
+   * (canonical wins), minus those `db_only` already covers. Whether a page under one is database-only is ambiguous, so
+   * a caller deciding whether its missing file deletes it holds it instead (`dbOnlyVerdict`).
+   */
+  ignored_db_only?: string[];
 }
 
 export type StorageTier = 'db_tracked' | 'db_only' | 'unspecified';
 
 /** Recognized YAML keys (canonical and deprecated). */
 const STORAGE_KEYS = new Set([
-  'db_tracked', 'db_only',
+  'db_tracked', 'db_only', 'keep_db',
   'git_tracked', 'supabase_only', // deprecated aliases
 ]);
+const CANONICAL_STORAGE_KEYS = ['db_tracked', 'db_only', 'keep_db'];
 
 /**
- * Parse the gbrain.yml shape: a top-level `storage:` section with up to four
- * array-valued nested keys (canonical `db_tracked` / `db_only` plus the
- * deprecated aliases `git_tracked` / `supabase_only`).
+ * Parse the gbrain.yml shape: a top-level `storage:` section with up to five
+ * array-valued nested keys (canonical `db_tracked` / `db_only`, the opt-in
+ * `keep_db` policy, and the deprecated aliases `git_tracked` /
+ * `supabase_only`). Any other nested key is collected into `unknown`, which
+ * `loadStorageConfig` warns about once per key and process.
  *
  * Intentionally narrow. Does NOT handle the full YAML spec — only the file
  * shape gbrain controls. Trades expressiveness for zero-dep parsing and
@@ -44,11 +58,24 @@ const STORAGE_KEYS = new Set([
 type RawStorage = {
   db_tracked?: string[];
   db_only?: string[];
+  keep_db?: string[];
   git_tracked?: string[];
   supabase_only?: string[];
 };
 
-function parseStorageYaml(content: string): RawStorage | null {
+/**
+ * The values of a one-line flow list (`[]`, `[dir/, 'other/']`), or null when `text` is not one the parser resolves: not a
+ * flow list, a nested list, or an unquoted value holding whitespace (a missing comma: `[a/ b/]`, #8015).
+ */
+function parseFlowList(text: string): string[] | null {
+  const flow = /^\[(.*)\]$/.exec(text);
+  if (!flow || /[[\]]/.test(flow[1]!)) return null;
+  const tokens = [...flow[1]!.matchAll(/\s*("[^"]*"|'[^']*'|[^,]*)\s*(?:,|$)/g)].map((m) => m[1]!.trim());
+  if (tokens.some((token) => !/^["']/.test(token) && /\s/.test(token))) return null;
+  return tokens.map((token) => token.replace(/^["']|["']$/g, '')).filter(Boolean);
+}
+
+function parseStorageYaml(content: string, unknown: string[] = []): RawStorage | null {
   const lines = content.split('\n').map((line) => line.replace(/\r$/, ''));
 
   let inStorage = false;
@@ -96,13 +123,11 @@ function parseStorageYaml(content: string): RawStorage | null {
     const key = indented.slice(0, colon).trim();
     if (STORAGE_KEYS.has(key)) {
       currentList = key as keyof RawStorage;
-      // Inline empty list: `db_only: []`.
-      const remainder = indented.slice(colon + 1).trim();
-      if (remainder === '[]' && !raw[currentList]) {
-        raw[currentList] = [];
-      }
+      const values = parseFlowList(indented.slice(colon + 1).trim());
+      if (values) raw[currentList] = [...(raw[currentList] ?? []), ...values];
       continue;
     }
+    if (!unknown.includes(key)) unknown.push(key);
     currentList = null;
   }
 
@@ -116,7 +141,7 @@ function parseStorageYaml(content: string): RawStorage | null {
  * Resolution order (per plan eng-review pass 2 finding #2):
  *   1. If canonical keys present, use them.
  *   2. Else if deprecated keys present, map to canonical AND emit a
- *      once-per-process deprecation warning suggesting `gbrain doctor --fix`.
+ *      once-per-process deprecation warning asking for a rename by hand.
  *   3. If both are present, canonical wins. Deprecated keys are ignored
  *      with a stronger warning (the user is mid-migration).
  *
@@ -140,27 +165,30 @@ function normalizeStorageConfig(raw: RawStorage): StorageConfig {
       console.warn(
         `Warning: ${which} in gbrain.yml is deprecated and ignored ` +
           `(canonical keys db_tracked/db_only are present). ` +
-          `Remove the deprecated keys, or run \`gbrain doctor --fix\`.`,
+          `Move their directories under db_tracked / db_only by hand and remove them (see docs/storage-tiering.md).`,
       );
     } else {
       console.warn(
         `Warning: ${which} in gbrain.yml is deprecated. ` +
-          `Rename to db_tracked / db_only — see docs/storage-tiering.md. ` +
-          `Run \`gbrain doctor --fix\` for an automated rename.`,
+          `Rename them to db_tracked / db_only by hand — see docs/storage-tiering.md.`,
       );
     }
   }
 
+  const keep = raw.keep_db ? { keep_db: raw.keep_db } : {};
   if (hasCanonical) {
     return {
       db_tracked: raw.db_tracked ?? [],
       db_only: raw.db_only ?? [],
+      ...keep,
+      ...(raw.supabase_only?.length ? { ignored_db_only: raw.supabase_only } : {}),
     };
   }
 
   return {
     db_tracked: raw.git_tracked ?? [],
     db_only: raw.supabase_only ?? [],
+    ...keep,
   };
 }
 
@@ -181,6 +209,7 @@ function normalizeStorageConfig(raw: RawStorage): StorageConfig {
  *     surface "your config didn't take" rather than silently no-op.
  */
 let _missingStorageWarned = false;
+const _unknownKeysWarned = new Set<string>();
 
 export function loadStorageConfig(repoPath?: string | null): StorageConfig | null {
   if (!repoPath) return null;
@@ -191,48 +220,7 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
   // Read failure is a real error (not a "feature not configured" signal).
   // Throwing here lets the caller decide whether to crash or fall back.
   const content = readFileSync(yamlPath, 'utf-8');
-
-  let raw: RawStorage | null;
-  try {
-    raw = parseStorageYaml(content);
-  } catch (error) {
-    console.warn(
-      `Warning: Failed to parse gbrain.yml: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return null;
-  }
-
-  // No storage section at all → null (with sanity warning).
-  if (raw === null) {
-    if (!_missingStorageWarned) {
-      _missingStorageWarned = true;
-      console.warn(
-        `Warning: ${yamlPath} exists but has no storage configuration. ` +
-          `Add a "storage:" section with db_tracked / db_only arrays, ` +
-          `or remove gbrain.yml to suppress this warning.`,
-      );
-    }
-    return null;
-  }
-
-  const merged = normalizeStorageConfig(raw);
-
-  // Empty storage section → return as-is but warn.
-  if (merged.db_tracked.length === 0 && merged.db_only.length === 0) {
-    if (!_missingStorageWarned) {
-      _missingStorageWarned = true;
-      console.warn(
-        `Warning: ${yamlPath} exists but has no storage configuration. ` +
-          `Add a "storage:" section with db_tracked / db_only arrays, ` +
-          `or remove gbrain.yml to suppress this warning.`,
-      );
-    }
-    return merged;
-  }
-
-  // Normalize cosmetic issues + throw on semantic overlap (D7).
-  // Throws StorageConfigError on overlap — propagates to the caller.
-  return normalizeAndValidateStorageConfig(merged);
+  return storageConfigFromYaml(content, yamlPath);
 }
 
 export class StorageConfigError extends Error {
@@ -305,7 +293,8 @@ export function normalizeAndValidateStorageConfig(input: StorageConfig): Storage
 
   const tracked = normalize(input.db_tracked);
   const dbonly = normalize(input.db_only);
-  const allChanged = [...tracked.changed, ...dbonly.changed];
+  const keep = input.keep_db ? normalize(input.keep_db) : null;
+  const allChanged = [...tracked.changed, ...dbonly.changed, ...(keep?.changed ?? [])];
 
   if (allChanged.length > 0 && !_normalizationInfoEmitted) {
     _normalizationInfoEmitted = true;
@@ -326,7 +315,8 @@ export function normalizeAndValidateStorageConfig(input: StorageConfig): Storage
     }
   }
 
-  return { db_tracked: tracked.normalized, db_only: dbonly.normalized };
+  return { db_tracked: tracked.normalized, db_only: dbonly.normalized, ...(keep ? { keep_db: keep.normalized } : {}),
+    ...ignoredDbOnly(input.ignored_db_only, dbonly.normalized) };
 }
 
 /**
@@ -362,29 +352,109 @@ export function isDbOnly(slug: string, config: StorageConfig): boolean {
  * `effectiveDbOnlyDirs`, issue #3766). Only declared dirs count: the
  * derive-phase defaults may be file-backed on some brains.
  */
+function ignoredDbOnly(ignored: string[] | undefined, dbOnly: string[]): { ignored_db_only?: string[] } {
+  const uncovered = (ignored ?? []).map((dir) => (dir.endsWith('/') ? dir : dir + '/'))
+    .filter((dir) => !dbOnly.some((declared) => dir.toLowerCase() === declared.toLowerCase() || matchesTierDir(dir.toLowerCase(), declared.toLowerCase())));
+  return uncovered.length ? { ignored_db_only: uncovered } : {};
+}
+
+/**
+ * #8007/#8015: whether a page slug is database-only under this config, for a delete decision: true under a declared
+ * db_only dir, `unknown` under an ignored deprecated `supabase_only` dir that db_only does not cover, false otherwise.
+ */
+export function dbOnlyVerdict(slug: string, config: StorageConfig | null): boolean | 'unknown' {
+  if (isDeclaredDbOnlySlug(slug, config)) return true;
+  return config?.ignored_db_only?.some((dir) => matchesTierDir(slug, dir.toLowerCase())) ? 'unknown' : false;
+}
+
 export function isDeclaredDbOnlySlug(slug: string, config: StorageConfig | null): boolean {
   return config?.db_only.some((dir) => matchesTierDir(slug, dir.toLowerCase())) ?? false;
+}
+
+/** #6696 C7: whether a page slug sits under a declared `keep_db` prefix (case-insensitive, like `isDeclaredDbOnlySlug`). */
+export function isKeepDbSlug(slug: string, keepDb: readonly string[]): boolean {
+  return keepDb.some((dir) => matchesTierDir(slug, dir.toLowerCase()));
 }
 
 /**
  * True when gbrain.yml has a `db_only` (or deprecated `supabase_only`) key
  * line but no db_only directory resolved from it. `loadStorageConfig` warns
- * and resolves nothing for syntax the narrow parser does not handle (e.g.
- * flow-style `db_only: [dir/]`), so a caller that must not guess a tier
- * refuses instead. Only YAML key lines count, not comments or prose that
- * mention the word. Known false positive: an intentionally empty
- * `db_only: []` also counts, since it resolves to the same empty config.
+ * and resolves nothing for syntax the narrow parser does not handle (e.g. a
+ * flow list split over several lines, or a key outside the storage section),
+ * so a caller that must not guess a tier refuses instead. Only YAML key lines
+ * count, not comments or prose that mention the word; an explicit empty
+ * `db_only: []` declares no directory and does not count.
  */
 export function hasUnresolvedDbOnlyDeclaration(repoPath: string, config: StorageConfig | null): boolean {
-  if (config && config.db_only.length > 0) return false;
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is the registered local source root and the file name is a constant; this only reads its gbrain.yml
   const yamlPath = join(repoPath, 'gbrain.yml');
-  const yamlContent = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '';
-  return yamlContent.split('\n').some((line) => {
+  return unresolvedDbOnlyIn(existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '', config);
+}
+
+/**
+ * `hasUnresolvedDbOnlyDeclaration` over gbrain.yml's content. #8015: a db_only or supabase_only key whose inline value
+ * the parser refuses counts even when another key resolved, so a partly read declaration never answers "not db_only".
+ */
+export function unresolvedDbOnlyIn(content: string, config: StorageConfig | null): boolean {
+  const keys = content.split('\n').flatMap((line) => {
     const trimmed = line.trim();
-    if (trimmed.startsWith('#')) return false;
-    return /^(db_only|supabase_only)\s*:/.test(trimmed);
+    const key = trimmed.startsWith('#') ? null : /^(db_only|supabase_only)\s*:(.*)$/.exec(trimmed.replace(/\s+#.*$/, ''));
+    return key ? [key[2]!.trim()] : [];
   });
+  if (keys.some((value) => value !== '' && parseFlowList(value) === null)) return true;
+  if (config && config.db_only.length > 0) return false;
+  return keys.some((value) => value.replace(/\s+/g, '') !== '[]');
+}
+
+/** gbrain.yml content as `loadStorageConfig` reads it (`label` names the file in warnings); throws on overlapping tiers. */
+export function storageConfigFromYaml(content: string, yamlPath: string): StorageConfig | null {
+  let raw: RawStorage | null;
+  const unknown: string[] = [];
+  try {
+    raw = parseStorageYaml(content, unknown);
+  } catch (error) {
+    console.warn(
+      `Warning: Failed to parse gbrain.yml: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+
+  // No storage section at all → null (with sanity warning).
+  if (raw === null) {
+    if (!_missingStorageWarned) {
+      _missingStorageWarned = true;
+      console.warn(
+        `Warning: ${yamlPath} exists but has no storage configuration. ` +
+          `Add a "storage:" section with db_tracked / db_only arrays, ` +
+          `or remove gbrain.yml to suppress this warning.`,
+      );
+    }
+    return null;
+  }
+
+  for (const key of unknown.filter(key => !_unknownKeysWarned.has(key))) {
+    _unknownKeysWarned.add(key);
+    console.warn(`Warning: ${yamlPath}: unknown storage key '${key}' is ignored; storage takes ${CANONICAL_STORAGE_KEYS.join(', ')} (see docs/storage-tiering.md).`);
+  }
+
+  const merged = normalizeStorageConfig(raw);
+
+  // Empty storage section → return as-is but warn.
+  if (merged.db_tracked.length === 0 && merged.db_only.length === 0 && !merged.keep_db?.length) {
+    if (!_missingStorageWarned) {
+      _missingStorageWarned = true;
+      console.warn(
+        `Warning: ${yamlPath} exists but has no storage configuration. ` +
+          `Add a "storage:" section with db_tracked / db_only arrays, ` +
+          `or remove gbrain.yml to suppress this warning.`,
+      );
+    }
+    return merged;
+  }
+
+  // Normalize cosmetic issues + throw on semantic overlap (D7).
+  // Throws StorageConfigError on overlap — propagates to the caller.
+  return normalizeAndValidateStorageConfig(merged);
 }
 
 /**
@@ -469,6 +539,7 @@ export const isSupabaseOnly = isDbOnly;
 /** Reset once-per-process warning flags. Test-only. */
 export function __resetMissingStorageWarning(): void {
   _missingStorageWarned = false;
+  _unknownKeysWarned.clear();
   _deprecationWarned = false;
   _normalizationInfoEmitted = false;
 }

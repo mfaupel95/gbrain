@@ -22,6 +22,9 @@ export class TimeoutError extends Error {
 const TERMINAL_STATES: readonly MinionJobStatus[] = ['completed', 'failed', 'dead', 'cancelled'] as const;
 const TERMINAL_SET = new Set<MinionJobStatus>(TERMINAL_STATES);
 
+/** completed, failed, dead or cancelled: the job will not run again unless someone retries it. */
+export function isTerminalJobStatus(status: MinionJobStatus): boolean { return TERMINAL_SET.has(status); }
+
 export interface WaitOpts {
   /** Abort after this many ms. Default: 24h (long enough for most durable runs). */
   timeoutMs?: number;

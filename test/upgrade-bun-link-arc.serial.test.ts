@@ -244,6 +244,8 @@ async function spawnWithShims(
     PATH: `${fx.shimDir}:${process.env.PATH ?? ''}`,
     HOME: fx.home,
     GBRAIN_HOME: fx.home,
+    // The install method's own path (alpha); the stable channel has its own suite (upgrade-stable-channel).
+    GBRAIN_RELEASE_CHANNEL: 'alpha',
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_TERMINAL_PROMPT: '0',
     NO_COLOR: '1',
@@ -347,13 +349,14 @@ describe('runUpgrade — bun-link arc (real git vs local bare origin; bun/gbrain
     expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.originHead);
 
     // Recorder sequence: the bun shim saw the POST-pull HEAD (pull ran first),
-    // then verify → post-upgrade → features, in order, and nothing else.
+    // then verify → post-upgrade → features → the new build's restart (GBRA-175), in order, and nothing else.
     expect(argvLines(fx)).toEqual([
       `bun install ::head=${fx.originHead}`,
       'gbrain --version',
       'gbrain --help',
       'gbrain post-upgrade',
       'gbrain features',
+      'gbrain upgrade --restart-only',
     ]);
 
     // saveUpgradeState checkpoint: $HOME/.gbrain/upgrade-state.json.

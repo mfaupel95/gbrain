@@ -53,7 +53,7 @@ async function pooledPlan(): Promise<unknown> {
   const stmt = buildVectorSearchStatement({ dialect: 'postgres', embedding: query, limit: 50, offset: 0, opts });
   const attempt = { innerLimit: stmt.innerLimit, maxScanTuples: POOL_MAX_SCAN_TUPLES, remainingMs: 8_000, exact: false };
   const run = (engine as unknown as { runVectorAttempt: (s: unknown, a: unknown, i: boolean, o: unknown, r: Run) => Promise<Record<string, unknown>[]> }).runVectorAttempt;
-  const [row] = await run.call(engine, stmt, attempt, true, opts, (tx, sql, bound) => tx.unsafe(`EXPLAIN (FORMAT JSON) ${sql}`, bound));
+  const [row] = await run.call(engine, () => stmt, attempt, true, opts, (tx, sql, bound) => tx.unsafe(`EXPLAIN (FORMAT JSON) ${sql}`, bound));
   return row?.['QUERY PLAN'];
 }
 

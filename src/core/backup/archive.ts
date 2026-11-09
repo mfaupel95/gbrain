@@ -7,7 +7,9 @@ import { protectNewBackupPath } from './private-path.ts';
 
 const MAGIC = Buffer.from('GBRAIN-BACKUP-1\n');
 const MAX_MANIFEST = 8 * 1024 * 1024;
-const MAX_BYTES = 8 * 1024 * 1024 * 1024;
+/** The archive's total payload cap (8 GiB); `gbrain backup create` checks it up front (#6649). */
+export const BACKUP_ARCHIVE_MAX_BYTES = 8 * 1024 * 1024 * 1024;
+const MAX_BYTES = BACKUP_ARCHIVE_MAX_BYTES;
 const MAX_FILES = 100_000;
 export interface ArchiveEntry { path: string; size: number; sha256: string }
 export interface ArchiveManifest { format_version: 1; entries: ArchiveEntry[]; [key: string]: unknown }
@@ -162,6 +164,8 @@ export function readBackupArchive(archive: string, destination: string): Archive
  * PGLite dumpDataDir emits ustar with /-prefixed cluster-relative paths.
  * Parse its narrow format ourselves: never hand an unchecked tar to a runtime.
  * Reject links/devices/PAX/duplicates and verify checksums before writing.
+ * Files are not flushed here: the restore flushes every file of its staged tree once before the ready receipt
+ * (a per-file flush here cost 11-22 s per restore on win32-arm64 and was repeated by that tree sync).
  */
 export function extractPgliteDump(file: string, destination: string): void {
   const fd = openSync(file, 'r');
@@ -220,7 +224,6 @@ export function extractPgliteDump(file: string, destination: string): void {
             const block = readExactly(fd, Math.min(size - copied, 1024 * 1024), offset + copied);
             writeAll(out, block); copied += block.length;
           }
-          fsyncSync(out);
         } finally { closeSync(out); }
       }
       offset += Math.ceil(size / 512) * 512;

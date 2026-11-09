@@ -28,21 +28,26 @@ import {
   ensureIpcSecretForConfig,
   type IpcHandlers,
   type IpcServerOpts,
+  type TurnContextRequest,
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 import { lexicalArmsEnabled } from '../core/context/reflex.ts';
 import { VOLUNTEER_MAX_PAGES_CAP } from '../core/context/volunteer.ts';
-import { assembleTurnContext } from '../core/context/turn-context.ts';
+import { assembleTurnContext, TURN_CONTEXT_DEFAULT_MAX_BYTES, type TurnContextResult } from '../core/context/turn-context.ts';
+import { attachBrief, briefEnabled, BRIEF_MAX_BYTES, recordBriefDelivered, turnBrief, TURN_BRIEF_CUTOFF_MS, withBriefDeadline } from '../core/context/proactive-brief.ts';
+import { proactiveEligibility } from '../core/eligibility/registry.ts';
+import { readHotMemorySessionOnly } from '../core/facts/meta-hook.ts';
 import { makeContextPackIpcHandler } from './context-pack-handler.ts';
-import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+import { logBriefDeliveryFireAndForget, logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
 import { persistenceSocketPathForConfig, startPersistenceIpcServer, type PersistenceIpcProvider, type PersistenceIpcBinding } from '../core/persistence/ipc.ts';
 import { residentPersistenceConfig } from '../core/persistence/local-client.ts';
+import { findIpcPathTooLong, ipcPathTooLongMessage } from '../core/context/ipc-path-too-long.ts';
 
 export interface ResolveIpcBinding {
-  /** The bound listener, or null when binding was skipped/failed (best-effort). */
-  server: Server | null;
-  /** The socket path the listener bound (null when not bound). */
-  socketPath: string | null;
+  /** The bound listener for this serve's own resolve socket, or null while it is not bound (best-effort). */
+  readonly server: Server | null;
+  /** The socket path the listener bound (null while not bound). */
+  readonly socketPath: string | null;
   /** Dedicated persistence listener; its larger frames never enter hook handlers. */
   persistence?: PersistenceIpcBinding;
   /** Idempotent teardown: close the listener + reap the socket file. */
@@ -50,6 +55,54 @@ export interface ResolveIpcBinding {
 }
 
 const NULL_BINDING: ResolveIpcBinding = { server: null, socketPath: null, close: () => {} };
+
+/** #6647: a serve that could not bind a resolve socket retries it this often (plus jitter). */
+export const RESOLVE_IPC_REBIND_INTERVAL_MS = 30_000;
+const RESOLVE_IPC_REBIND_JITTER_MS = 5_000;
+
+function defaultRebindDelayMs(): number {
+  return RESOLVE_IPC_REBIND_INTERVAL_MS + Math.floor(Math.random() * RESOLVE_IPC_REBIND_JITTER_MS);
+}
+
+/**
+ * The turn_context assembly the serve answers with (minus the pressure gate).
+ * Wave 5 D5 proactive brief (default off): the legacy block is assembled
+ * first and stands on its own; when `context.proactive_brief` is on, the
+ * brief runs in what is left of a request-start cutoff (its queries stop once
+ * it passes), inside a byte reservation taken from the legacy block, and
+ * leads the text. Off, this is the legacy assembly exactly. Always assembles
+ * against the serve's OWN registered source [CX2-10].
+ */
+export async function turnContextWithBrief(engine: BrainEngine, sourceId: string, req: TurnContextRequest): Promise<TurnContextResult> {
+  const clock = { now: Date.now(), stopAt: Date.now() + TURN_BRIEF_CUTOFF_MS };
+  const briefOn = await briefEnabled(engine);
+  const base = await assembleTurnContext(engine, {
+    sourceId,
+    window: req.window ?? [],
+    priorContextText: req.priorContextText,
+    sessionId: req.sessionId,
+    sessionOnly: await readHotMemorySessionOnly(engine),
+    maxBytes: briefOn ? Math.max(1024, (req.maxBytes ?? TURN_CONTEXT_DEFAULT_MAX_BYTES) - BRIEF_MAX_BYTES - 2) : req.maxBytes,
+    // Per-request config read: `gbrain serve` is long-running, and the
+    // lexical-arms switch reverts a false-fire regression on the NEXT turn
+    // (adversarial F3).
+    lexicalArms: lexicalArmsEnabled(loadConfig()),
+  });
+  const last = req.window?.at(-1);
+  const prompt = last?.role === 'user' ? last.text : '';
+  if (!briefOn || !prompt.trim()) return base;
+  const brief = await withBriefDeadline(proactiveEligibility({ engine }, 'hook.user_prompt').then((eligibility) => turnBrief(engine, {
+    sourceId, prompt, sessionId: req.sessionId, priorContextText: req.priorContextText, eligibility, clock,
+  })), clock);
+  return attachBrief(base, brief);
+}
+
+/** A delivered block's brief: record its ids for the session, then log them. No-op without a brief. */
+export function briefDelivered(engine: BrainEngine, sourceId: string, result: TurnContextResult, sessionId: string | undefined): void {
+  if (!result.brief) return;
+  recordBriefDelivered(sourceId, sessionId, result.brief.items.map((i) => i.id));
+  logBriefDeliveryFireAndForget(engine, result.brief, sessionId);
+}
 
 /**
  * Bind the resolve/turn_context/context_pack (+ delegated sync/sweep) IPC
@@ -88,22 +141,39 @@ export async function bindResolveIpcForServe(
   engine: BrainEngine,
   defaultSource: string,
   persistenceProvider?: PersistenceIpcProvider,
-  opts: { rememberCallable?: boolean | (() => boolean) } = {},
+  opts: {
+    rememberCallable?: boolean | (() => boolean);
+    /** #7599: a lean serve (a read-only stdio serve on Postgres, `readOnlyServeSkipsResidentDuties`) registers no delegated sync, nudge or sweep kind (clients get the polite refusal); PGLite keeps them. #7612: it binds only its read socket, never the source or legacy socket a read-write serve answers delegation on. */
+    lean?: boolean;
+    /** Delay before each re-bind attempt of a socket this serve does not hold; tests inject a short one. */
+    rebindDelayMs?: () => number;
+  } = {},
 ): Promise<ResolveIpcBinding> {
   let persistence: PersistenceIpcBinding | null = null;
   try {
     const cfg = loadConfig();
     // #5042: this serve's own source-keyed socket, plus the legacy URL-only
     // socket when it is free (older hooks and hooks naming no source).
-    const resolveSocket = resolveSocketPathForConfig(cfg, 'resolve', defaultSource);
-    const legacySocket = resolveSocketPathForConfig(cfg);
+    // #7612: a lean serve on Postgres binds its read socket alone, so it can
+    // never hold either delegation-capable socket ahead of a read-write serve.
+    const readSocket = opts.lean ? resolveSocketPathForConfig(cfg, 'read', defaultSource) : null;
+    const resolveSocket = readSocket ?? resolveSocketPathForConfig(cfg, 'resolve', defaultSource);
+    const legacySocket = readSocket ?? resolveSocketPathForConfig(cfg);
     if (!resolveSocket || !legacySocket) return NULL_BINDING;
+
+    // #6573: a socket path the OS cannot bind (even after the per-user
+    // run-dir fallback) is reported once, typed, and never retried.
+    const tooLong = (path: string | null) => {
+      const problem = findIpcPathTooLong([path]);
+      if (problem) process.stderr.write(`[resolve-ipc] ${ipcPathTooLongMessage(problem)}\n`);
+      return problem !== null;
+    };
 
     // The owner socket follows the brain the engine opened, which may be a mount (#5237).
     const owner = residentPersistenceConfig(cfg);
     if (persistenceProvider && owner?.engine === 'pglite') {
       const persistenceSocket = persistenceSocketPathForConfig(owner);
-      if (persistenceSocket) {
+      if (persistenceSocket && !tooLong(persistenceSocket)) {
         try { persistence = await startPersistenceIpcServer(persistenceSocket, persistenceProvider); }
         catch {
           process.stderr.write('[persistence-ipc] listener unavailable; local callers will receive owner_unavailable.\n');
@@ -126,8 +196,9 @@ export async function bindResolveIpcForServe(
     // catch would otherwise swallow the error and start NO listener).
     // Kill switch: GBRAIN_SERVE_SYNC_IPC=0 → the kinds are simply not
     // registered and clients get 'unsupported_kind' (the polite refusal).
-    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    const delegation = process.env.GBRAIN_SERVE_SYNC_IPC !== '0' && !opts.lean;
+    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort' | 'sync_nudge'> = {};
+    if (delegation) {
       try {
         const runner = await import('../core/serve-sync-runner.ts');
         syncHandlers = {
@@ -139,6 +210,8 @@ export async function bindResolveIpcForServe(
             }),
           sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId, typeof req.afterLine === 'number' ? req.afterLine : 0),
           sync_abort: (req) => runner.abortDelegatedSync(req.jobId),
+          // GBRA-133 PR 2a: a wanted marker recorded through this serve, acknowledged, and a nudge to its notifier.
+          sync_nudge: async (req) => (await import('../core/notifier/nudge.ts')).recordSyncNudge(engine, req),
         };
       } catch (e) {
         process.stderr.write(
@@ -150,7 +223,7 @@ export async function bindResolveIpcForServe(
     // try/catch so a runner failure never takes the other kinds down.
     // Shares the GBRAIN_SERVE_SYNC_IPC kill switch (one delegation family).
     let sweepHandlers: Pick<IpcHandlers, 'sweep_start' | 'sweep_status'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    if (delegation) {
       try {
         const sweepRunner = await import('../core/serve-sweep-runner.ts');
         sweepHandlers = {
@@ -198,16 +271,7 @@ export async function bindResolveIpcForServe(
       // source — cross-source requests are rejected in the IPC layer via
       // boundSourceId below, and the handler never honors a caller source.
       turn_context: async (req) => ({
-        ...await assembleTurnContext(engine, {
-          sourceId: defaultSource,
-          window: req.window ?? [],
-          priorContextText: req.priorContextText,
-          sessionId: req.sessionId,
-          maxBytes: req.maxBytes,
-          // Per-request config read — same next-turn-revert rationale as
-          // the resolve handler above (adversarial F3).
-          lexicalArms: lexicalArmsEnabled(loadConfig()),
-        }),
+        ...await turnContextWithBrief(engine, defaultSource, req),
         // Context-pressure gate for the harness hook (pressure.ts); a surface without remember never warns.
         pressure: await readPressureGate(engine, typeof opts.rememberCallable === 'function' ? opts.rememberCallable() : opts.rememberCallable ?? true),
       }),
@@ -242,33 +306,60 @@ export async function bindResolveIpcForServe(
       // in context_volunteer_events under the request's channel. Body
       // lives in volunteer-events.ts (logTurnContextDeliveryFireAndForget)
       // so the shipped wiring is unit-testable.
-      onTurnContextDelivered: (result, req) =>
-        logTurnContextDeliveryFireAndForget(engine, result, req),
+      // Wave 5 D5: a delivered brief (UserPromptSubmit or SessionStart) is
+      // ledgered for repeat suppression and logged under channel 'brief'.
+      onTurnContextDelivered: (result, req) => {
+        logTurnContextDeliveryFireAndForget(engine, result, req);
+        briefDelivered(engine, defaultSource, result, req.sessionId);
+      },
+      onContextPackDelivered: (result, req) => briefDelivered(engine, defaultSource, result, req.sessionId),
       boundSourceId: defaultSource,
       secret: ipcSecret,
     };
-    const server = await startResolveIpcServer(resolveSocket, handlers, serverOpts);
-    const legacyServer = legacySocket === resolveSocket ? null : await startResolveIpcServer(legacySocket, handlers, serverOpts);
-
-    // startResolveIpcServer returns null when the socket is already owned
-    // by a live listener (another serve) — that serve is the IPC provider.
-    if (!server && !persistence) {
-      try { legacyServer?.close(); } catch { /* noop */ }
-      return NULL_BINDING;
-    }
-
+    // #6647: every socket this serve could not bind (its source socket, the
+    // legacy socket) is retried on its own unref'd timer through the same
+    // startResolveIpcServer, which still defers to a live or unknown owner
+    // (#4896), so a surviving serve takes over only once the owner probes
+    // dead. Bind attempts and close() run one at a time per serve; a bind
+    // that completes after close() is closed at once. Persistence is never
+    // re-set-up here.
+    const slots = [resolveSocket, ...(legacySocket === resolveSocket ? [] : [legacySocket])]
+      .filter(path => !tooLong(path))
+      .map(path => ({ path, server: null as Server | null, timer: undefined as ReturnType<typeof setTimeout> | undefined }));
+    const rebindDelayMs = opts.rebindDelayMs ?? defaultRebindDelayMs;
     let closed = false;
+    let lifecycle: Promise<void> = Promise.resolve();
+    const serialized = (step: () => Promise<void>): Promise<void> => (lifecycle = lifecycle.then(step, step));
+    const bind = async (slot: (typeof slots)[number], retry: boolean): Promise<void> => {
+      if (closed || slot.server) return;
+      const server = await startResolveIpcServer(slot.path, handlers, serverOpts).catch(() => null);
+      if (closed) { try { server?.close(); } catch { /* noop */ } return; }
+      if (!server) { schedule(slot); return; }
+      slot.server = server;
+      if (retry) process.stderr.write(`[resolve-ipc] took over ${slot.path} after its previous owner exited\n`);
+    };
+    const schedule = (slot: (typeof slots)[number]): void => {
+      if (closed) return;
+      slot.timer = setTimeout(() => {
+        slot.timer = undefined;
+        void serialized(() => bind(slot, true));
+      }, rebindDelayMs());
+      slot.timer.unref?.();
+    };
+    await serialized(async () => { for (const slot of slots) await bind(slot, false); });
+
+    const own = slots.find(slot => slot.path === resolveSocket);
     return {
-      server,
-      socketPath: server ? resolveSocket : null,
+      get server() { return own?.server ?? null; },
+      get socketPath() { return own?.server ? resolveSocket : null; },
       ...(persistence ? { persistence } : {}),
       close: () => {
         if (closed) return;
         closed = true;
+        for (const slot of slots) clearTimeout(slot.timer);
         // server.close() unlinks the pathname THIS listener bound; never
         // blind-unlink the path — it may belong to a newer live serve (#4896).
-        try { server?.close(); } catch { /* noop */ }
-        try { legacyServer?.close(); } catch { /* noop */ }
+        for (const slot of slots) { try { slot.server?.close(); } catch { /* noop */ } }
         persistence?.close();
       },
     };

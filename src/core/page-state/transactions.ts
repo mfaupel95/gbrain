@@ -91,3 +91,25 @@ export async function pipelined(engine: object, calls: ReadonlyArray<() => Promi
   if (failed) throw failed.reason;
   return settled.map(s => (s as PromiseFulfilledResult<unknown>).value);
 }
+
+/**
+ * GBRA-133 (PR 2b): statements a Postgres transaction sends without waiting for before its COMMIT (a coordinated write's
+ * settings restore), so they share COMMIT's round trip. Each is ordered ahead of COMMIT on the transaction's connection,
+ * and the driver never sends a statement behind COMMIT, so #6543's boundary holds. One that failed aborted the
+ * transaction, so its COMMIT rolled back: the transaction then rejects with that statement's error.
+ */
+export async function withCommitChecks<T>(run: (checks: Array<Promise<unknown>>) => Promise<T>): Promise<T> {
+  const checks: Array<Promise<unknown>> = [];
+  const result = await run(checks);
+  await Promise.all(checks);
+  return result;
+}
+
+/** A statement already sent: left to the enclosing Postgres transaction's COMMIT (undefined), or returned to await. */
+export function settleAtCommit(engine: object, sent: Promise<unknown>): Promise<unknown> | undefined {
+  const checks = (engine as { _commitChecks?: Array<Promise<unknown>> })._commitChecks;
+  if (!checks) return sent;
+  sent.catch(() => undefined);
+  checks.push(sent);
+  return undefined;
+}

@@ -5,6 +5,72 @@
 Sub-agents and fresh sessions inherit gbrain tools but not the knowledge of
 when and how to use them. This file is that knowledge.
 
+## Which gbrain call for which lookup
+
+<!-- BEGIN lookup-table -->
+Ask gbrain before you `grep`, `cat`, `ls` or run SQL on the brain checkout: it
+reads the index across every source, ranks, filters and names the slug to read
+next. With the gbrain MCP server connected, call the tool of the same name
+instead of the CLI (one connection, no per-call startup).
+
+| Lookup | CLI | MCP tool |
+|---|---|---|
+| Find a page by name or path | `gbrain find <name\|prefix\|glob> [--type T] [--source S]` | `find_pages` |
+| Count pages by kind or source | `gbrain stats --by source,type [--since 30d] [--collapse-aliases]` | `get_stats` (needs an admin-scope token) |
+| Answer a question, search a topic | `gbrain query "<question>" [--types '["meeting"]'] [--since 30d]` | `query` |
+| Pages with these words | `gbrain search "<words>" [--match keyword] [--source S]` | `search` |
+| Read a known page | `gbrain get <slug>` | `get_page` |
+| Read only the part a search hit points at | `gbrain get <slug> --around-chunk-id <chunk_id>` or `--lines '{"from":1,"count":200}'` | `get_page` |
+| What the brain knows about a person or company | `gbrain entity <slug>`, then `gbrain recall "<topic>" --json` | `entity`, `recall` |
+| Links, dated events, every page of a type | `gbrain backlinks <slug>`, `gbrain timeline <slug>`, `gbrain list --type T` | `get_backlinks`, `get_timeline`, `list_pages` |
+| Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
+| Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
+
+Parse `--json` output instead of matching the text; notices go to stderr. Never
+send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
+then reads as "no results"; check the exit code too. Take
+`chunk_id` from a fresh `search --json` hit (an old one fails `revision_changed`),
+and read a degraded notice before concluding the brain has nothing.
+<!-- END lookup-table -->
+
+<a id="identity-exact-match"></a>
+## Dated questions: read by valid time
+
+When the user asks what a page said, or what was in force, on a date, read it
+with `get_page {slug, as_of: 'YYYY-MM-DD'}` (CLI: `gbrain get <slug> --as-of
+<date>`), not the current page. Quote text only from an `in_force` answer; any
+other status puts the edition under `last_in_force` or `earliest_known`, and
+says so. When `valid_time.uncertain` is true, tell the user why and follow the
+`fix` (it asks the user for a date or a backup; never invent either). A reply
+without `valid_time` is the current page.
+
+When you edit a page whose text takes effect on a date, keep its `valid_from`
+for a correction, or set a new quoted `valid_from` for a new edition. Read the
+write result's `valid_time` advisory and ask the user when it asks a question.
+Which record to use for a change in effect (edit in place, amendment record,
+`supersedes` link): the page history guide (`docs/guides/page-history.md`, Valid time).
+
+## Identity needs an exact match
+
+Resolving an email sender, a calendar attendee or a contact to a person page is
+an identity decision, and a search's top hit is not one: ranking always returns
+something, so taking it files strangers onto known contacts. Use the exact
+lookup:
+
+```bash
+gbrain whois alice@acme-example.com --source-id __all__ --json   # an email address
+gbrain whois "Alice Example" --source-id __all__ --json          # a display name
+```
+
+`whois` returns the entity pages whose frontmatter email, title or declared
+alias equals the query, ignoring case, accents and quotes, and never anything
+fuzzy. Look up the email address first and the display name only when the
+address has no match. One match is the person. `matches: []` means no exact
+match: treat the sender as new or ask the user. `ambiguous: true` means
+several pages match: ask, or resolve by the email address. Never fall back to
+a search's top hit, a partial name or a similar address, and never merge a
+stranger into a known contact's page.
+
 ## Available GBrain Tools
 
 Your tool inventory includes these (prefixed `gbrain__` in OpenClaw):
@@ -12,7 +78,7 @@ Your tool inventory includes these (prefixed `gbrain__` in OpenClaw):
 | Tool | Use for |
 |------|---------|
 | `gbrain__search` / `search` | Exact tokens / known names — cheap hybrid, no expansion |
-| `gbrain__query` / `query` | Concept / landscape questions — hybrid + LLM expansion |
+| `gbrain__query` / `query` | Concept / landscape questions — hybrid; `expand: true` adds LLM expansion |
 | `gbrain__get_page` / `get_page` | Direct page read when you know the slug |
 | `gbrain__get_links` / `get_links` | Outgoing links from a page |
 | `gbrain__get_backlinks` / `get_backlinks` | Who references this entity |
@@ -33,9 +99,9 @@ Route by the SHAPE of the question, then escalate:
 1. **Exact known token / name / structured field** → **`search`** — cheap
    hybrid (vector + keyword, no expansion; embedding-only cost).
 2. **Concept / landscape / synonym-phrased question** ("all the X that do Y",
-   "the landscape of Z") → **`query`** FIRST — multi-query expansion recovers
-   phrasings `search` misses. Costs one extra LLM expansion call; worth it
-   for these.
+   "the landscape of Z") → **`query`** FIRST — meaning-match and reranking recover
+   phrasings `search` misses. `expand: true` adds one LLM expansion call
+   when the results look thin.
 3. **`get_page`** if you found a slug — read the full compiled truth.
 4. **External APIs only after steps 1-2 return nothing useful.**
 
@@ -131,3 +197,12 @@ until the canonical form lands. Silent typos would be the worst outcome
 When in doubt: declare `brain_first: exempt` explicitly OR add the
 canonical Convention callout near the top of the skill body. Both are
 zero-friction one-line operations.
+
+## Recording why a page changed
+
+When you edit a policy, contract, plan or any document page, pass `reason` on
+`put_page` or `edit_page` with one line on why, in the user's words where you
+have them ("Client asked for the 30-day window."). Edit the existing page with
+its `expected_revision`; don't create a second page for a new edition.
+`get_versions` shows each version's `replaced_because`. Never put a credential
+in a reason: it can be pushed in a Git commit message, and gbrain refuses it.

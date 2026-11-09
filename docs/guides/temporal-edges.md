@@ -70,14 +70,18 @@ the page states:
 - **Frontmatter `since` / `until`** on relationship objects:
   `company: [{ name: Acme, since: 2021-04, until: 2024-02-15 }]` (partial dates
   normalize to the first day of the month or year). List the company twice for a
-  rejoin.
+  rejoin. A name dates the target it names exactly or by slug prefix (`Acme` for
+  `acme-example`); when several objects in one field match a target, only the exact
+  match dates it.
 - **Past-tense prose.** "previously at", "former CTO of", "used to work at" mark the
   page's assertion as past ("has worked at" and "was promoted to CTO at" stay present).
   A relationship with no dated evidence at all then reads as ended at an unknown date;
   a dated start stays open until a dated end, whatever the prose says. On one page, a
   present-tense mention wins ("previously at Acme, now runs Acme's EU team" stays live).
 - **Manual edges:** `add_link` accepts `valid_from` and `valid_until` (YYYY-MM-DD).
-  Re-run `add_link` with `valid_until` to record that a relationship ended.
+  Re-run `add_link` with `valid_until` to record that a relationship ended. On a
+  managed brain the edge and its dates are a row of the from page's `## Links` table
+  (`<!--- gbrain:links:begin -->`); editing or deleting that row edits or removes the edge.
 
 Dated evidence beats undated evidence from any page: a closure on a person's timeline
 ends the relationship even if the company page still lists them under `key_people`.
@@ -173,7 +177,9 @@ sections). A link may keep a `mentions` row beside a typed one.
 `all`) and `as_of`; `traverse_graph` walks live relationships (read history with
 `get_links` or `get_backlinks`). When a default read leaves relationships
 out, the response carries a `former_relationships_hidden` notice with the exact call
-that shows them, and `gbrain.temporal` response metadata with the count.
+that shows them, and `gbrain.temporal` response metadata with the count. Both filters run before the
+500-row page cap, so a hidden relationship never takes a row; on a paged read the count
+covers the rows that page spans.
 
 Recipe for "where did alice-example work in 2022":
 
@@ -216,8 +222,11 @@ its closures are applied as timeline lines, each undoable. Set
 
 The closure date is the newer relationship's start. When someone left one job and
 started the next later, and only the "joined" lines are written, the earlier job closes
-on the later start date: late, not wrong. An explicit end line
-(`Ended works_at [[companies/x]]`) or a "left" line dates it exactly.
+on the later start date: late, not wrong. So a closure only the check dated is shown as
+an upper bound, `ended: works_at acme-example (by 2025-03-01)`, and `gbrain beliefs
+changes` marks it `end by 2025-03-01`. An explicit end line
+(`Ended works_at [[companies/x]]`) or a "left" line dates it exactly and replaces the
+inferred end, whether its date is earlier or later.
 
 | Setting | Default |
 |---|---|
@@ -294,6 +303,68 @@ reversible timeline line.
 
 Older gbrain releases reject a pack that uses `cardinality`, so set the pack's
 `gbrain_min_version` to the release that adds it.
+
+## Amendments: the amends link
+
+A record that changes some terms of an earlier record (a contract amendment, a
+revised policy) links to it with `amends`. The earlier record still governs the
+terms the amendment did not change, so `amends` is metadata, not a ranking input:
+
+- **No ranking effect.** Adding amends edges leaves every final search score and
+  ranking signal unchanged: the backlink boost, the in-set and cross-source adjacency
+  boosts, relational fanout and chain hops, the typed (hub) degree, the enrich
+  inbound-link order, canonical entity picks, generated-page demotion and entity
+  anchoring. The list of non-ranking link types is in code
+  (`src/core/link-ranking-policy.ts`); a pack needs no field for it.
+- **Still a reference.** `get_links`, `get_backlinks`, `traverse_graph`, entity-card
+  edges, `backlink_count` and `referenced_by` return amends edges as usual.
+- **`since` is when the amended terms take effect.** Declare `amends` with
+  `temporal: event`, and `since` on each frontmatter object records the start
+  (`link_relationships.first_start`, in the `all` and `world` read scopes).
+- **Never hidden for starting later.** A default or `as_of` read keeps an amends
+  edge whose `since` is still ahead (status `not_started` in history reads), and so
+  does a `during` window that ends before it. `status: "ended"` never returns one.
+- **`supersedes` is different.** It marks a record replaced as a whole: search
+  halves the replaced record's score and labels it `superseded`. Use `amends`
+  whenever the earlier record still governs part of the terms.
+
+The frontmatter mapping is per page type (`frontmatter_links` names one
+`page_type`), so you write it for your own record types. The bundled example
+[`examples/schema-packs/amends-example/pack.yaml`](../../examples/schema-packs/amends-example/pack.yaml)
+maps `amends` (and `supersedes`) on `contract` pages under `contracts/`:
+
+```yaml
+link_types:
+  - name: amends
+    temporal: event
+frontmatter_links:
+  - page_type: contract
+    fields: [amends]
+    link_type: amends
+```
+
+A page then states what it amends and from when:
+
+```markdown
+---
+type: contract
+title: MSA Amendment 2
+amends:
+  - name: MSA Example
+    since: 2026-11-01
+---
+```
+
+Pages written before the mapping was active get their amends links when you
+re-extract them:
+
+```bash
+gbrain extract links --source db --include-frontmatter
+```
+
+Older gbrain releases load the same pack, but they rank amends edges like any
+typed link and hide future-dated ones, so set the pack's `gbrain_min_version` to
+the release that adds this policy (the example does).
 
 ## Turning it off
 

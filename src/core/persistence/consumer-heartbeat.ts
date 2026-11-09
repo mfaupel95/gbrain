@@ -30,8 +30,9 @@
 import { randomBytes } from 'node:crypto';
 import { readlinkSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
+import { isProcessAlive, processStartTime, readBootId } from '../pglite-lock.ts';
 import { VERSION } from '../../version.ts';
-import { localHostIdentity } from './identity.ts';
+import { hostIdentityPathsFor } from './identity.ts';
 import type { SqlEngine } from './model.ts';
 
 /** Kinds whose process stays resident: they defer to the first live full consumer of their host (`serve` always starts full). */
@@ -48,8 +49,13 @@ export const CONSUMER_RENEWAL_MS = 10_000;
 export const CONSUMER_DEADLINE_MS = 5_000;
 
 export type ConsumerRowMode = 'probing' | 'full' | 'waiter_only' | 'promoted';
-/** Process identity: `{ pid, nonce, pid_ns }`; `kind` names the gbrain command. */
-export interface ConsumerProcessIdentity { pid: number; nonce: string; pid_ns: string | null }
+/**
+ * Process identity: `{ pid, nonce, pid_ns }`; `kind` names the gbrain command. #6650: `boot_id` (the kernel's
+ * boot id) and `start` (the process's kernel start time, `/proc/<pid>/stat` field 22) let another process on the
+ * same machine prove this one is dead; null where /proc is unreadable, and `start` is null where /proc does not number
+ * processes as this pid namespace does.
+ */
+export interface ConsumerProcessIdentity { pid: number; nonce: string; pid_ns: string | null; boot_id?: string | null; start?: string | null }
 /** The pool numbers a heartbeat row carries; `inflight_oldest_ms` and `completed` (#6383) are absent from rows an older owner wrote. */
 export interface ConsumerPool { checked_out: number; max: number; waiters: number; inflight_oldest_ms?: number; completed?: number }
 export interface ConsumerRow {
@@ -68,6 +74,9 @@ export interface ConsumerRow {
   persistence_home: string;
   minted_under: Record<string, unknown> | null;
   version: string;
+  /** #6650 (migration v243): the owner's boot id and process start time; null on rows an older consumer wrote. */
+  boot_id?: string | null;
+  process_start?: string | null;
 }
 /** A row as `listHostConsumers` returns it: the row plus its liveness, read on the database clock. */
 export interface ListedConsumer extends ConsumerRow {
@@ -86,7 +95,11 @@ export function consumerIdentity(): ConsumerProcessIdentity {
   if (identity) return identity;
   let pidNs: string | null = null;
   try { pidNs = readlinkSync('/proc/self/ns/pid'); } catch { pidNs = null; }
-  identity = { pid: process.pid, nonce: randomBytes(8).toString('hex'), pid_ns: pidNs };
+  // #6650: a start time is recorded only when /proc numbers processes as this pid namespace does (a nested namespace
+  // that inherited its parent's procfs would read another process's stat), so a stamp never carries a wrong one.
+  let aligned = false;
+  try { aligned = readlinkSync('/proc/self') === String(process.pid); } catch { aligned = false; }
+  identity = { pid: process.pid, nonce: randomBytes(8).toString('hex'), pid_ns: pidNs, boot_id: readBootId(), start: aligned ? processStartTime(process.pid) : null };
   return identity;
 }
 /** Test seam: a fresh identity, so one test process can play several consumers. */
@@ -95,6 +108,26 @@ export function resetConsumerIdentityForTest(next?: Partial<ConsumerProcessIdent
   identity = { ...consumerIdentity(), ...next };
   return identity;
 }
+/**
+ * #6650: whether `owner` (a claim stamp's or a heartbeat row's identity) is provably a dead process: it ran under
+ * this machine's boot and pid namespace, it recorded its start time, it is not this process, and its pid is now
+ * either gone or held by a process that started at another time (a reused pid). Anything this process cannot
+ * check from here (another host or container, an older owner without the markers, a /proc this process cannot
+ * read or that numbers another pid namespace's processes) is not provably dead, so the caller keeps its time-based
+ * rule for it.
+ */
+export function consumerProvablyDead(owner: { pid: number; nonce?: string | null; pid_ns?: string | null; boot_id?: string | null; start?: string | null } | null | undefined,
+  self: ConsumerProcessIdentity = consumerIdentity()): boolean {
+  if (!owner || !owner.boot_id || !owner.pid_ns || !owner.start || !self.boot_id || !self.pid_ns || !self.start) return false;
+  if (owner.boot_id !== self.boot_id || owner.pid_ns !== self.pid_ns || sameProcess(owner, self)) return false;
+  if (!isProcessAlive(owner.pid)) return true;
+  const start = processStartTime(owner.pid);
+  return start !== null && start !== owner.start;
+}
+/** #6650: `consumerProvablyDead` for a heartbeat row, whose start time is stored as `process_start`. */
+export function consumerRowProvablyDead(row: Pick<ConsumerRow, 'pid' | 'nonce' | 'pid_ns' | 'boot_id' | 'process_start'>, self: ConsumerProcessIdentity = consumerIdentity()): boolean {
+  return consumerProvablyDead({ pid: row.pid, nonce: row.nonce, pid_ns: row.pid_ns, boot_id: row.boot_id, start: row.process_start }, self);
+}
 /** Whether `owner` (a claim stamp's or a row's identity) is this process: the pid and, when both sides carry one, the nonce. */
 export function sameProcess(owner: { pid?: number | null; nonce?: string | null } | null | undefined, self: ConsumerProcessIdentity = consumerIdentity()): boolean {
   if (!owner || owner.pid !== self.pid) return false;
@@ -102,7 +135,7 @@ export function sameProcess(owner: { pid?: number | null; nonce?: string | null 
 }
 
 const ROW_COLUMNS = `host_id::text AS host_id,pid,nonce,pid_ns,kind,mode,started_at::text AS started_at,renewed_at::text AS renewed_at,restart_required,root_barrier_age_ms,pool,
-  host_json_path,persistence_home,minted_under,version,(EXTRACT(EPOCH FROM (now()-renewed_at))*1000)::bigint::text AS renewed_age_ms,
+  host_json_path,persistence_home,minted_under,version,boot_id,process_start,(EXTRACT(EPOCH FROM (now()-renewed_at))*1000)::bigint::text AS renewed_age_ms,
   (EXTRACT(EPOCH FROM (now()-started_at))*1000)::bigint::text AS age_ms`;
 type RawRow = Omit<ConsumerRow, 'pool' | 'minted_under'> & { pool: unknown; minted_under: unknown; renewed_age_ms: string; age_ms: string };
 
@@ -135,7 +168,12 @@ export function consumerWedged(row: Pick<ConsumerRow, 'restart_required' | 'root
 /**
  * The first live, full, resident-kind consumer of `hostId` that is not `self`
  * and is not wedged (B1a), or null. Liveness is judged on the database clock
- * (renewed within `CONSUMER_LIVE_MS`), so two hosts' clocks never enter it.
+ * (renewed within `CONSUMER_LIVE_MS`), so two hosts' clocks never enter it;
+ * #6650: a row this process can prove dead (`consumerProvablyDead`: same boot
+ * and pid namespace, pid gone or reused) is skipped at once instead of reading
+ * live for the rest of its window, so a killed client's leftover row never
+ * outranks the serve started after it. The order stays oldest first, the
+ * order `consumer-election.ts` defers in.
  * PGLite admits one process: always null there. A read the database cannot
  * answer rejects; the caller decides whether that means "no owner".
  */
@@ -145,9 +183,10 @@ export async function probeLiveFullConsumer(engine: SqlEngine & Partial<Pick<Bra
   const rows = await engine.executeRaw<RawRow>(`SELECT ${ROW_COLUMNS} FROM persistence_consumers
     WHERE host_id=$1::uuid AND mode IN ('full','promoted') AND kind=ANY($2::text[]) AND NOT (pid=$3::integer AND nonce=$4)
       AND renewed_at > now() - ($5::integer * interval '1 millisecond') AND NOT restart_required
-    ORDER BY started_at,pid LIMIT 8`, [hostId, [...RESIDENT_CONSUMER_KINDS], self.pid, self.nonce, CONSUMER_LIVE_MS], { signal: opts.signal });
+    ORDER BY started_at,pid`, [hostId, [...RESIDENT_CONSUMER_KINDS], self.pid, self.nonce, CONSUMER_LIVE_MS], { signal: opts.signal });
   const ceiling = opts.ceilingMs ?? 600_000;
-  const live = rows.map(row => listed(row, self)).find(row => !consumerWedged(row, ceiling));
+  const live = rows.map(row => listed(row, self))
+    .find(row => !consumerWedged(row, ceiling) && !consumerRowProvablyDead(row, self));
   return live ?? null;
 }
 
@@ -174,12 +213,17 @@ export interface ConsumerHeartbeat {
 }
 
 type DirectEngine = SqlEngine & Partial<Pick<BrainEngine, 'kind' | 'executeRawDirect'>>;
+/**
+ * What this binary's consumer can drain: `refresh_barrier_1` (v292) claims writes deferred behind a worktree refresh,
+ * `refresh_barrier_import_1` (v294) writes held for an import.
+ */
+export const CONSUMER_CAPABILITIES = ['refresh_barrier_1', 'refresh_barrier_import_1'] as const;
 const RENEW_SQL = `WITH purged AS (
     DELETE FROM persistence_consumers WHERE host_id=$1::uuid AND renewed_at < now() - ($14::integer * interval '1 millisecond') AND NOT (pid=$2::integer AND nonce=$3))
-  INSERT INTO persistence_consumers(host_id,pid,nonce,pid_ns,kind,mode,restart_required,root_barrier_age_ms,pool,host_json_path,persistence_home,minted_under,version)
-  VALUES($1::uuid,$2::integer,$3,$4,$5,$6,$7::boolean,$8::integer,$9::text::jsonb,$10,$11,$12::text::jsonb,$13)
+  INSERT INTO persistence_consumers(host_id,pid,nonce,pid_ns,kind,mode,restart_required,root_barrier_age_ms,pool,host_json_path,persistence_home,minted_under,version,boot_id,process_start,segment_reader,capabilities)
+  VALUES($1::uuid,$2::integer,$3,$4,$5,$6,$7::boolean,$8::integer,$9::text::jsonb,$10,$11,$12::text::jsonb,$13,$15,$16,true,ARRAY['${CONSUMER_CAPABILITIES.join("','")}']::text[])
   ON CONFLICT (host_id,pid,nonce) DO UPDATE SET renewed_at=now(),mode=EXCLUDED.mode,restart_required=EXCLUDED.restart_required,
-    root_barrier_age_ms=EXCLUDED.root_barrier_age_ms,pool=EXCLUDED.pool,version=EXCLUDED.version`;
+    root_barrier_age_ms=EXCLUDED.root_barrier_age_ms,pool=EXCLUDED.pool,version=EXCLUDED.version,segment_reader=EXCLUDED.segment_reader,capabilities=EXCLUDED.capabilities`;
 
 /**
  * Starts this process's heartbeat row for `hostId` and renews it every
@@ -190,7 +234,7 @@ const RENEW_SQL = `WITH purged AS (
 export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opts: ConsumerHeartbeatOpts): ConsumerHeartbeat {
   if (engine.kind === 'pglite') return { renew: async () => {}, get failures() { return 0; }, stop: async () => {} };
   const self = opts.identity ?? consumerIdentity();
-  const paths = opts.paths ?? (() => { const id = localHostIdentity(); return { host_json_path: id.path, persistence_home: id.persistence_home, minted_under: id.minted_under }; })();
+  const paths = opts.paths ?? hostIdentityPathsFor(engine);
   const execute = (sql: string, params: unknown[], signal: AbortSignal) =>
     engine.executeRawDirect ? engine.executeRawDirect(sql, params, { signal }) : engine.executeRaw(sql, params, { signal });
   const everyMs = opts.everyMs ?? CONSUMER_RENEWAL_MS;
@@ -219,7 +263,7 @@ export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opt
       const mode = typeof opts.mode === 'function' ? opts.mode() : opts.mode;
       await bounded(execute(RENEW_SQL, [hostId, self.pid, self.nonce, self.pid_ns, opts.kind, mode, status.restart_required, status.root_barrier_age_ms,
         status.pool ? JSON.stringify(status.pool) : null, paths.host_json_path, paths.persistence_home,
-        paths.minted_under ? JSON.stringify(paths.minted_under) : null, VERSION, CONSUMER_PURGE_MS], cancel.signal), cancel, deadlineMs);
+        paths.minted_under ? JSON.stringify(paths.minted_under) : null, VERSION, CONSUMER_PURGE_MS, self.boot_id ?? null, self.start ?? null], cancel.signal), cancel, deadlineMs);
       streak = 0;
     } catch (error) {
       if (!stopped) report(error);
@@ -246,6 +290,12 @@ export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opt
       const cancel = new AbortController();
       try { await bounded(execute('DELETE FROM persistence_consumers WHERE host_id=$1::uuid AND pid=$2::integer AND nonce=$3', [hostId, self.pid, self.nonce], cancel.signal), cancel, 1_000); }
       catch { /* the row lapses on its own; the next renewal on this host purges it */ }
+      // GBRA-248: the worktrees this host owns keep the time it stopped, so owner-activity.ts can tell a stopped owner from one long gone.
+      // Rows another transaction holds (a transfer) are skipped, in id order, so the stamp neither waits nor deadlocks.
+      const stamp = new AbortController();
+      try { await bounded(execute(`UPDATE persistence_worktrees SET heartbeat_at=now() WHERE id IN
+        (SELECT id FROM persistence_worktrees WHERE owner_host_id=$1::uuid ORDER BY id FOR UPDATE SKIP LOCKED)`, [hostId], stamp.signal), stamp, 1_000); }
+      catch { /* best effort: owner activity falls back to receipts and the last renewal */ }
     },
   };
 }

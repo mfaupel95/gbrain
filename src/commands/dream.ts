@@ -36,9 +36,11 @@ import { jsonGuardActive, jsonRequested, setCliExitVerdict, writeJsonDocument } 
 import { BUDGET_STOP_EXIT_CODE } from '../core/exit-codes.ts';
 import { opError, type OperationError } from '../core/ops/contract.ts';
 import { usageError, writeCliError, writeCliRefusal } from '../cli/cli-error.ts';
+import { cliRenderContext, renderAction, shellQuote, type Action } from '../core/agent-output.ts';
+import { codeEntry } from '../core/error-catalogue.ts';
 import { fetchSource } from '../core/sources-load.ts';
 import { existsSync } from 'fs';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 interface DreamArgs {
   json: boolean;
@@ -158,6 +160,10 @@ function parseArgs(args: string[]): DreamArgs {
   const phaseWasExplicit = phaseValues.length > 0;
   let phases: CyclePhase[] = [];
   for (const rawPhase of phaseValues) {
+    if (rawPhase === 'auto_think') {
+      dreamExit(usageError('The auto_think phase is replaced by pinned questions: dream.auto_think.questions became pins (inactive when auto_think was off).',
+        'Run gbrain dream --phase standing_questions to refresh due pins; gbrain questions list shows them.'), json);
+    }
     if (!(ALL_PHASES as string[]).includes(rawPhase)) {
       dreamExit(usageError(`Unknown phase "${rawPhase}". Valid: ${ALL_PHASES.join(', ')}`, 'Example: gbrain dream --phase lint'), json);
     }
@@ -344,7 +350,7 @@ async function resolveBrainDir(
   // source has a checkout on disk, use it so its filesystem phases can run.
   if (engine && resolvedSourceId) {
     const src = await fetchSource(engine, resolvedSourceId);
-    if (src?.local_path && existsSync(src.local_path)) {
+    if (src?.local_path && isAbsolute(src.local_path) && existsSync(src.local_path)) {
       return resolve(src.local_path);
     }
     // Explicit --source whose checkout isn't on disk → DB-only (skip FS phases).
@@ -358,7 +364,8 @@ async function resolveBrainDir(
 
   if (engine) {
     const configured = await engine.getConfig('sync.repo_path');
-    if (configured && existsSync(configured)) {
+    // #7630: a relative stored path names whatever directory gbrain runs from, so it is no checkout.
+    if (configured && isAbsolute(configured) && existsSync(configured)) {
       return resolve(configured);
     }
   }
@@ -403,9 +410,10 @@ Options:
                       unlike toggling the flag on/off around the run, a
                       crash mid-invocation can't leave it stuck. Applies to
                       patterns, synthesize, conversation_facts_backfill,
-                      enrich_thin, skillopt, drift; no-op on phases with no such
-                      gate. Requires an EXPLICIT --phase <name> — a phase
-                      implied by --input or --drain does not count (bare
+                      enrich_thin, skillopt, drift, lint, consolidate; no-op
+                      on phases with no such gate. Requires an EXPLICIT
+                      --phase <name> — a phase implied by --input or
+                      --drain does not count (bare
                       --once, or --once with --input/--drain and no
                       explicit --phase, is a usage error).
   --eval-run          Eval harness run: honor GBRAIN_DECIDE_SLOTS (e.g. triage=on)
@@ -445,9 +453,14 @@ Options:
                       (the default phase when --drain is set). Holds the
                       cycle lock once, processes batches until the backlog
                       empties or --window elapses, reports {extracted,
-                      remaining, stopped}, and exits 3 unless the backlog
-                      drained (printing the rerun command) so a cron/agent
-                      loop knows to run again. Use this to grind down an
+                      remaining, stopped}. Exits 0 when the backlog drained;
+                      11 when running again can continue (window, budget,
+                      batch cap, deadline, lock, an unknown count, a rate
+                      limit or transient provider failure), printing the
+                      rerun command; 1 when it cannot until something
+                      changes (provider auth, billing, unknown model or
+                      content block; no_progress), printing the fix. --json
+                      adds status, retryable and code. Use this to grind down an
                       extract_atoms backlog on a brain whose pack doesn't
                       run the phase in the routine cycle.
   --window <seconds>  Drain window, a hard deadline: no page or transcript
@@ -653,24 +666,47 @@ async function runDrain(
       `[drain] ${result.failure_count} item failure(s)${omitted}${result.last_error ? `; last error: ${result.last_error}` : ''}\n`,
     );
   }
+  // #6503: cut items are not failures and not complete; say so once per drain.
+  if ((result.input_truncated ?? 0) > 0) {
+    process.stderr.write(
+      `[drain] ${result.input_truncated} item(s) cut at cycle.extract_atoms.max_input_chars: the model did not read their tail; ` +
+      'head atoms are kept, the items are not marked complete and are skipped until the cap rises (gbrain config set cycle.extract_atoms.max_input_chars <n>)\n',
+    );
+  }
   const { drainBudgetNotice, usd } = await import('../core/cycle/extract-atoms-budget-notice.ts');
+  const { drainOutcome } = await import('../core/cycle/extract-atoms-drain-outcome.ts');
+  // #6817: one stop → exit/status/retryable mapping, shared with the Minion handler.
+  const outcome = drainOutcome(result);
   const budgetNotice = result.stopped === 'budget' ? drainBudgetNotice(result) : null;
+  const fix = outcome.retryable || !outcome.code ? undefined : codeEntry(outcome.code)?.fix;
   if (opts.json) {
-    const done = result.stopped === 'drained' && result.remaining === 0;
-    await writeJsonDocument(JSON.stringify(done ? result : { ...result, resume_command: drainCommand(opts),
+    await writeJsonDocument(JSON.stringify(outcome.status === 'ok' ? result : {
+      ...result, status: outcome.status, retryable: outcome.retryable, code: outcome.code,
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.retryable ? { resume_command: drainCommand(opts) } : {}),
+      ...(fix ? { fix: renderAction(fix, cliRenderContext()) } : {}),
       ...(budgetNotice ? { notices: [budgetNotice] } : {}) }, null, 2));
   } else {
     console.log(`[drain] extracted ${result.extracted} atom(s) across ${result.batches} batch(es); ${result.remaining ?? '?'} remaining (stopped: ${result.stopped})`);
   }
   // null remaining = the final count query failed; do not report success.
-  if (result.stopped === 'drained' && result.remaining === 0) return;
+  if (outcome.status === 'ok') return;
+  const stop = `[drain] stopped: ${result.stopped}${outcome.status === 'provider_failure' ? ` (${outcome.reason})` : ''}; ${result.remaining ?? '?'} page(s) remaining.`;
   process.stderr.write(budgetNotice
     ? `[drain] stopped: budget; spent ${usd(result.spent_usd)} of the ${usd(result.budget_usd)} per-run cap (cycle.extract_atoms.budget_usd); ` +
       `${result.remaining ?? '?'} page(s) remaining. Rerun: ${drainCommand(opts)}, or raise the cap: gbrain config set cycle.extract_atoms.budget_usd <usd>\n`
-    : `[drain] stopped: ${result.stopped}; ${result.remaining ?? '?'} page(s) remaining. ` +
-      `Rerun: ${drainCommand(opts)}\n`,
+    : outcome.retryable
+      ? `${stop} Rerun: ${drainCommand(opts)}\n`
+      : `${stop} Fix: ${nonRetryableFixLine(outcome.code!, fix!)}\n`,
   );
-  process.exit(EXIT_DRAIN_INCOMPLETE);
+  process.exit(outcome.exit);
+}
+
+/** The registry suggestion for a non-retryable drain stop, plus its read-only check when the prose does not already name it. */
+function nonRetryableFixLine(code: string, fix: Action): string {
+  const suggestion = codeEntry(code)!.suggestion;
+  const check = shellQuote(fix.argv ?? []);
+  return suggestion.includes(check) ? suggestion : `${suggestion} Read-only check: ${check}`;
 }
 
 function drainCommand(opts: DreamArgs): string {
@@ -852,9 +888,12 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
 
   const report = await runCycle(engine, {
     brainDir,
+    // #6023: the local CLI sees private fact text in the consolidate dry-run preview.
+    remote: false,
     dryRun: opts.dryRun,
     pull: opts.pull,
     phases,
+    directPhases: phases !== undefined,
     // Undefined for legacy unscoped runs; set for explicit source cycles,
     // path-derived cycles, and bare default-like non-default source cycles.
     sourceId: resolvedSourceId,

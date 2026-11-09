@@ -45,8 +45,12 @@ import {
 import { pricingSetCommand } from '../../budget/no-pricing.ts';
 import { getEmbeddingModel, withBudgetTracker } from '../../ai/gateway.ts';
 import { embedStaleForSource } from '../../embed-stale.ts';
+import type { ContentDriftSweepStatus } from '../../content-drift-sweep.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
 import { currentEmbeddingSignature } from '../../embedding.ts';
+import { readEmbedBackfillBlockers } from '../../embed-backfill-stall.ts';
+import { budgetLimitedField, readBudgetLimited, type BudgetLimitedReport } from '../../held-embedding.ts';
+import { UnrecoverableError } from '../errors.ts';
 import { type DbPacer, createDbPacer, createNoopPacer } from '../../db-pacer.ts';
 import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../../pace-mode.ts';
 import type { BrainEngine } from '../../engine.ts';
@@ -55,6 +59,8 @@ import { parseUsdLimit, usdLimitToCap, resolveSpendPosture } from '../../spend-p
 import { recordMinionJobSpend } from '../../minion-spend.ts';
 
 import { embedBackfillLockId, EMBED_BACKFILL_LOCK_TTL_MIN } from '../../embed-backfill-lock.ts';
+import { keylessEmbedBackfill, reportKeylessNotice } from '../../embed-backfill-submit.ts';
+import type { RenderedNotice } from '../../agent-output.ts';
 
 const DEFAULT_MAX_USD_PER_JOB = 10;
 
@@ -66,7 +72,12 @@ export interface EmbedBackfillJobData {
 }
 
 export interface EmbedBackfillResult {
-  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted';
+  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted' | 'skipped';
+  /** Set when status === 'skipped': the brain is keyless by choice, so nothing was read or embedded. */
+  outcome?: 'embed_backfill_skipped';
+  reason?: 'embedding_disabled';
+  /** The embed_backfill_skipped notice, on the first skip for this brain state only. */
+  notice?: RenderedNotice;
   sourceId: string;
   embedded: number;
   chunksProcessed: number;
@@ -79,10 +90,14 @@ export interface EmbedBackfillResult {
   invalidated: number;
   /** #4283: set when drifted chunks existed but the embedder probe failed. */
   invalidationSkipped?: 'embedder_probe_failed';
+  /** #7117: this run's content-drift sweep: counts, cursor, pass state, error. */
+  contentDrift?: ContentDriftSweepStatus;
   /** $USD spent inside this job (from BudgetTracker.totalSpent). */
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
   budgetCapUsd?: number;
+  /** #6803: large pages of this source waiting for embedding approval (informational; never a failure or a stall). */
+  budget_limited?: BudgetLimitedReport;
 }
 
 /**
@@ -224,6 +239,12 @@ export function makeEmbedBackfillHandler(
   ): Promise<EmbedBackfillResult> {
     const { sourceId, batchSize } = parseParams(job.data);
 
+    const keyless = await keylessEmbedBackfill(engine);
+    if (keyless) {
+      return { status: 'skipped', outcome: 'embed_backfill_skipped', reason: 'embedding_disabled', sourceId, embedded: 0, chunksProcessed: 0,
+        pagesProcessed: 0, invalidated: 0, spentUsd: 0, ...(keyless.notice ? { notice: reportKeylessNotice(keyless.notice) } : {}) };
+    }
+
     // D2: per-source lock at handler entry. The submit-side cooldown (D19)
     // prevents most contention but this is the run-side safety net.
     const lockKey = embedBackfillLockId(sourceId);
@@ -269,6 +290,7 @@ export function makeEmbedBackfillHandler(
     if (job.signal?.aborted) drainAbort.abort();
     job.signal?.addEventListener('abort', onJobAbort, { once: true });
     let progressCounter = 0;
+    const progressWrites = new Set<Promise<unknown>>();
     const watchdog = stallSeconds > 0
       ? createEmbedStallWatchdog({ thresholdSeconds: stallSeconds, readProgress: () => progressCounter })
       : undefined;
@@ -306,13 +328,15 @@ export function makeEmbedBackfillHandler(
             // Banked forward progress feeds the stall watchdog's clock.
             progressCounter = embedded + chunksProcessed;
             // Fire-and-forget; updateProgress returns a Promise but the
-            // handler is sync inside the loop.
-            void job.updateProgress({
+            // handler is sync inside the loop. Tracked so the #6803 stall
+            // record below is written after every in-flight update.
+            const write: Promise<unknown> = job.updateProgress({
               embedded,
               chunksProcessed,
               cursor,
               spentUsd: tracker.totalSpent,
-            });
+            }).catch(() => undefined).finally(() => progressWrites.delete(write));
+            progressWrites.add(write);
           },
         }),
       );
@@ -335,6 +359,7 @@ export function makeEmbedBackfillHandler(
           pagesProcessed: result.pagesProcessed,
           invalidated: result.invalidated,
           ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+          ...(result.contentDrift && { contentDrift: result.contentDrift }),
           spentUsd: tracker.totalSpent,
         };
       }
@@ -345,7 +370,32 @@ export function makeEmbedBackfillHandler(
       // in a row while an entire corpus sat stripped. NULLed chunks stay NULL
       // for the next (fixed-config) run to pick up.
       if ((result.remaining ?? 0) > 0 || (result.blocked ?? 0) > 0) {
-        throw new Error(`embed-backfill: incomplete; ${result.remaining ?? 0} chunks remain and ${result.blocked ?? 0} projections are blocked. Durable progress is retained; inspect provider and projection readiness before retrying.`);
+        // #7193: the stale count leaves out large pages held for approval or at their cap; the remainder names them too.
+        const held = await readBudgetLimited(engine, { sourceId, signature: currentEmbeddingSignature() }).catch(() => null);
+        const heldNote = held && held.pending_chunks > 0
+          ? ` (${held.pending_chunks} of them on ${held.held + held.capped} large page(s) held for approval or at their spend cap; gbrain embed --held --dry-run --source ${sourceId} lists them)` : '';
+        const message = `embed-backfill: incomplete; ${(result.remaining ?? 0) + (held?.pending_chunks ?? 0)} chunks remain${heldNote} and ${result.blocked ?? 0} projections are blocked. Durable progress is retained; inspect provider and projection readiness before retrying.`;
+        // #6803: a run that embedded nothing records its blocker fingerprint, so
+        // automatic submission backs off and stops after identical failures
+        // (embed-backfill-stall.ts); a retry of this job that finds the same
+        // blockers dead-letters instead of failing the same way again.
+        let repeated = false;
+        if (result.embedded === 0) {
+          try {
+            await Promise.all(progressWrites);
+            const { fingerprint, remaining, blocked, signature } = await readEmbedBackfillBlockers(engine, sourceId, currentEmbeddingSignature());
+            const [prior] = job.attempts_made > 0
+              ? await engine.executeRaw<{ fingerprint: string | null }>("SELECT progress->'stall'->>'fingerprint' AS fingerprint FROM minion_jobs WHERE id=$1", [job.id])
+              : [];
+            await job.updateProgress({ embedded: 0, chunksProcessed: result.chunksProcessed, cursor: result.lastCursor, spentUsd: tracker.totalSpent,
+              stall: { fingerprint, remaining, blocked, signature } });
+            repeated = prior?.fingerprint === fingerprint;
+          } catch { /* the stall record is bookkeeping; the incomplete failure below stands either way */ }
+        }
+        if (repeated) {
+          throw new UnrecoverableError(`${message} No progress since the previous attempt and the same blockers remain; see gbrain doctor --only embed_backfill_stalled.`);
+        }
+        throw new Error(message);
       }
       if (result.embedded === 0 && (result.invalidated > 0 || result.chunksProcessed > 0)) {
         throw new Error(
@@ -362,7 +412,9 @@ export function makeEmbedBackfillHandler(
         pagesProcessed: result.pagesProcessed,
         invalidated: result.invalidated,
         ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+        ...(result.contentDrift && { contentDrift: result.contentDrift }),
         spentUsd: tracker.totalSpent,
+        ...(await budgetLimitedField(engine, sourceId, currentEmbeddingSignature())),
       };
     } catch (err) {
       if (err instanceof BudgetExhausted) {

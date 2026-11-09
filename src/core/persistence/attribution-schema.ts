@@ -21,6 +21,7 @@
  * until it is.
  */
 import { TRUST_ROW_COLUMNS } from '../trust/schema.ts';
+import { requireMaintainerPoliciesSql } from '../derived-state-maintainers.ts';
 
 /** created_by and last_mutated_by on facts, takes and timeline_entries. */
 export const ROW_ATTRIBUTION_COLUMNS = [
@@ -54,7 +55,7 @@ export const WRITE_ATTRIBUTION_CONTENT_COLUMNS: Record<AttributedTable, readonly
  * content rewrite, so it does not move last_write_*).
  */
 export const WRITE_ATTRIBUTION_PROJECTION_COLUMNS: Record<AttributedTable, readonly string[]> = {
-  facts: ['embedding', 'embedded_at', 'embedding_model', 'embedded_text_hash', ...TRUST_ROW_COLUMNS],
+  facts: ['embedding', 'embedded_at', 'embedding_model', 'embedded_text_hash', 'source_window', ...TRUST_ROW_COLUMNS],
   takes: ['embedding', 'embedded_at', 'updated_at', 'embedding_model', 'embedded_text_hash', ...TRUST_ROW_COLUMNS],
   timeline_entries: [...TRUST_ROW_COLUMNS],
 };
@@ -74,13 +75,26 @@ const addColumns = (table: string, columns: readonly string[]) =>
   `ALTER TABLE ${table} ${columns.map(column => `ADD COLUMN IF NOT EXISTS ${column} ${typed(column)}`).join(', ')}`;
 
 /**
+ * Set transaction-locally by the facts insert guard (facts/insert-guard-schema.ts)
+ * around its withdrawal stamp, which runs as an UPDATE at the end of the
+ * inserting statement; the per-row guard it replaced stamped the row before
+ * insert, where attribution never saw a change.
+ */
+export const FACT_WITHDRAWAL_STAMP_SETTING = 'gbrain.fact_withdrawal_stamp';
+const FACT_CONTENT_WITHOUT_STAMP = WRITE_ATTRIBUTION_CONTENT_COLUMNS.facts.filter(column => column !== 'expired_at' && column !== 'valid_until');
+
+/**
  * INSERT: stamp created_by and last_mutated_by from the settings; without
  * settings keep supplied values (engine copy, backfill). UPDATE: created_by is
  * immutable once set; last_mutated_by moves only when a content column
  * changed (to NULL when no actor is set: an unattributed writer mutated it).
  * Either pair may be filled while it is still NULL (journal backfill).
+ * Under FACT_WITHDRAWAL_STAMP_SETTING a facts UPDATE that changes only
+ * expired_at and valid_until is not a content change, so last_mutated_by
+ * keeps the inserted (or supplied) values; any other content change still
+ * moves it.
  */
-const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+export const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text; changed boolean;
 BEGIN${SETTINGS}
   IF TG_OP = 'INSERT' THEN
@@ -98,6 +112,9 @@ BEGIN${SETTINGS}
     changed := ${contentChanged(table)};`).join('\n  ')}
   ELSE
     RAISE EXCEPTION 'gbrain_stamp_write_attribution is not classified for table %', TG_TABLE_NAME;
+  END IF;
+  IF changed AND TG_TABLE_NAME = 'facts' AND COALESCE(current_setting('${FACT_WITHDRAWAL_STAMP_SETTING}', true), '') = 'on' THEN
+    changed := ${tuple('NEW', FACT_CONTENT_WITHOUT_STAMP)} IS DISTINCT FROM ${tuple('OLD', FACT_CONTENT_WITHOUT_STAMP)};
   END IF;
   IF changed THEN
     NEW.last_write_request_id := req; NEW.last_write_principal_kind := principal_kind; NEW.last_write_principal_id := principal_id;
@@ -135,11 +152,13 @@ END $fn$`;
  * A version row snapshots the page before the archiving write changes it, in
  * the same transaction, so the page row still carries the snapshotted
  * revision and its writer. The archiving actor comes from the settings.
+ * Under RLS the archiving writer needs the page (#7637, derived-state-maintainers.ts).
  */
-const STAMP_VERSION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_version_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+export const STAMP_VERSION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_version_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text;
 BEGIN${SETTINGS}
   IF (NEW.write_request_id, NEW.write_principal_kind, NEW.write_principal_id) IS NOT DISTINCT FROM (NULL::uuid, NULL::text, NULL::text) THEN
+    ${requireMaintainerPoliciesSql('pages', ['SELECT'], '    ')}
     SELECT p.revision_write_request_id, p.revision_principal_kind, p.revision_principal_id
       INTO NEW.write_request_id, NEW.write_principal_kind, NEW.write_principal_id
       FROM pages p WHERE p.id = NEW.page_id AND p.knowledge_revision = NEW.knowledge_revision;

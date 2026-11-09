@@ -15,9 +15,9 @@ import { discoverGitRoot } from '../sync-git.ts';
 import { isInsideGitRepo, hasTrackedContent } from '../git-remote.ts';
 import { containsPath, getWorktreeBinding, humanManifestProgress, type WorktreeBinding, type WorktreeManifest, worktreeManifest } from './ownership.ts';
 import { manifestDifferences, storedManifestScope, type WorktreeManifestScope } from './worktree-manifest.ts';
-import { localHostId } from './identity.ts';
-import { advanceTopology, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
-import { priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
+import { hostIdFor } from './identity.ts';
+import { advanceTopology, assertTopologyRequestsSettled, inspectTopologyPhysicalRoot, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
+import { assertTopologyChangeCapacity, priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
 import { isWriteRequestId } from './types.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
@@ -25,8 +25,11 @@ import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from '.
 import { canonicalFilesystemPath, nativeFilesystemPath } from './root-registry.ts';
 import { flushTopologyDirectory } from './topology-filesystem.ts';
 import { claimPhysicalRoot } from './physical-root.ts';
+import { inspectRelocatedPhysicalRoot, relocatePhysicalRoot } from './physical-root-record.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
+import { rebindContentReceipts } from '../shared-skills/receipt-root.ts';
+import { assertLinkedWorktreeIntact } from './worktree-link.ts';
 
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
@@ -39,6 +42,8 @@ export interface SourceLifecycleInput {
   expectedAdminState?:string;
   automaticClaim?:boolean;
 }
+/** #7702/#8905: pages one retire batch deletes; each batch (with its cascaded chunks, links and versions) stays far under the 5 s topology statement bound. */
+export const SOURCE_RETIRE_BATCH_PAGES=500;
 interface SourceState {id:string;incarnation:string;archived:boolean;local_path:string|null;config:Record<string,unknown>;name:string;last_commit:string|null;}
 
 function sourcesListFix():Action{
@@ -57,6 +62,7 @@ function localRoot(path:string,create=false):{source:string;worktree:string}{
     'The path names a file. Pass the directory that holds the source content, then rerun the command; nothing was changed.');
   let worktree=source;
   let ancestor=source;while(!existsSync(ancestor))ancestor=dirname(ancestor);
+  assertLinkedWorktreeIntact(ancestor);
   try{worktree=realpathSync(discoverGitRoot(ancestor));}catch{/* directory source */}
   return {source,worktree};
 }
@@ -64,7 +70,7 @@ function localRoot(path:string,create=false):{source:string;worktree:string}{
 export async function installTopologyBinding(tx:BrainEngine,sourceId:string,incarnation:string,root:{source:string;worktree:string},bindings:WorktreeBinding[]):Promise<string>{
   const others=await tx.executeRaw<{source_id:string;relative_path:string;local_path:string}>(`SELECT b.source_id,b.relative_path,h.local_path
     FROM persistence_source_bindings b JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid
-    WHERE b.source_id<>$2`,[localHostId(),sourceId]);
+    WHERE b.source_id<>$2`,[hostIdFor(tx),sourceId]);
   const sourcePath=nativeFilesystemPath(root.source);
   const overlap=others.find(other=>{const path=nativeFilesystemPath(join(other.local_path,other.relative_path));return containsPath(path,sourcePath)||containsPath(sourcePath,path);});
   if(overlap) throw opError('overlapping_path','Sources cannot claim overlapping canonical directories.',
@@ -76,13 +82,13 @@ export async function installTopologyBinding(tx:BrainEngine,sourceId:string,inca
     `The directory for '${sourceId}' contains the checkout of source '${overlapping.source_id}'. Move that source first with gbrain sources set-path ${overlapping.source_id} and its verified new directory (a topology change the user decides), or choose a directory that does not enclose it.`,
     {fix:ownerStatusFix(overlapping.source_id)});
   const worktree=compatible?.local_path??root.worktree;
-  const physical=await claimPhysicalRoot(tx,worktree,{hostId:localHostId(),
+  const physical=await claimPhysicalRoot(tx,worktree,{hostId:hostIdFor(tx),
     ...(compatible?{worktreeId:compatible.worktree_id,coordinationPath:compatible.coordination_path!}:{})});
   const id=physical.worktreeId;
   const [existing]=await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid',[id]);
-  if(!existing)await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch) VALUES($1::uuid,$2::uuid,1)',[id,localHostId()]);
+  if(!existing)await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch) VALUES($1::uuid,$2::uuid,1)',[id,hostIdFor(tx)]);
   await tx.executeRaw(`INSERT INTO persistence_host_bindings(worktree_id,host_id,local_path,coordination_path) VALUES($1::uuid,$2::uuid,$3,$4)
-    ON CONFLICT(worktree_id,host_id) DO NOTHING`,[id,localHostId(),worktree,physical.coordinationPath]);
+    ON CONFLICT(worktree_id,host_id) DO NOTHING`,[id,hostIdFor(tx),worktree,physical.coordinationPath]);
   const rel=relative(nativeFilesystemPath(worktree),nativeFilesystemPath(root.source)).split(sep).join('/');
   await tx.executeRaw(`INSERT INTO persistence_source_bindings(source_id,source_incarnation,worktree_id,relative_path,topology_generation)
     SELECT $1,$2::uuid,$3::uuid,$4,topology_generation FROM persistence_worktrees WHERE id=$3::uuid
@@ -130,7 +136,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   if(prior) return topologyReceipt(prior);
   if(input.requireGitContent&&input.path&&(!isInsideGitRepo(input.path)||!hasTrackedContent(input.path)))
     throw opError('not_a_git_repo','The source path must contain committed Git content. Use --force to register an ordinary directory.',
-      `Commit the content in that directory with git first, or, if '${input.sourceId}' is meant to be a plain directory, rerun the add with --force; nothing was registered.`);
+      `Commit the content in that directory with git first, or, if '${input.sourceId}' is meant to be a plain directory, rerun the add with --force (sync then imports its files without Git; a file removed from it keeps its page); nothing was registered.`);
   if(input.operation==='reclone'||input.operation==='add'&&input.remoteUrl){
     const {runManagedSourceClone}=await import('./topology-clone.ts');
     return runManagedSourceClone(engine,input,principal,requestId,intent);
@@ -145,7 +151,17 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   if(input.expectedIncarnation&&input.expectedIncarnation!==before?.incarnation) throw opError('source_changed','The source was replaced.',
     `Source '${input.sourceId}' was removed and re-added after expected_incarnation was read, so nothing was changed. Read its current incarnation with the command in fix and confirm the ${input.operation} still applies before running it again.`,
     {fix:ownerStatusFix(input.sourceId)});
-  if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null};
+  // #5200 (W14 P1.4): only an operation that compares or records checkout bytes hashes the manifest (add at an existing
+  // root, claim, rebind, restore; reclone hashes in topology-clone.ts). Retiring a source (archive, remove, purge) compares
+  // nothing, so when every binding already carries a verified digest it skips the walk and refreshes the stored manifest's
+  // canonical_stamp in place; a symlink that appeared in the checkout after the claim no longer refuses a retire its dry
+  // run said would succeed. A binding claimed before activation has no digest yet, and the retire records that first
+  // manifest (clone recovery needs it), so its dry run says so.
+  const retire=['archive','remove','purge'].includes(input.operation);
+  const manifestRequired=!retire||(await engine.executeRaw<{digest:string|null}>(
+    `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
+  if(input.dryRun) await inspectTopologyPhysicalRoot(engine,input.sourceId,root?.worktree,{relocation:input.operation==='rebind'});
+  if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     // Hash canonical bytes while holding native exclusion, without a database
     // connection checked out. The final transaction rejects new pending mirrors.
@@ -155,9 +171,10 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       if(!existsSync(path)) {
         if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
         // #5219: retiring may skip a vanished checkout; the transaction proves the source is empty and its sole member.
-        if(['archive','remove','purge'].includes(input.operation)&&!root){missingCheckout=path;continue;}
+        if(retire&&!root){missingCheckout=path;continue;}
         throw missingCheckoutError(input.sourceId,path);
       }
+      if(!manifestRequired)continue;
       const manifest=worktreeManifest(path,{progress:humanManifestProgress()});
       manifests.set(path,manifest);
     }
@@ -166,7 +183,43 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     if(input.operation==='rebind'&&root&&currentRoot&&currentRoot!==root.worktree&&manifests.has(currentRoot)&&manifests.has(root.worktree)
       &&storedManifestScope(manifests.get(currentRoot))!==storedManifestScope(manifests.get(root.worktree)))
       manifests.set(root.worktree,worktreeManifest(root.worktree,{progress:humanManifestProgress(),scope:storedManifestScope(manifests.get(currentRoot))}));
-    return topologyTransaction(engine,async tx=>{
+    // #7702/#8905: a remove or purge first deletes the source's pages in bounded batches, each its own transaction behind
+    // the final transaction's preconditions; any precondition that would refuse or replay stops batching and the final
+    // transaction reports it. Committed batches are durable, so a retry with the same request_id resumes. A batch
+    // whose DELETE hits the statement bound is retried at half the size, so heavy pages still fit; any other bounded wait
+    // (a lock wait, a busy writer, a slow precondition or commit) stops the run with write_pending, and the retry resumes at
+    // full size. Only committed batches count toward the pages the run reports.
+    let retiredPages=0;
+    try{
+    let deleting=false;
+    const retireBatch=async(limit:number):Promise<number|null>=>{ deleting=false; try{ const n=await topologyTransaction(engine,async tx=>{
+        await assertWriterAdminState(tx,input.expectedAdminState);
+        const sources=await lockTopologyRows(tx,input.sourceId,bindings);
+        const [source]=await tx.executeRaw<{incarnation:string;archived:boolean;due:boolean}>(
+          `SELECT incarnation,archived,${input.expiredOnly?EXPIRED_ARCHIVE_SQL:'true'} AS due FROM sources WHERE id=$1`,[input.sourceId]);
+        if(source?.incarnation!==before!.incarnation||!source.due||input.operation==='purge'&&!input.expiredOnly&&!source.archived
+          ||await priorTopologyChange(tx,principal,requestId,intent)
+          ||(await tx.executeRaw('SELECT client_id FROM oauth_clients WHERE source_id=$1 LIMIT 1',[input.sourceId])).length) return 0;
+        await assertTopologyRequestsSettled(tx,sources,bindings.map(binding=>binding.worktree_id));
+        await lockTopologyPrincipal(tx,principal);
+        await assertTopologyChangeCapacity(tx,{principal,operation:input.operation,sourceId:input.sourceId});
+        const gone=await withCoordinatedWrite(tx,sources,async()=>{
+          deleting=true;
+          const rows=await tx.executeRaw('DELETE FROM pages WHERE id IN (SELECT id FROM pages WHERE source_id=$1 LIMIT $2) RETURNING id',[input.sourceId,limit]);
+          deleting=false;
+          return rows;
+        },principalAttribution({kind:'local_cli',id:principal}));
+        return gone.length;
+      }); retiredPages+=n; return n; }catch(error){
+        if(deleting&&error instanceof OperationError&&error.code==='write_pending'&&error.reason==='statement_timeout'&&limit>1) return null;
+        throw error;
+      } };
+    if(['remove','purge'].includes(input.operation)&&input.confirmDestructive&&!missingCheckout&&!admission)
+      for(let limit=SOURCE_RETIRE_BATCH_PAGES,deleted=limit;deleted===limit;){
+        const n=await retireBatch(limit);
+        if(n===null)deleted=limit=Math.ceil(limit/2);else deleted=n;
+      }
+    return await topologyTransaction(engine,async tx=>{
     await assertWriterAdminState(tx,input.expectedAdminState);
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     const sources=await lockTopologyRows(tx,input.sourceId,bindings);
@@ -212,6 +265,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     const invalidated=await settleTopologyRequests(tx,sources,worktrees,principal);
     // All pending mirrors must settle before these manifests are read. A pure
     // path rebind may never substitute stale or incomplete canonical bytes.
+    let relocated:ReturnType<typeof inspectRelocatedPhysicalRoot>|undefined;
     if(input.operation==='rebind'){
       const binding=bindings.find(value=>value.source_id===input.sourceId);
       if(!binding&&source?.local_path===null)throw new OperationError('writer_registration_required','This source has no canonical filesystem binding.',
@@ -221,6 +275,8 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         {fix:ownerStatusFix(input.sourceId)});
       if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw rebindManifestMismatch(input.sourceId,binding.local_path,root!.worktree,
         storedManifestScope(manifests.get(binding.local_path)));
+      if(binding.local_path!==root!.worktree&&realpathSync(binding.local_path)===root!.worktree)
+        relocated=inspectRelocatedPhysicalRoot(binding.local_path,root!.worktree,{worktreeId:binding.worktree_id,coordinationPath:binding.coordination_path});
     }
     const ownedSourcePath=currentBinding?.local_path?join(currentBinding.local_path,currentBinding.relative_path):source?.local_path;
     if(input.operation==='restore'&&ownedSourcePath&&!existsSync(ownedSourcePath)) throw opError('recovery_required','Restore requires the verified canonical checkout. Reclone it before restoring the source.',
@@ -230,7 +286,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
     const result=await withCoordinatedWrite(tx,sources,async()=>{
       let incarnation=source?.incarnation??randomUUID();
-      let pagesDeleted=0;
+      let pagesDeleted=retiredPages;
       if(input.operation==='add'||input.operation==='claim'){
         if(root&&input.createDirectory&&!existsSync(root.source)){mkdirSync(root.source,{recursive:true});flushTopologyDirectory(dirname(root.source));}
         if(source) await tx.executeRaw("UPDATE sources SET local_path=$2,name=COALESCE($3,name),config=$4::text::jsonb WHERE id=$1",
@@ -241,30 +297,41 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       }else if(input.operation==='archive') await tx.executeRaw(`UPDATE sources SET archived=true,archived_at=COALESCE(archived_at,now()),
         archive_expires_at=COALESCE(archive_expires_at,now()+interval '72 hours'),config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:false})]);
       else if(input.operation==='restore') await tx.executeRaw(`UPDATE sources SET archived=false,archived_at=NULL,archive_expires_at=NULL,
-        config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:input.refederate!==false})]);
-      else if(input.operation==='rebind'){
+        config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:input.refederate!==false&&source?.config?.qm_scope!==true})]);
+      else if(input.operation==='rebind'&&relocated){
+        // #5914 (P1.3c): the recorded root now resolves through a symlink to the new directory; the worktree keeps its id
+        // and its ownership records move to the real path (reservation under the new sha256(root) name, stamp naming it).
+        const moved=relocatePhysicalRoot(currentBinding!.local_path!,root!.worktree,relocated);
+        await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[input.sourceId,root!.source]);
+        await tx.executeRaw('UPDATE persistence_host_bindings SET local_path=$3 WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[currentBinding!.worktree_id,hostIdFor(tx),moved.root]);
+        const rel=relative(nativeFilesystemPath(moved.root),nativeFilesystemPath(root!.source)).split(sep).join('/');
+        await tx.executeRaw('UPDATE persistence_source_bindings SET relative_path=$2 WHERE source_id=$1',[input.sourceId,rel]);
+        manifests.set(moved.root,manifests.get(root!.worktree)!);
+      }else if(input.operation==='rebind'){
         await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[input.sourceId,root!.source]);
         const id=await installTopologyBinding(tx,input.sourceId,incarnation,root!,bindings);if(!worktrees.includes(id))worktrees.push(id);
       }else{
         const refs=await tx.executeRaw<{client_id:string}>('SELECT client_id FROM oauth_clients WHERE source_id=$1 LIMIT 1',[input.sourceId]);
         if(refs.length) throw opError('source_referenced','OAuth clients still reference this source. Revoke and remove those registrations first.',
-          `Nothing was removed. OAuth client ${refs[0].client_id} (and possibly others) is bound to '${input.sourceId}'; list them with the command in fix and ask the user before revoking any, since revoking disconnects that client.`,
+          `${retiredPages?`Only the ${retiredPages} page(s) this run already deleted were removed.`:'Nothing was removed.'} OAuth client ${refs[0].client_id} (and possibly others) is bound to '${input.sourceId}'; list them with the command in fix and ask the user before revoking any, since revoking disconnects that client.`,
           {fix:readFix('Lists OAuth clients with the source each is bound to.',{argv:['gbrain','auth','clients','--json']})});
         const [impact]=await tx.executeRaw<{count:string}>('SELECT count(*)::text AS count FROM pages WHERE source_id=$1',[input.sourceId]);
-        pagesDeleted=Number(impact.count);
+        pagesDeleted+=Number(impact.count);
         await tx.executeRaw('DELETE FROM sources WHERE id=$1 AND incarnation=$2::uuid',[input.sourceId,incarnation]);
         await tx.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1 AND source_incarnation=$2::uuid',[input.sourceId,incarnation]);
       }
+      const contentReceipts=input.operation==='rebind'?await rebindContentReceipts(tx,worktrees,hostIdFor(tx),relocated?undefined:[input.sourceId]):[];
       await advanceTopology(tx,worktrees);
       for(const id of worktrees){
-        const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,localHostId()]);
+        const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,hostIdFor(tx)]);
         if(host&&manifests.has(host.local_path)) await tx.executeRaw('UPDATE persistence_worktrees SET manifest=$2::text::jsonb WHERE id=$1::uuid',[id,JSON.stringify({...manifests.get(host.local_path),canonical_stamp:await topologyCanonicalStamp(tx,id)})]);
+        else if(!manifestRequired&&host) await tx.executeRaw(`UPDATE persistence_worktrees SET manifest=COALESCE(manifest,'{}'::jsonb)||jsonb_build_object('canonical_stamp',$2::text) WHERE id=$1::uuid`,[id,await topologyCanonicalStamp(tx,id)]);
       }
       // This durable registry intentionally retains old checkout paths, so
       // stale installations cannot write after a source moved or disappeared.
       await refreshManagedFilesystemRoots(tx,managedFilesystemDatastorePath(engine));
       return {operation:input.operation,source_id:input.sourceId,source_incarnation:incarnation,invalidated_requests:invalidated,
-        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),
+        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),...(contentReceipts.length?{content_receipts:contentReceipts}:{}),
         ...(root?{local_path:root.source}:{}),...(['remove','purge'].includes(input.operation)?{storage_retained:true,local_path:ownedSourcePath??null,pages_deleted:pagesDeleted}:{}),
         ...(input.operation==='add'?{name:input.name??source?.name??input.sourceId,config:redactSourceConfig({...source?.config,...input.config}),id:input.sourceId}: {})};
     },principalAttribution({kind:'local_cli',id:principal}));
@@ -272,7 +339,12 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     const row=await recordTopologyChange(tx,{principal,requestId,intent,operation:input.operation,sourceId:input.sourceId,incarnation:source?.incarnation??String(result.source_incarnation),worktrees},result);
     return topologyReceipt(row);
     });
-  },root?.worktree);
+    }catch(error){
+      if(retiredPages&&error instanceof OperationError&&!error.suggestion?.startsWith('Only the'))
+        error.suggestion=`This run had already deleted ${retiredPages} page(s) of source '${input.sourceId}' in committed batches before it stopped; the source and its remaining pages are still registered. ${error.suggestion??''}`.trim();
+      throw error;
+    }
+  },root?.worktree,5000,{relocation:input.operation==='rebind'});
 }
 
 /** #6099: a rebind's new directory does not match the current checkout; names the first differing paths (Git-tracked paths in git scope). */

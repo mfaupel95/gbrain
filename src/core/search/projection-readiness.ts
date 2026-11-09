@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { PageReadScope } from '../types.ts';
-import { pageReadFilter } from './read-policy-sql.ts';
+import { projectionClassSql } from '../page-state/projection-class.ts';
+import { coverageScopeFilters } from './retrieval-coverage.ts';
 
 export interface ProjectionReadinessScope extends PageReadScope {
   pageKind?: string;
@@ -8,8 +9,12 @@ export interface ProjectionReadinessScope extends PageReadScope {
   excludeSlugPrefixes?: string[];
 }
 
+/**
+ * `by_design` (#6803): the only unsealed pages in scope are protected-OCR images,
+ * which no repair seals (archived sources are already outside every live read).
+ */
 export interface ProjectionReadiness {
-  status: 'ready' | 'projection_pending' | 'unknown';
+  status: 'ready' | 'projection_pending' | 'by_design' | 'unknown';
   ready: boolean;
   hint?: string;
 }
@@ -78,37 +83,34 @@ async function probeUncached(
   scope: ProjectionReadinessScope,
 ): Promise<ProjectionReadiness> {
   const params: unknown[] = [];
-  const filters = [pageReadFilter('p', scope, params, true)];
-  if (scope.sourceIds?.length === 0) filters.push('FALSE');
-  if (scope.pageKind) {
-    params.push(scope.pageKind);
-    filters.push(`p.page_kind = $${params.length}`);
-  }
-  if (scope.types) {
-    params.push(scope.types);
-    filters.push(`p.type = ANY($${params.length}::text[])`);
-  }
-  for (const prefix of scope.excludeSlugPrefixes ?? []) {
-    params.push(prefix);
-    filters.push(`LEFT(p.slug, LENGTH($${params.length}::text)) <> $${params.length}`);
-  }
+  const filters = coverageScopeFilters(scope, params);
   try {
-    const rows = await engine.executeRaw<{ pending: boolean }>(
-      `SELECT EXISTS (
-        SELECT 1 FROM pages p
+    // One bound statement: unsealed pages that need work, then those unsealed by design (the class fragment doctor counts).
+    // by_design is read only when nothing is pending, and an InitPlan runs only when the CASE reaches it: while pages are
+    // pending its LIMIT 1 finds no protected page to stop at, so evaluating it anyway read every unsealed page (#8000).
+    // The planner has no statistics for a column-to-column comparison, so it believes most pages are unsealed and an
+    // EXISTS chose a sequential scan of pages that expected to stop at once; on a sealed brain it read every page
+    // (~600 ms at 600k pages, on every cold call). Ordering by idx_pages_projection_pending's columns under LIMIT 1
+    // makes that partial index the cheap first row, so the probe reads only the unsealed pages.
+    const unsealed = (cond: string) => `(SELECT true FROM pages p JOIN sources s ON s.id = p.source_id
         WHERE p.deleted_at IS NULL
           AND p.text_projection_revision IS DISTINCT FROM p.knowledge_revision
-          AND ${filters.join(' AND ')}
-      ) AS pending`,
+          AND ${filters.join(' AND ')} AND ${cond}
+        ORDER BY p.source_id, p.page_kind, p.slug LIMIT 1) IS NOT NULL`;
+    const cls = projectionClassSql('p', 's');
+    const rows = await engine.executeRaw<{ pending: boolean; by_design: boolean }>(
+      `WITH r AS MATERIALIZED (SELECT ${unsealed(`${cls} NOT IN ('protected','archived')`)} AS pending)
+      SELECT r.pending, CASE WHEN r.pending THEN false ELSE ${unsealed(`${cls} IN ('protected','archived')`)} END AS by_design FROM r`,
       params,
     );
     if (typeof rows[0]?.pending !== 'boolean') throw new Error('Invalid readiness result');
-    return rows[0].pending
-      ? {
+    if (rows[0].pending) {
+      return {
         status: 'projection_pending', ready: false,
         hint: 'Current text projections are pending in the visible scope; results may be incomplete. Run `gbrain doctor` locally to inspect recovery. This read does not repair or embed content.',
-      }
-      : { status: 'ready', ready: true };
+      };
+    }
+    return { status: rows[0].by_design ? 'by_design' : 'ready', ready: true };
   } catch {
     return {
       status: 'unknown', ready: false,
@@ -116,3 +118,4 @@ async function probeUncached(
     };
   }
 }
+

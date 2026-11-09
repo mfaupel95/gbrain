@@ -5,7 +5,7 @@ Brain data (pulled pages, synthetic brains, PGLite files, results) lives under
 `$BENCH_WORK` (default `~/.capy/work/brain`) and must never be committed. Result rows hold
 counts, sizes and timings only.
 
-Requires Bun >= 1.4 (the repo's `engines.bun`) and Docker for the Postgres engine.
+Requires Bun >= 1.4.4 (the repo's `engines.bun`) and Docker for the Postgres engine.
 
 | File | What it does |
 |---|---|
@@ -19,6 +19,7 @@ Requires Bun >= 1.4 (the repo's `engines.bun`) and Docker for the Postgres engin
 | `probe-cold.ts` | Cold CLI start split: bun start, module graph, `--version`, real reads, each with stdout piped and with `GBRAIN_FLUSH_GRACE_MS=0` (the non-TTY exit-flush grace). |
 | `probe-rerank.ts` | Direct Voyage `/v1/rerank` grid over `top_n_in x max_doc_tokens` and models on candidate sets drawn from a Postgres bench brain: billed tokens/call, $/1k queries, p50/p95, top-5 agreement with the 25x1400 default (a drift signal, not quality). Spends ~$0.1 per 20-query grid. |
 | `probe-mcp-start.ts` | MCP stdio cold start: fresh `gbrain serve` per sample, spawn -> initialize, spawn -> tools/list, first tools/call latency and spawn -> first call, after each `--idle-ms` gap; interleaves several `--cli` trees and prints the tools/list size and hash per tree (equal hashes = byte-identical list). |
+| `probe-pglite-open.ts` | PGLite open cost on a copy of a data directory: `PGlite.create` with PGLite's stock (eager) vs gbrain's lazy extensions, at the 128MB default vs the 32MB one-shot-read `shared_buffers`, one fresh process per sample, plus the first query that loads `vector.so`. |
 | `bench-chunk.ts` | In-process chunk pass: parse every page of a synthetic brain directory (or `--cjk <pages>` for a generated mixed CJK / Latin / emoji corpus), then time the importer's `prepareMarkdownChunks` over all pages for `--n` passes after a warm-up. Prints p50/p95 per pass and a sha256 over every chunk, so a before/after pair doubles as an equivalence check. |
 | `vector-scope-share.ts` | Vector search latency and recall per source scope against an existing Postgres or PGLite brain (GBRA-71): `searchVector` per scope, recall of result pages against the exact statement, page share, the chunk count the engine routes on, underfilled exits; `--remote` adds the private-page rule. |
 | `remote-rows.ts` | Rows for hosted-brain read latency recorded during a pull. |

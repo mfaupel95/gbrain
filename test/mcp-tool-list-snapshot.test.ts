@@ -84,11 +84,19 @@ async function handshake(mode: Mode, eager: boolean): Promise<{ initialize: stri
 
 type Pair = { manifest: { initialize: string; tools: string }; eager: { initialize: string; tools: string } };
 let results: Pair[] = [];
+/** Servers booting at once: each handshake's deadline is one boot's, not a share of the whole matrix booting together (about 23 CPU-seconds and 4 GB). */
+const BOOTS_AT_ONCE = 4;
 beforeAll(async () => {
-  results = await Promise.all(MODES.map(async mode => {
-    const [manifest, eager] = await Promise.all([handshake(mode, false), handshake(mode, true)]);
-    return { manifest, eager };
+  const boots = MODES.flatMap((mode, i) => [false, true].map(eager => ({ mode, i, eager })));
+  const pairs: Array<Partial<Pair>> = MODES.map(() => ({}));
+  let next = 0;
+  await Promise.all(Array.from({ length: BOOTS_AT_ONCE }, async () => {
+    while (next < boots.length) {
+      const { mode, i, eager } = boots[next++]!;
+      pairs[i]![eager ? 'eager' : 'manifest'] = await handshake(mode, eager);
+    }
   }));
+  results = pairs as Pair[];
 }, 180_000);
 
 describe('stdio initialize + tools/list: manifest path == eager registry path', () => {

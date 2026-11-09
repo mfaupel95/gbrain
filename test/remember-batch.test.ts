@@ -38,15 +38,39 @@ describe('remember items[] batch', () => {
     expect(writes[1].request_id).toBe(childRequestId(rid, 1));
   });
 
-  test('a non-UUID request_id refuses the batch before any write (#6280)', async () => {
-    for (const request_id of ['not-a-uuid', 'r1', '', 42]) {
+  test("a top-level entity reaches validation and admission; an item's own entity wins (#7432)", async () => {
+    const validated: unknown[] = [];
+    const admitted: unknown[] = [];
+    await runRememberBatch(ctx, {
+      entity: 'people/alice-example',
+      provenance: 'session',
+      items: [{ fact: 'Prefers tea' }, 'Ships weekly', { fact: 'Prefers coffee', entity: 'people/bob-example' }, { fact: 'An unscoped note', entity: null }],
+    }, async (c, p) => {
+      (c.dryRun ? validated : admitted).push(p.entity);
+      return { status: 'saved' };
+    }, ve);
+    const expected = ['people/alice-example', 'people/alice-example', 'people/bob-example', null];
+    expect(validated).toEqual(expected);
+    expect(admitted).toEqual(expected);
+  });
+
+  test('an unusable request_id refuses the batch before any write (#6280)', async () => {
+    for (const request_id of ['', 42, null, 'has space', 'x'.repeat(129)]) {
       const { handler, writes } = fakeSingle();
       let err: unknown;
       try { await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }] }, handler, ve); } catch (e) { err = e; }
       expect(err).toBeInstanceOf(OperationError);
       expect((err as OperationError).code).toBe('invalid_params');
-      expect((err as Error).message).toContain('request_id must be a UUID');
+      expect((err as Error).message).toContain('request_id must be 1 to 128 printable ASCII characters');
       expect(writes).toHaveLength(0);
+    }
+  });
+
+  test('a client request_id (F6) is accepted; children derive from the string as sent', async () => {
+    for (const request_id of ['not-a-uuid', 'r1']) {
+      const { handler, writes } = fakeSingle();
+      await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve);
+      expect(writes.map(w => w.request_id)).toEqual([childRequestId(request_id, 0), childRequestId(request_id, 1)]);
     }
   });
 
@@ -78,6 +102,42 @@ describe('remember items[] batch', () => {
     expect(out.partial).toBe(true);
     expect(out.items[1].status).toBe('failed');
     expect(out.next).toContain('new request_id');
+    // #8621: a partial failure is an in-band error (the CLI exits 1), not a clean success.
+    expect(out).toMatchObject({ status: 'error', code: 'internal_error', saved: 1, failed: 1 });
+  });
+
+  test('#8621: an item whose outcome is unknown keeps the per-item envelope and its child request_id, never "none saved"', async () => {
+    const { handler: base } = fakeSingle({ failWrite: p => p.fact === 'fenced' });
+    const handler = async (c: OperationContext, p: Record<string, unknown>) => {
+      if (p.fact !== 'lost' || c.dryRun) return base(c, p);
+      const e = ve('unavailable', 'The write outcome is unknown.', 'Poll get_write_request.');
+      Object.assign(e, { writeError: 'write_outcome_unknown' });
+      throw e;
+    };
+    const root = '22222222-2222-4222-8222-222222222222';
+    const out = await runRememberBatch(ctx, { provenance: 'p', request_id: root, items: [{ fact: 'fenced' }, { fact: 'lost' }] }, handler, ve) as Record<string, any>;
+    expect(out).toMatchObject({ status: 'error', code: 'internal_error', saved: 0, failed: 2 });
+    expect(out.items[1]).toMatchObject({ request_id: childRequestId(root, 1), status: 'failed', error: { write_error: 'write_outcome_unknown' } });
+  });
+
+  test('#8621: a fenced item in a partial batch keeps its canonical code and retryable flag', async () => {
+    const { handler: base } = fakeSingle();
+    const handler = async (c: OperationContext, p: Record<string, unknown>) => {
+      if (p.fact !== 'fenced' || c.dryRun) return base(c, p);
+      throw Object.assign(ve('unavailable', 'The checkout is refreshing.', 'Retry the same request_id.'), { canonical: 'worktree_refreshing', retryable: true, detail: 'retry_after_ms=1000' });
+    };
+    const out = await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'ok' }, { fact: 'fenced' }] }, handler, ve) as Record<string, any>;
+    expect(out.items[1].error).toMatchObject({ code: 'unavailable', canonical: 'worktree_refreshing', retryable: true, detail: 'retry_after_ms=1000' });
+  });
+
+  test('#8621: a batch whose every item failed throws the first item error instead of returning a success envelope', async () => {
+    const { handler, writes } = fakeSingle({ failWrite: () => true });
+    let err: unknown;
+    try { await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as OperationError).code).toBe('internal_error');
+    expect((err as Error).message).toBe('items[0]: boom None of the 2 item(s) was saved.');
+    expect(writes).toHaveLength(0);
   });
 
   test('rejects empty, oversized, unknown-field and fact+items calls', async () => {

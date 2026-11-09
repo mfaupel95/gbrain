@@ -39,6 +39,7 @@
 
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
+import { engineKey } from '../engine-key.ts';
 
 /** Names whose parentless submits coalesce on identical params by default. */
 export const PARAM_COALESCE_DEFAULT: Readonly<Record<string, boolean>> = {
@@ -60,12 +61,13 @@ export const WAITING_TTL_DEFAULT_HOURS: Readonly<Record<string, number>> = {
 export const QUOTA_MAX_WAITING_DEFAULT: Readonly<Record<string, number>> = {};
 
 /**
- * Keys excluded from the param hash. ONLY the hash's own storage key:
- * `__owner_client_id` is deliberately INCLUDED so coalescing never crosses
- * owner lanes — one OAuth client's submit must not be suppressed by (or
- * handed a job id owned by) another client.
+ * Keys excluded from the param hash: the hash's own storage key and the
+ * `__submitter` display label (`job-insight.ts`), so a re-submit from another
+ * local process still coalesces. `__owner_client_id` is deliberately INCLUDED
+ * so coalescing never crosses owner lanes — one OAuth client's submit must not
+ * be suppressed by (or handed a job id owned by) another client.
  */
-export const PARAM_HASH_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['__param_hash']);
+export const PARAM_HASH_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['__param_hash', '__submitter']);
 
 /**
  * error_text prefix stamped by the waiting-TTL sweep. The 24h-cancellation
@@ -196,16 +198,17 @@ function parsePositiveNumber(v: string | null): number | null {
   return n;
 }
 
-// ~60s in-process cache: add() runs per submission; a config read per submit
-// would add a query to the hot path for a value that changes at human speed.
+// ~60s in-process cache per engine and job name: add() runs per submission; a
+// config read per submit would add a query to the hot path for a value that
+// changes at human speed.
 type CacheEntry = { at: number; policy: AdmissionPolicy };
-const policyCache = new Map<string, CacheEntry>();
+let policyCache = new WeakMap<object, Map<string, CacheEntry>>();
 const POLICY_CACHE_MS = 60_000;
 let warnedFailOpen = false;
 
 /** Test seam: drop the cache so config changes are visible immediately. */
 export function _resetAdmissionCacheForTest(): void {
-  policyCache.clear();
+  policyCache = new WeakMap();
   warnedFailOpen = false;
 }
 
@@ -218,7 +221,10 @@ export async function resolveAdmissionPolicy(engine: BrainEngine, jobName: strin
   if (admissionKilled()) {
     return { coalesceParams: false, ttlWaitingHours: null, quotaMaxWaiting: null };
   }
-  const cached = policyCache.get(jobName);
+  const key = engineKey(engine);
+  let byName = policyCache.get(key);
+  if (!byName) policyCache.set(key, byName = new Map());
+  const cached = byName.get(jobName);
   if (cached && Date.now() - cached.at < POLICY_CACHE_MS) return cached.policy;
 
   const policy: AdmissionPolicy = {
@@ -251,7 +257,7 @@ export async function resolveAdmissionPolicy(engine: BrainEngine, jobName: strin
       );
     }
   }
-  policyCache.set(jobName, { at: Date.now(), policy });
+  byName.set(jobName, { at: Date.now(), policy });
   return policy;
 }
 

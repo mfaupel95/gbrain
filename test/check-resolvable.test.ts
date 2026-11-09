@@ -12,6 +12,11 @@ import {
 const SKILLS_DIR = join(import.meta.dir, "..", "skills");
 
 describe("parseResolverEntries", () => {
+  test('an orphan skills-index begin marker does not hide the resolver entries after it', () => {
+    const content = '## Brain\n<!-- gbrain:skills:begin -->\n- a stale line\n| "query the brain" | `skills/query/SKILL.md` |\n';
+    expect(parseResolverEntries(content).map((e) => e.skillPath)).toContain('skills/query/SKILL.md');
+  });
+
   test("extracts skill paths from markdown table rows", () => {
     const content = `## Brain operations
 | Trigger | Skill |
@@ -350,6 +355,21 @@ describe("extractDelegationTargets", () => {
       "some prose.\nSee `skills/conventions/quality.md` for details.\n"
     );
     expect(refs).toEqual([{ convention: "conventions/quality.md", line: 2 }]);
+  });
+
+  test("accepts a #anchor after .md and drops it from the path (#6704)", () => {
+    const refs = extractDelegationTargets(
+      "See `skills/conventions/quality.md#citations` and `skills/_brain-filing-rules.md#the-rule`.\n"
+    );
+    expect(refs).toEqual([
+      { convention: "conventions/quality.md", line: 1 },
+      { convention: "_brain-filing-rules.md", line: 1 },
+    ]);
+  });
+
+  test("accepts an anchor with dots and non-ASCII letters (#6704)", () => {
+    const refs = extractDelegationTargets("See `skills/conventions/quality.md#v1.2-引用`.\n");
+    expect(refs).toEqual([{ convention: "conventions/quality.md", line: 1 }]);
   });
 
   test("ignores backticks pointing outside known delegation targets", () => {

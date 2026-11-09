@@ -41,6 +41,56 @@ Each row's `score_details`:
 A stage the search did not run is reported as `not_run` or `skipped` with a
 reason, never as an invented value.
 
+## See where the time went
+
+Every `search` and `query` response carries its stage timings in
+`_meta.retrieval.timings` (MCP and thin clients; never in the result text),
+and `gbrain search --explain` / `gbrain query --explain` print them as the
+first header line, on empty and degraded responses too:
+
+```text
+timings: 74ms total — setup 1, lexical 12, relational 0, embed 0, vector 16, fuse 26, post_fusion 9, rerank 2, alias_fanout 0, anchoring 0, facts_arm 5, response 3, other 0 (overlapped: keyword_arm 12, title_arm 12)
+```
+
+**Say to your agent:** *"Why was that search slow? Show me where the time went."*
+
+| Field | Meaning |
+|---|---|
+| `total_ms` | Wall time of the whole operation, measured on its own clock after the response is assembled. |
+| `stages_ms` | Time the request spent blocked in each stage that ran: `setup` (scope, config, mode), `lexical`, `relational`, `expansion`, `embed`, `vector`, `fuse`, `post_fusion` (boosts, dedup, identity tiers, return sizing), `rerank`, `alias_fanout`, `anchoring`, `facts_arm` (query), `response` (evidence delivery, response metadata, redaction). A second search the operation runs (a retry, a CRAG re-run) adds to the same stages; the alias fan-out's keyword searches count under `alias_fanout`. |
+| `other_ms` | Time no stage claimed. `sum(stages_ms) + other_ms = total_ms`. |
+| `overlapped_ms` | Work that ran alongside a stage, so it is not added to the total: the keyword and title arms run in parallel inside `lexical` (`keyword_arm`, `title_arm`), `search`'s total-match count runs alongside the whole request (`keyword_count`), and the vector side (query expansion, the query embed and the vector search) starts with the lexical arms, so the part of `expansion`, `embed` and `vector` that finished while they ran is listed here under the stage's name. The rest of those stages, the part the request had to wait for, stays in `stages_ms`. The response metadata's concurrent reads are listed as `meta_saved_facts`, `meta_entity_facts`, `meta_held`, `meta_readiness`, `meta_freshness`, `meta_embedding_held`, `meta_safe_index` and `meta_filter_hint`; `response.meta` waits for the slowest of them. |
+| `parts_ms` | Present when a stage records its steps: `response` splits into `evidence` (evidence delivery), `trust` (the page-trust stamp), `meta` (the response metadata), `keyword_count` (the wait for `search`'s total-match count) and `feedback` (the answer-feedback record). Parts run one after another and never overlap, so they sum to at most the stage; the rest of `response` is redaction, snippet caps and row projection. `stages_ms.response` keeps its whole time. |
+
+All values are integer milliseconds.
+
+### The whole CLI call and what it spent
+
+`gbrain search --json --timings` and `gbrain query --json --timings` print
+`{ "results": [...], "timings_ms": {...}, "cost": {...} }` instead of the bare
+result array (plain `--json` is unchanged); without `--json`, `--timings`
+adds one `timings:` line on stderr.
+
+`timings_ms` adds the CLI's own phases to the operation's stages: `total`
+(process start to output), `startup` (module load, config, argument parsing),
+`connect` (opening the brain), `context` (operation context and source
+resolution), `remote` (a thin client's round trip to its server), `op` (the
+operation's `total_ms`), `stages` (its `stages_ms` plus `other`),
+`overlapped`, `parts` (the operation's `parts_ms`) and `cli_other` (CLI time in no phase: formatting, notices). A
+phase that did not run is absent; `0` means it took under half a
+millisecond. On a thin client `op` and `stages` are the server's.
+
+`cost` (also `_meta.retrieval.cost` over MCP) counts every model call the
+request made, by kind (`embedding`, `rerank`, `expansion`, `chat`, `decide`;
+`expansion` is the same call `chat_usage_log` records with phase `expansion`), each with
+`calls`, `input_tokens`, `output_tokens` and `usd`, plus `calls` and
+`estimated_usd` in total. Tokens are what the provider reported; a call it
+reported none for counts its request estimate and is tallied in
+`estimated_token_calls`. `usd` comes from the shipped price tables and is
+left out when a model is not priced. Failed calls count (a provider can bill
+them); a call a budget guard refused was never sent and does not. A
+keyword-only search reads `{ "calls": 0, "estimated_usd": 0 }`.
+
 ## Diagnose a missing page
 
 MCP:
@@ -50,17 +100,23 @@ MCP:
 ```
 
 The response meta `explain_target` holds the diagnosis, and a notice carries
-the next step:
+the next step. On the command line, `gbrain search|query "<q>" --explain-target
+<source>:<slug> --json` prints `{ "results": [...], "explain_target": {...} }`
+instead of the bare array, with the fix rendered as a command (`next`, `argv`,
+`command`); without `--explain-target` the output stays an array. When an arm
+failed on the call, `why` names it, since a failed arm is not evidence of absence:
 
 | `code` | What happened | Next step |
 |---|---|---|
 | `target_returned` | The page is in the results at `rank`. | Read its `score_details`. |
-| `target_beyond_limit` | It ranked below the requested limit. | The notice repeats the search with a limit that reaches it. |
+| `target_collapsed` | It is a copy folded into the result at `rank`, which lists it in `collapsed`. | Read that row, or set `search.collapse false` to return every copy. |
+| `target_beyond_limit` | It ranked below the requested limit; `arms` and `why` give each arm's rank. | The notice repeats the search with a limit that reaches it. |
 | `target_dropped_dedup` | Dedup kept a higher-ranked row from the same page or a near-duplicate. | Read the page directly with `get_page`. |
 | `target_dropped_return_sizing` | Autocut or adaptive return trimmed it. | `get_page`, or repeat with `autocut: false` (query). |
 | `target_dropped_token_budget` | The evidence budget filled first. | Repeat with a larger `token_budget`. |
 | `target_dropped_relaxed_keyword` | Only a loose keyword match found it. | `get_page`, or rephrase with the page's own terms. |
-| `target_not_retrieved` | No arm returned it for this query. | `query` (multi-query expansion) or rephrase. |
+| `target_not_retrieved` | No arm returned it for this query. | `query --expand` (`expand: true`; one call to the configured expansion model) or rephrase. The fix carries `consent: ["paid", "egress"]`, so it renders `next: ask_user`: the agent asks before sending the query to the model. |
+| `target_not_embedded` | Its chunks have no vectors (held from embedding or not embedded yet), so only a keyword or title match can return it. | `gbrain doctor --json` names the held pages and the embed command. |
 | `target_not_indexed` | The page has no indexed chunks. | `gbrain doctor --json` names the re-index command. |
 | `target_projection_stale` | The page changed and its searchable text is still being rebuilt. | Retry after `gbrain doctor` shows the backlog drained. |
 | `target_safe_chunks_uncertified` | Remote reads withhold pages indexed before the current safe-chunk format. | The brain host runs `gbrain repair safe-chunks`. |

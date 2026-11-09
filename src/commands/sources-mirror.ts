@@ -5,7 +5,8 @@
  * writes a file into the source's checkout: sync imports canonical metadata
  * database-only and page writes are stored database-only, so a mirror kept
  * current by `git pull --ff-only` never gains local modifications.
- * Follows `federate` / `unfederate`.
+ * Follows `federate` / `unfederate`. `--dry-run` prints the change and writes
+ * nothing (#7086), as `sources remove --dry-run` does.
  */
 import type { BrainEngine } from '../core/engine.ts';
 import { normalizeSourceConfig, parseSourceConfig } from '../core/sources-load.ts';
@@ -13,7 +14,7 @@ import { normalizeSourceConfig, parseSourceConfig } from '../core/sources-load.t
 export async function runMirrorMode(engine: BrainEngine, args: string[], readOnly: boolean): Promise<void> {
   const id = args[0];
   if (!id || id.startsWith('-')) {
-    console.error(`Usage: gbrain sources ${readOnly ? 'mirror-readonly' : 'mirror-writable'} <id>`);
+    console.error(`Usage: gbrain sources ${readOnly ? 'mirror-readonly' : 'mirror-writable'} <id> [--dry-run]`);
     process.exit(2);
   }
   const [src] = await engine.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id=$1', [id]);
@@ -22,6 +23,14 @@ export async function runMirrorMode(engine: BrainEngine, args: string[], readOnl
     process.exit(4);
   }
   const config = parseSourceConfig(src.config);
+  if (args.includes('--dry-run')) {
+    const current = config.mirror_read_only === true;
+    console.log(current === readOnly
+      ? `Source "${id}" is already ${readOnly ? 'a read-only mirror' : 'writable'}; nothing would change.`
+      : `Source "${id}" would become ${readOnly ? 'a read-only mirror (mirror_read_only: false -> true)' : 'writable (mirror_read_only: true -> false)'}.`);
+    console.log('(dry-run; no side effects)');
+    return;
+  }
   if (readOnly) config.mirror_read_only = true;
   else delete config.mirror_read_only;
   await engine.executeRaw('UPDATE sources SET config = $1::text::jsonb WHERE id = $2', [JSON.stringify(normalizeSourceConfig(config)), id]);

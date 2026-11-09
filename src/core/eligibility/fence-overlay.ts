@@ -106,22 +106,44 @@ export interface FenceOverlaySplit {
 export function splitFenceOverlay(text: string, overlay: FenceChunkOverlay | null | undefined): FenceOverlaySplit {
   if (fenceOverlayIsEmpty(overlay) || !text.includes('gbrain:facts:begin')) return { main: text, lowTier: [] };
   const { omit, demote } = overlay!;
+  const main = dropFactFenceRowsByNumber(text, row => !omit.has(row.rowNum) && !demote.has(row.rowNum));
+  return { main, lowTier: renderFenceLowTier(fenceLowTierRows(text, overlay)) };
+}
+
+/** A visible world fence row of a body whose tier is below the page tier, with that tier, in body order. */
+export interface FenceLowTierRow { tier: TrustTier; unconfirmed: boolean; row: ParsedFact }
+
+/**
+ * The rows `splitFenceOverlay` moves out of a body, in order. Fence blocks never cross a segment cut, so the rows of a
+ * segmented body are its segments' rows concatenated, and `renderFenceLowTier` over them equals the whole-body split.
+ */
+export function fenceLowTierRows(text: string, overlay: FenceChunkOverlay | null | undefined): FenceLowTierRow[] {
+  if (fenceOverlayIsEmpty(overlay) || !text.includes('gbrain:facts:begin')) return [];
+  const { omit, demote } = overlay!;
   const flagged = overlay!.unconfirmed ?? new Set<number>();
-  const groups = new Map<string, ParsedFact[]>();
+  const rows: FenceLowTierRow[] = [];
   for (const block of withdrawalFenceBlocks(text)) {
     if (block.parsed.warnings.length) continue;
     for (const row of block.parsed.facts) {
       const tier = demote.get(row.rowNum);
       if (!tier || omit.has(row.rowNum) || row.visibility !== 'world' || row.forgotten) continue;
-      const group = `${tier}|${flagged.has(row.rowNum)}`;
-      groups.set(group, [...(groups.get(group) ?? []), row]);
+      rows.push({ tier, unconfirmed: flagged.has(row.rowNum), row });
     }
   }
-  const main = dropFactFenceRowsByNumber(text, row => !omit.has(row.rowNum) && !demote.has(row.rowNum));
-  return { main, lowTier: TRUST_TIERS.flatMap(tier => [false, true].flatMap(unconfirmed => {
-    const rows = groups.get(`${tier}|${unconfirmed}`);
-    return rows ? [{ tier, unconfirmed, body: renderFactsTable(rows) }] : [];
-  })) };
+  return rows;
+}
+
+/** One rendered facts fence per demoted tier and unconfirmed state, least trusted last (`FenceOverlaySplit.lowTier`). */
+export function renderFenceLowTier(rows: readonly FenceLowTierRow[]): FenceOverlaySplit['lowTier'] {
+  const groups = new Map<string, ParsedFact[]>();
+  for (const { tier, unconfirmed, row } of rows) {
+    const group = `${tier}|${unconfirmed}`;
+    groups.set(group, [...(groups.get(group) ?? []), row]);
+  }
+  return TRUST_TIERS.flatMap(tier => [false, true].flatMap(unconfirmed => {
+    const grouped = groups.get(`${tier}|${unconfirmed}`);
+    return grouped ? [{ tier, unconfirmed, body: renderFactsTable(grouped) }] : [];
+  }));
 }
 
 /** World fence rows of a body, every complete block. */

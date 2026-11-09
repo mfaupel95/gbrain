@@ -57,9 +57,10 @@ export async function updateSourceConfig(exec: SqlExecutor, sourceId: string, pa
     // String branch guard: a JSONB string whose inner text is NOT itself valid
     // JSON (one of the historical bad shapes this path repairs) would make the
     // bare `::jsonb` cast raise `invalid input syntax for type json`, failing
-    // the whole UPDATE. Postgres has no `try_cast`, so we gate the cast with
-    // the SQL `IS JSON` predicate (Postgres 16+): parseable inner text is
-    // double-encoded config and gets parsed; unparseable text falls back to `{}`.
+    // the whole UPDATE. Postgres has no `try_cast`, so the cast goes through
+    // gbrain_try_jsonb (NULL on unparseable text; Postgres 15+, unlike IS JSON,
+    // #7112): parseable inner text is double-encoded config and gets parsed;
+    // unparseable text falls back to `{}`.
     // The guard keeps the merge a single atomic statement (no extra round-trip,
     // no lost-update race).
     //

@@ -84,6 +84,7 @@ describe('embedStaleForSource', () => {
       chunksProcessed: 0,
       pagesProcessed: 0,
       invalidated: 0,
+      contentDrift: expect.objectContaining({ scope: 'source:default', state: 'complete', checked: 0, drifted: 0, batches: 1 }),
       lastCursor: null,
       done: true,
       aborted: false,
@@ -450,6 +451,29 @@ describe('signature invalidation is probe-gated (#4283)', () => {
       `SELECT embedding_signature AS s FROM pages WHERE slug = 'p1'`,
     );
     expect(sig[0]!.s).toBe(target);
+  });
+
+  test('a drift pre-check that cannot count still invalidates (#7148)', async () => {
+    await seedEmbeddedPage('p1', 3, 'old:model:1536');
+    const target = (await recordedModel('p1')) + ':1536';
+    await engine.executeRaw("UPDATE content_chunks SET model = 'old:model' WHERE page_id = (SELECT id FROM pages WHERE slug = 'p1' AND source_id = 'default')");
+    let timedOut = 0;
+    let armed = true;
+    const timingOut = new Proxy(engine, {
+      get(target, key) {
+        if (key === 'countStaleChunks') return async (...args: Parameters<PGLiteEngine['countStaleChunks']>) => {
+          if (armed) { timedOut++; throw new Error('canceling statement due to statement timeout'); }
+          return target.countStaleChunks(...args);
+        };
+        if (key === 'transaction') armed = false;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const result = await embedStaleForSource(timingOut, 'default', { embeddingSignature: target, embedFn: fakeEmbedFn });
+    expect(result.invalidated).toBe(3);
+    expect(result.embedded).toBe(3);
+    expect(timedOut).toBe(0);
   });
 
   test('no signature drift → no probe call (no embed spend on the common path)', async () => {

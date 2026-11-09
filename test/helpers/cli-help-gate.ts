@@ -16,9 +16,10 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { CLI_COMMANDS } from '../../src/cli/command-table.ts';
 import { ROUTERS } from '../../src/cli/subcommands.ts';
 import { STRICT_SUBCOMMANDS } from '../../src/cli/strict-args.ts';
+import { fileURLToPath } from 'node:url';
 
 export const GATE_PARTS = 4;
-const REPO = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/, '');
 const PROBE = join(REPO, 'test/helpers/cli-side-effect-probe.ts');
 /** Files any run may touch without acting: the agent-contract event log is written by the error/exit seam. */
 const TREE_ALLOW = [/^\.gbrain\/agent-contract\//];
@@ -45,7 +46,7 @@ export interface GateCase {
 const ROUTER_USAGE: Record<string, string> = {
   pages: 'gbrain pages —', cache: 'gbrain cache —', integrity: 'Usage: gbrain integrity', hook: 'Usage: gbrain hook',
   search: 'Usage: gbrain search <modes', 'edge-proposals': 'Usage: gbrain edge-proposals', schema: 'gbrain schema —',
-  config: 'Usage: gbrain config',
+  config: 'Usage: gbrain config', core: 'Usage: gbrain core', loops: 'gbrain loops —',
 };
 
 /** Every case, in a stable order. */

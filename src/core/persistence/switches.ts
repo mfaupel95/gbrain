@@ -28,12 +28,21 @@ export const WRITE_SWITCHES = {
    * (consumer-election.ts) instead of starting their own. Off by default until Phase 0's preregistered reading sets it.
    */
   single_consumer: { key: 'persistence.single_consumer', env: 'GBRAIN_SINGLE_CONSUMER', defaultOn: false },
+  /**
+   * Convergence PR B: a page write that meets a worktree refresh is admitted `deferred` and publishes after the refresh, instead
+   * of being refused `worktree_refreshing`. Off by default; turned on per brain once every routed producer polls its receipts.
+   */
+  refresh_barrier: { key: 'persistence.refresh_barrier', env: 'GBRAIN_REFRESH_BARRIER', defaultOn: false },
 } as const;
 export type WriteSwitch = keyof typeof WRITE_SWITCHES;
 export type WriteSwitches = Record<WriteSwitch, boolean>;
 export const WRITE_SWITCH_KEYS: readonly string[] = Object.values(WRITE_SWITCHES).map(s => s.key);
 export const SWITCH_TTL_MS = 5000;
 
+/** `sync.write_through` as the write path and onboarding read it: on unless explicitly off (#6449 shares the predicate with activation). */
+export function writeThroughConfigured(value: string | null | undefined): boolean {
+  return !/^(false|0|off|no)$/i.test(value ?? 'true');
+}
 const off = (value: string | null | undefined) => typeof value === 'string' && /^(0|false)$/i.test(value.trim());
 const on = (value: string | null | undefined) => typeof value === 'string' && /^(1|true)$/i.test(value.trim());
 /** One snapshot read: the switches plus the #6278 preparation budgets (preparation-budget.ts), so a claim never reads config on its own. */
@@ -76,6 +85,16 @@ export function readWriteSwitchSnapshot(viewed: SqlEngine, opts: { now?: () => n
   snapshots.set(engine, { at: now(), generation, read });
   read.catch(() => { if (snapshots.get(engine)?.read === read) snapshots.delete(engine); });
   return read;
+}
+/**
+ * GBRA-156: a whole-table config read this process just took (the CLI's connect-time merge) is the switch snapshot as of
+ * that read, kept for SWITCH_TTL_MS like any other; a snapshot already held is left alone.
+ */
+export function seedWriteSwitchSnapshot(viewed: object, rows: Record<string, string>, now: number = Date.now()): void {
+  const engine = viewedEngine(viewed);
+  const held = snapshots.get(engine);
+  if (held && held.generation === generation && now - held.at < SWITCH_TTL_MS) return;
+  snapshots.set(engine, { at: now, generation, read: Promise.resolve(resolve(new Map(Object.entries(rows)))) });
 }
 /** The preparation budgets in effect (defaults when the read fails). */
 export async function readPreparationPolicy(engine: SqlEngine): Promise<PreparationPolicy> {

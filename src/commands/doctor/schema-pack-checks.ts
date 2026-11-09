@@ -6,7 +6,10 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import type { Check } from '../doctor.ts';
 import type { MisroutedResult } from '../../core/multi-source-drift.ts';
+import { boundUnknownDetails } from './bounded-unknown.ts';
+import { statSync } from 'node:fs';
 import { redactConnectionInfo } from '../../core/audit/redact-connection-info.ts';
+import { formatPackBytes, OVERSIZED_PACK_RUNBOOK, schemaPackMaxBytes } from '../../core/schema-pack/loader.ts';
 import { loadActivePackForLocalEngine } from '../../core/schema-pack/best-effort.ts';
 import { sanitizeTypeForDisplay, storedTypeMissesPack } from '../../core/schema-pack/type-usage.ts';
 
@@ -34,11 +37,20 @@ export async function checkSchemaPackActive(engine: BrainEngine): Promise<Check>
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* engine.config may not exist on very old brains */ }
     const pack = await loadActivePack({ cfg: loadConfigFileOnly(), remote: false, dbConfig });
-    return {
-      name: 'schema_pack_active',
-      status: 'ok',
-      message: `Active pack: ${pack.manifest.name} v${pack.manifest.version} (${pack.manifest.page_types.length} types, ${pack.manifest.link_types?.length ?? 0} link verbs)`,
-    };
+    const summary = `Active pack: ${pack.manifest.name} v${pack.manifest.version} (${pack.manifest.page_types.length} types, ${pack.manifest.link_types?.length ?? 0} link verbs)`;
+    // #6432: a mutable pack file past the warn bound is almost always the
+    // backslash-doubling growth an older release produced; say so before
+    // every process pays for loading it, and before it hits the hard bound.
+    const oversized = await oversizedMutablePack(pack.manifest.name);
+    if (oversized) {
+      return {
+        name: 'schema_pack_active',
+        status: 'warn',
+        message: `${summary}. Its file is ${formatPackBytes(oversized.bytes)} (warn bound ${formatPackBytes(oversized.bound)}; loading refuses at ${formatPackBytes(schemaPackMaxBytes())}). Open ${oversized.path} and restore the grown quoted lines (usually a link-type regex) by hand; runbook ${OVERSIZED_PACK_RUNBOOK}.`,
+        details: { code: 'schema_pack_oversized', path: oversized.path, bytes: oversized.bytes, warn_bytes: oversized.bound, docs: OVERSIZED_PACK_RUNBOOK },
+      };
+    }
+    return { name: 'schema_pack_active', status: 'ok', message: summary };
   } catch (e) {
     return {
       name: 'schema_pack_active',
@@ -49,6 +61,22 @@ export async function checkSchemaPackActive(engine: BrainEngine): Promise<Check>
 }
 
 const SCHEMA_PACK_DOCS = 'docs/architecture/schema-packs.md#undeclared-page-types';
+
+/** The mutable active pack's file when it exceeds the warn bound (`GBRAIN_SCHEMA_PACK_WARN_BYTES`, default 1 MiB), else null. */
+async function oversizedMutablePack(name: string): Promise<{ path: string; bytes: number; bound: number } | null> {
+  const raw = process.env.GBRAIN_SCHEMA_PACK_WARN_BYTES;
+  const parsed = raw ? Number(raw) : NaN;
+  const bound = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1024 * 1024;
+  try {
+    const { BUNDLED_PACK_NAMES, locateMutablePackFile } = await import('../../core/schema-pack/mutate.ts');
+    if (BUNDLED_PACK_NAMES.has(name)) return null;
+    const { path } = locateMutablePackFile(name);
+    const bytes = statSync(path).size;
+    return bytes > bound ? { path, bytes, bound } : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * #5432: a check that could not read its input says "not verified" (warn),
@@ -154,13 +182,20 @@ export async function checkSchemaPackConsistency(
   };
 }
 
-export async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<Check> {
+export async function checkSchemaPackSourceDrift(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     // Compare per-source schema_pack overrides (tier 3 DB config) to detect
     // multi-source brains where different sources point at conflicting packs.
-    const rows = await engine.executeRaw<{ key: string; value: string }>(
-      `SELECT key, value FROM config WHERE key LIKE 'schema_pack.source.%'`,
-    );
+    // A remote caller's grant confines the comparison to its own sources'
+    // override keys, so it never counts another source's override.
+    const rows = opts.sourceIds
+      ? await engine.executeRaw<{ key: string; value: string }>(
+        `SELECT key, value FROM config WHERE key = ANY($1::text[])`,
+        [opts.sourceIds.map((id) => `schema_pack.source.${id}`)],
+      )
+      : await engine.executeRaw<{ key: string; value: string }>(
+        `SELECT key, value FROM config WHERE key LIKE 'schema_pack.source.%'`,
+      );
     if (rows.length === 0) {
       return { name: 'schema_pack_source_drift', status: 'ok', message: 'No per-source pack overrides — drift N/A.' };
     }
@@ -257,15 +292,24 @@ export function multiSourceDriftCheck(
       `. Fix the path or permissions (\`gbrain sources status\`), then re-run \`gbrain doctor\`.`
     : '';
   if (result.walk_truncated) {
+    // #7145: a walk stopped at its bound did not compare every file, so drift is unknown, not detected and not clear;
+    // slugs already found before the bound are a floor, kept so the bound does not hide them.
+    const bound = result.truncated_by === 'time' ? 'time' : 'files';
+    const which = bound === 'files'
+      ? `its file limit (${result.limit} files per source, GBRAIN_DRIFT_LIMIT)`
+      : `its time limit (${result.timeout_ms} ms, GBRAIN_DRIFT_TIMEOUT_MS)`;
+    const found = result.count > 0
+      ? ` At least ${result.count} misrouted slug(s) were already found before it stopped (e.g., ${result.sample.map((s) => `${s.slug} (intended=${s.intended_source})`).join(', ')}).`
+      : '';
     return {
       name: 'multi_source_drift',
       status: 'warn',
       message:
-        `Multi-source drift not verified — the FS walk hit its bound (${result.limit} files / ${result.timeout_ms} ms)` +
-        (host === 'remote' ? ' on the brain server' : '') +
-        `. Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor\`.` +
+        `Multi-source drift unknown: the FS walk stopped at ${which}` + (host === 'remote' ? ' on the brain server' : '') +
+        ` before comparing every file, so health is unknown, not clear (bounds: ${result.limit} files / ${result.timeout_ms} ms).${found}` +
+        ` Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor --only multi_source_drift\`.` +
         unreadableNote,
-      details: { ...details, code: 'not_verified', verified: false },
+      details: { ...details, ...boundUnknownDetails(bound), code: 'not_verified', verified: false, drift_found_so_far: result.count },
     };
   }
   if (result.count > 0) {

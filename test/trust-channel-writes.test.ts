@@ -255,6 +255,107 @@ describe('channel tiers on journaled writes', () => {
     }
   }), 90_000);
 
+  test('#6550: an agent edit of an unclassified legacy page stamps the writer tier, and the round trip after backfill files no lower_page', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    for (const engine of engines) {
+      const b = await brain(engine);
+      const slug = 'notes/legacy-example';
+      await run(b.local, 'put_page', { slug, content: page('Legacy', 'Written before trust tiers.') });
+      await b.engine.transaction(tx => withCoordinatedWrite(tx, [b.sourceId], () => tx.executeRaw(
+        `UPDATE pages SET trust_tier='unknown', frontmatter = frontmatter - 'trust_tier' - 'source_kind' - 'ingested_via' WHERE source_id=$1 AND slug=$2`,
+        [b.sourceId, slug]), TEST_WRITE_ATTRIBUTION));
+      const edit = async (body: string) => {
+        const got = await run(b.remote, 'get_page', { slug, include_content: true });
+        const content = String(got.content ?? got.markdown ?? '');
+        expect(content).toContain('title: Legacy');
+        return run(b.remote, 'put_page', { slug, content: content.replace(/\n[^\n]*\n?$/, `\n${body}\n`), force: true });
+      };
+      await edit('Edited by an agent.');
+      const first = await pageRow(b, slug);
+      expect(first.frontmatter.trust_tier).toBe('agent_written');
+      expect(first.trust_tier).toBe('unknown');
+      // The backfill classifies the row from its signals (the agent write request).
+      await b.engine.transaction(tx => withCoordinatedWrite(tx, [b.sourceId], () => withTrustBackfill(tx, () => tx.executeRaw(
+        `UPDATE pages SET trust_tier='agent_written' WHERE source_id=$1 AND slug=$2`, [b.sourceId, slug])), TEST_WRITE_ATTRIBUTION));
+      const second = await edit('Edited again after the backfill.');
+      expect(second.trust_lowered).toBeUndefined();
+      expect((await pageRow(b, slug)).trust_tier).toBe('agent_written');
+      expect(await listTrustProposals(engine, { sourceId: b.sourceId, action: 'lower_page' })).toHaveLength(0);
+      // An explicit unknown marker stays a lower-only cap.
+      await run(b.remote, 'put_page', { slug: 'notes/marked-unknown', content: page('Marked', 'Unverified on purpose.', 'trust_tier: unknown\n') });
+      const marked = await pageRow(b, 'notes/marked-unknown');
+      expect(marked.trust_tier).toBe('unknown');
+      expect(marked.frontmatter.trust_tier).toBe('unknown');
+    }
+  }), 90_000);
+
+  test('#6550 repair: a marker stamped before the fix files a spurious lower_page; the approved repair stops it and leaves unnamed and deliberate markers alone', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    for (const engine of engines) {
+      const b = await brain(engine);
+      const backfill = (slug: string) => b.engine.transaction(tx => withCoordinatedWrite(tx, [b.sourceId], () => withTrustBackfill(tx, () => tx.executeRaw(
+        `UPDATE pages SET trust_tier='agent_written' WHERE source_id=$1 AND slug=$2`, [b.sourceId, slug])), TEST_WRITE_ATTRIBUTION));
+      const edit = async (slug: string, body: string) => {
+        const got = await run(b.remote, 'get_page', { slug, include_content: true });
+        return run(b.remote, 'put_page', { slug, content: String(got.content ?? '').replace(/\n[^\n]*\n?$/, `\n${body}\n`), force: true });
+      };
+      const lowerItems = async (slug: string) => (await listTrustProposals(engine, { sourceId: b.sourceId, action: 'lower_page' }))
+        .filter(p => p.target_id === Number(rowIds.get(slug)));
+      const rowIds = new Map<string, number>();
+      // A legacy page the pre-fix release stamped: imported clean, then agent edits carried `trust_tier: unknown`.
+      const stamped = async (slug: string) => {
+        await run(b.local, 'put_page', { slug, content: page('Legacy', 'Written before trust tiers.') });
+        await b.engine.transaction(tx => withCoordinatedWrite(tx, [b.sourceId], () => tx.executeRaw(
+          `UPDATE pages SET trust_tier='unknown', frontmatter = frontmatter - 'trust_tier' - 'source_kind' - 'ingested_via' WHERE source_id=$1 AND slug=$2`,
+          [b.sourceId, slug]), TEST_WRITE_ATTRIBUTION));
+        await run(b.remote, 'put_page', { slug, content: page('Legacy', 'Stamped by an old agent edit.', 'trust_tier: unknown\n'), force: true });
+        await edit(slug, 'Edited again before the fix.');
+      };
+      for (const slug of ['notes/legacy-a', 'notes/legacy-c']) await stamped(slug);
+      // A deliberate marker: the page was imported with it.
+      await run(b.local, 'put_page', { slug: 'notes/marked-b', content: page('Marked', 'Unverified on purpose.', 'trust_tier: unknown\n') });
+      await edit('notes/marked-b', 'An agent added a line.');
+      for (const slug of ['notes/legacy-a', 'notes/legacy-c', 'notes/marked-b', 'notes/legacy-d']) {
+        if (slug === 'notes/legacy-d') await stamped(slug);
+        const row = await pageRow(b, slug);
+        rowIds.set(slug, Number(row.id));
+        expect(row.frontmatter.trust_tier).toBe('unknown');
+        await b.engine.executeRaw(`UPDATE page_versions SET snapshot_at = '2026-09-01T00:00:00Z' WHERE page_id = $1`, [row.id]);
+        await backfill(slug);
+      }
+      // Without a repair, the round trip after the backfill files a spurious lower_page.
+      await edit('notes/legacy-d', 'Edited after the backfill.');
+      expect((await pageRow(b, 'notes/legacy-d')).trust_tier).toBe('unknown');
+      expect(await lowerItems('notes/legacy-d')).toHaveLength(1);
+      const { applyMarkerRepair, previewMarkerRepair, renderMarkerRepairPreview } = await import('../src/core/trust/marker-repair.ts');
+      const review = await buildTrustReview(engine, { sourceId: b.sourceId });
+      expect(review.items.find(i => i.page === `p:${b.sourceId}/notes/legacy-d`)?.commands.repair).toEqual(['gbrain', 'trust', 'backfill', '--repair-unknown-markers']);
+      const preview = await previewMarkerRepair(engine, { sourceId: b.sourceId });
+      const bySlug = new Map(preview.candidates.map(c => [c.slug, c]));
+      expect([...bySlug.keys()]).toEqual(['notes/legacy-a', 'notes/legacy-c', 'notes/marked-b']);
+      expect(bySlug.get('notes/legacy-a')).toMatchObject({ marker: 'unknown', stored_tier: 'agent_written', proposed_marker: 'agent_written', proposed_tier: 'agent_written',
+        assessment: 'consistent_with_6550', evidence: { relative_to_fixed_release: 'before', in_original_import: false } });
+      expect(bySlug.get('notes/marked-b')).toMatchObject({ assessment: 'ambiguous', evidence: { in_original_import: true } });
+      expect(preview.lowered.map(l => l.page)).toEqual([`p:${b.sourceId}/notes/legacy-d`]);
+      expect(preview.apply_command).toEqual(['gbrain', 'trust', 'backfill', '--repair-unknown-markers', '--source', b.sourceId,
+        '--slug', 'notes/legacy-a', '--slug', 'notes/legacy-c', '--expect', preview.preview_hash]);
+      const text = renderMarkerRepairPreview(preview);
+      expect(text.trimEnd().split('\n').at(-1)).toBe(`Apply with: gbrain trust backfill --repair-unknown-markers --source ${b.sourceId} --slug notes/legacy-a --slug notes/legacy-c --expect ${preview.preview_hash}`);
+      await expect(applyMarkerRepair(engine, { slugs: ['notes/legacy-a'], expect: 'mr_0000000000000000', sourceId: b.sourceId })).rejects.toMatchObject({ code: 'preview_changed' });
+      // The operator names only legacy-a.
+      const applied = await applyMarkerRepair(engine, { slugs: ['notes/legacy-a'], expect: preview.preview_hash, sourceId: b.sourceId });
+      expect(applied.repaired).toEqual([{ page: `p:${b.sourceId}/notes/legacy-a`, marker_before: 'unknown', marker_after: 'agent_written', tier: 'agent_written' }]);
+      expect((await pageRow(b, 'notes/legacy-a')).frontmatter.trust_tier).toBe('agent_written');
+      await edit('notes/legacy-a', 'Edited after the repair.');
+      expect((await pageRow(b, 'notes/legacy-a')).trust_tier).toBe('agent_written');
+      expect(await lowerItems('notes/legacy-a')).toHaveLength(0);
+      for (const slug of ['notes/legacy-c', 'notes/marked-b']) {
+        const row = await pageRow(b, slug);
+        expect([row.frontmatter.trust_tier, row.trust_tier]).toEqual(['unknown', 'agent_written']);
+      }
+      // A stale hash refuses: the preview changed when legacy-a was repaired.
+      await expect(applyMarkerRepair(engine, { slugs: ['notes/legacy-c'], expect: preview.preview_hash, sourceId: b.sourceId })).rejects.toMatchObject({ code: 'preview_changed' });
+    }
+  }), 120_000);
+
   test('CEO-12: an agent rewrite of an owner page lowers it and files one lower_page proposal that later edits fold into', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       const b = await brain(engine);

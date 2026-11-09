@@ -82,8 +82,10 @@ export type ConfineTranscriptResult =
  * exception (#5465): an ENOENT leaf whose parent resolves inside the tree
  * validates ok with `absent: true`, because Claude Code writes transcripts
  * asynchronously and a not-yet-created file has nothing to read (the same
- * trust as no transcript_path at all). An absent parent, or any other lstat
- * failure, still fails closed.
+ * trust as no transcript_path at all). #6739 extends it to an absent project
+ * folder that is a direct child of an existing ancestor inside the tree, with
+ * no ".." segment. Any deeper absent path, or any other lstat failure, still
+ * fails closed.
  *
  * Cross-OS install (#4522, Claude Code on the Windows host + gbrain in WSL):
  * the hook stdin's transcript_path arrives as a Windows drive literal
@@ -145,10 +147,21 @@ export function confineTranscriptPath(
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, reason: 'unreadable' };
     const parent = dirname(candidate);
     // No directory component (a bare filename — e.g. an untranslated Windows
-    // drive literal on a non-WSL host) or an absent parent: containment is
-    // unprovable, so fail closed exactly as before.
-    if (parent === '.' || !existsSync(parent)) return { ok: false, reason: 'unreadable' };
-    if (!containedIn(parent)) return { ok: false, reason: 'outside_projects_dir' };
+    // drive literal on a non-WSL host): containment is unprovable.
+    if (parent === '.') return { ok: false, reason: 'unreadable' };
+    if (existsSync(parent)) {
+      if (!containedIn(parent)) return { ok: false, reason: 'outside_projects_dir' };
+      return { ok: true, path: candidate, size: 0, absent: true };
+    }
+    // #6739: Claude Code creates projects/<project>/ only after the first
+    // prompt in a new working folder, so the parent can be absent too. The
+    // path is judged lexically: no ".." segment, and the missing parent must
+    // be a direct child of an existing ancestor that resolves inside the
+    // tree. Anything deeper or less certain fails closed.
+    if (candidate.split(/[\\/]/).includes('..')) return { ok: false, reason: 'unreadable' };
+    const ancestor = dirname(parent);
+    if (ancestor === parent || !existsSync(ancestor)) return { ok: false, reason: 'unreadable' };
+    if (!containedIn(ancestor)) return { ok: false, reason: 'outside_projects_dir' };
     return { ok: true, path: candidate, size: 0, absent: true };
   }
   if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
@@ -209,10 +222,13 @@ export interface ParsedTranscript {
    * newest. Claude Code records a UserPromptSubmit hook's additionalContext
    * as a structured `{"type":"attachment","attachment":{"type":
    * "hook_additional_context","content":[...]}}` line (verified live against
-   * claude CLI 2.1.224). Selected structurally — never by substring matching
-   * over raw turn text, which would over-suppress short slugs appearing in
-   * tool payloads. The user-prompt hook feeds these back as priorContextText
-   * so a page is volunteered once per session, not once per mention.
+   * claude CLI 2.1.224), and a SessionStart hook's stdout as an attachment
+   * `{"type":"hook_success","hookEvent":"SessionStart","content":"<stdout>"}`,
+   * kept from gbrain's envelope on (#7026). Selected structurally — never by
+   * substring matching over raw turn text, which would over-suppress short
+   * slugs appearing in tool payloads. The user-prompt hook feeds these back
+   * as priorContextText so a page is volunteered once per session, not once
+   * per mention.
    */
   injectedContextBlocks: string[];
   /** Bytes actually read (== min(file size, maxBytes)). */
@@ -260,7 +276,11 @@ export interface ParsedTranscript {
   /**
    * Set by a lane that can prove the read held only records it recognizes and
    * no conversation: the Codex lane sets it when every non-blank line parsed
-   * and was a session header (a session opened and closed with no prompt).
+   * and was a session header (a session opened and closed with no prompt);
+   * the Claude Code lane sets it when it read the whole file, every line
+   * parsed, none carried a conversation message, and at least one was
+   * session scaffolding (permission-mode, a meta user record, a local slash
+   * command).
    * Session-end reads it as an empty session instead of parser drift.
    */
   recognizedOnly?: boolean;
@@ -316,6 +336,11 @@ export function parseTranscript(
   let parsedLines = 0;
   let skippedLines = 0;
   let compactBoundaries = 0;
+  // Records that carry a conversation message. A session holding none (only
+  // bookkeeping: permission-mode, cost-state, queue-operation, local slash
+  // commands, meta user records) is empty, not drifted.
+  let messageRecords = 0;
+  let scaffoldRecords = 0;
   for (const line of lines) {
     const t = line.trim();
     if (!t) continue;
@@ -329,6 +354,8 @@ export function parseTranscript(
       continue;
     }
     parsedLines++;
+    if (carriesConversationMessage(entry)) messageRecords++;
+    else if (isSessionScaffold(entry)) scaffoldRecords++;
     // v0.45.7: count compaction boundaries (system entries — disjoint from
     // attachments and turns) so post-compaction rehydration can detect them.
     // Cathedral 5: also record the boundary's position in turns-index space.
@@ -360,7 +387,36 @@ export function parseTranscript(
     const ok = c.id !== undefined ? toolResults.get(c.id) : undefined;
     return { name: c.name, input: capToolCallInput(c.input), ...(ok !== undefined ? { result: { ok } } : {}) };
   });
-  return { turns, genuineUserTurnIndexes, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes };
+  const recognizedOnly = size <= maxBytes && parsedLines > 0 && skippedLines === 0 && turns.length === 0 && messageRecords === 0 && scaffoldRecords > 0;
+  return { turns, genuineUserTurnIndexes, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes, ...(recognizedOnly ? { recognizedOnly } : {}) };
+}
+
+/**
+ * Records Claude Code writes for a session whether or not anyone spoke in it.
+ * At least one must be present before a no-message read counts as an empty
+ * session: a file of only unknown records stays parser_drift.
+ */
+const SESSION_SCAFFOLD_TYPES = new Set(['permission-mode', 'last-prompt', 'custom-title', 'agent-name', 'queue-operation']);
+function isSessionScaffold(entry: unknown): boolean {
+  if (typeof entry !== 'object' || entry === null) return false;
+  const e = entry as Record<string, unknown>;
+  if (typeof e.type === 'string' && SESSION_SCAFFOLD_TYPES.has(e.type)) return true;
+  if (e.type === 'user' && e.isMeta === true) return true;
+  return e.type === 'system' && e.subtype === 'local_command';
+}
+
+/**
+ * True when a record carries a conversation message the parser should have
+ * turned into a turn. Meta user records (`isMeta: true`, e.g. the harness's
+ * session-name reminder) are bookkeeping, not conversation. A record with a
+ * message that yields no turn is how a format change shows, so it keeps
+ * session-end on the parser_drift path.
+ */
+function carriesConversationMessage(entry: unknown): boolean {
+  if (typeof entry !== 'object' || entry === null) return false;
+  const e = entry as Record<string, unknown>;
+  if (typeof e.message !== 'object' || e.message === null) return false;
+  return !(e.type === 'user' && e.isMeta === true);
 }
 
 /** {type:'system', subtype:'compact_boundary'} — Claude Code's on-disk compaction marker (v0.45.7). */
@@ -391,7 +447,7 @@ const GBRAIN_BLOCK_MARKERS = [
 
 /**
  * One transcript line → a previously-injected GBRAIN context block, or null.
- * See ParsedTranscript.injectedContextBlocks for the recorded shape.
+ * See ParsedTranscript.injectedContextBlocks for the recorded shapes.
  */
 function entryToInjectedBlock(entry: unknown): string | null {
   if (typeof entry !== 'object' || entry === null) return null;
@@ -400,6 +456,15 @@ function entryToInjectedBlock(entry: unknown): string | null {
   const att = e.attachment;
   if (typeof att !== 'object' || att === null) return null;
   const a = att as Record<string, unknown>;
+  // #7026: `gbrain hook session-start` prints plain stdout, recorded as a
+  // SessionStart hook_success whose `content` is that stdout. Only the part
+  // from gbrain's envelope on is an injected block: the core memory and
+  // digest printed before it must not suppress pointers for the session.
+  if (a.type === 'hook_success') {
+    if (a.hookEvent !== 'SessionStart' || typeof a.content !== 'string') return null;
+    const at = a.content.indexOf(GBRAIN_BLOCK_MARKERS[0]);
+    return at < 0 ? null : a.content.slice(at).trim();
+  }
   if (a.type !== 'hook_additional_context' || !Array.isArray(a.content)) return null;
   const text = (a.content as unknown[]).filter((c): c is string => typeof c === 'string').join('\n').trim();
   if (!text) return null;

@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { persistenceConfigForBrain, readPersistenceCliRegistration, maybeDelegateLocalOperation, residentPersistenceConfig } from '../src/core/persistence/local-client.ts';
 import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
-import { PersistenceIpcTransportError } from '../src/core/persistence/ipc.ts';
+import { PersistenceIpcTransportError, persistenceSocketPathForConfig, startPersistenceIpcServer } from '../src/core/persistence/ipc.ts';
 import { resolveSourceId } from '../src/core/source-resolver.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { captureHookSessionCwd } from '../src/core/session-cwd.ts';
 
 const BRAIN = '10000000-0000-4000-8000-000000000001';
 const dirs: string[] = [];
@@ -36,12 +37,28 @@ describe('engine-free local persistence routing', () => {
     });
   });
 
+  test('#8426: a serve the hook launcher started binds the socket of the mount its session directory names', async () => {
+    const dir = temp(), project = join(dir, 'project'), mounts = join(dir, 'mounts.json');
+    mkdirSync(project);
+    writeFileSync(join(project, '.gbrain-mount'), 'example-brain\n'); chmodSync(join(project, '.gbrain-mount'), 0o644);
+    writeFileSync(mounts, JSON.stringify({ version: 1, mounts: [{ id: 'example-brain', engine: 'pglite', path: join(dir, 'clone'), database_path: '/mount/db' }] }), { mode: 0o600 });
+    const host = { engine: 'postgres' as const, database_url: 'postgresql://example.invalid/host' };
+    await withEnv({ GBRAIN_MOUNTS_PATH: mounts, GBRAIN_BRAIN_ID: undefined, GBRAIN_HOOK_CWD: project }, () => {
+      captureHookSessionCwd();
+      try {
+        expect(residentPersistenceConfig(host)).toEqual({ ...host, engine: 'pglite', database_path: '/mount/db', database_url: undefined });
+      } finally {
+        captureHookSessionCwd();
+      }
+    });
+  });
+
   test('missing registration never allocates a replacement principal', async () => {
     const dir = temp();
     await withEnv({ GBRAIN_HOME: dir }, () => {
       expect(() => readPersistenceCliRegistration(BRAIN)).toThrow('no readable durable writer registration');
       expect(() => readFileSync(join(dir, '.gbrain', 'persistence', `${BRAIN}.cli.json`))).toThrow();
-      expect(() => readPersistenceCliRegistration('../other')).toThrow('UUID');
+      expect(() => readPersistenceCliRegistration('../other')).toThrow('Missing durable brain identity');
     });
   });
 
@@ -81,9 +98,34 @@ describe('engine-free local persistence routing', () => {
         holder('call');
         expect(await maybeDelegateLocalOperation('forget', { id: '1' }, config, { brain: 'host', cwd: dir })).toEqual({ handled: false });
         holder('serve');
-        await expect(maybeDelegateLocalOperation('forget', { id: '1' }, config, { brain: 'host', cwd: dir })).rejects.toBeInstanceOf(PersistenceIpcTransportError);
+        await expect(maybeDelegateLocalOperation('forget', { id: '1' }, config, { brain: 'host', cwd: dir, startupWaitMs: 0 })).rejects.toBeInstanceOf(PersistenceIpcTransportError);
       });
     } finally { await releaseLock(lock); }
+  });
+
+  test('a serve that holds the datastore but has not bound its socket yet is an owner starting: the call waits for the socket instead of failing owner_unavailable (#6531)', async () => {
+    const dir = temp();
+    const config = { engine: 'pglite' as const, database_path: join(dir, 'db') };
+    const lock = await acquireLock(config.database_path, { timeoutMs: 1000 });
+    writeFileSync(lock.lockPath!, JSON.stringify({ ...JSON.parse(readFileSync(lock.lockPath!, 'utf8')), subcommand: 'serve' }));
+    const owner: { binding: Awaited<ReturnType<typeof startPersistenceIpcServer>> } = { binding: null };
+    try {
+      await withEnv({ GBRAIN_HOME: dir, GBRAIN_BRAIN_ID: 'host' }, async () => {
+        const socketPath = persistenceSocketPathForConfig(config)!;
+        const bind = new Promise<void>(resolve => setTimeout(async () => {
+          owner.binding = await startPersistenceIpcServer(socketPath, { brainId: BRAIN, dispatch: async () => ({ ok: true }) });
+          resolve();
+        }, 400));
+        // The socket appears 400 ms into the wait: the probe reaches the owner, so the next refusal is the missing CLI registration, not the transport.
+        const started = Date.now();
+        await expect(maybeDelegateLocalOperation('forget', { id: '1' }, config, { brain: 'host', cwd: dir })).rejects.toMatchObject({ code: 'permission_denied' });
+        expect(Date.now() - started).toBeGreaterThanOrEqual(350);
+        await bind;
+        // Without the wait the same call fails on the transport at once.
+        owner.binding!.close(); owner.binding = null;
+        await expect(maybeDelegateLocalOperation('forget', { id: '1' }, config, { brain: 'host', cwd: dir, startupWaitMs: 0 })).rejects.toBeInstanceOf(PersistenceIpcTransportError);
+      });
+    } finally { owner.binding?.close(); await releaseLock(lock); }
   });
 
   test('owner source environment and dotfiles cannot redirect a client with no local signal', async () => {

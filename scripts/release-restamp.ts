@@ -35,9 +35,9 @@
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
-  COLLISION_DOCS, MIGRATION_FILE_RE, MIGRATIONS_DIR, RESTAMP_DOCS, RestampError, STAMPS,
+  BEHAVIOR_NOTICE_FILE, COLLISION_DOCS, MIGRATION_FILE_RE, MIGRATIONS_DIR, RESTAMP_DOCS, RestampError, STAMPS,
   branchEntrySections, fail, findLeftoverRefs, isGenerated, migrationPayloadKey, nextPatchVersion, parseAddedLines,
-  planRenumber, rebuildChangelog, renumberMigrationText, resolveVersionOnlyHunks, restampTodoLines, versionOfHeader,
+  isVersionToken, planRenumber, rebuildChangelog, renumberMigrationText, resolveVersionOnlyHunks, restampSinceLines, restampTodoLines, stampTbdSince, versionOfHeader,
   type BranchMigration, type ChangelogSection, type LeftoverRef, type Renumber,
 } from './lib/restamp.ts';
 import { offlineEnv } from './regen-all.ts';
@@ -72,6 +72,8 @@ export const DEFAULT_CHECKS: Step[] = [
   { name: 'bootstrap template drift', argv: ['bash', 'scripts/check-bootstrap-templates.sh'] },
   { name: 'schema migration registry fresh', argv: ['bash', 'scripts/check-schema-migrations-fresh.sh'] },
   { name: 'schema migration order', argv: ['bun', 'scripts/check-schema-migration-order.ts'] },
+  { name: "no since: 'TBD' BEHAVIOR_CHANGES row", argv: ['bun', 'scripts/check-behavior-since.ts', '--stamped'] },
+  { name: 'CHANGELOG keeps every master release heading', argv: ['bun', 'scripts/check-changelog-headings.ts'] },
 ];
 
 interface State {
@@ -344,7 +346,14 @@ function restampTree(ctx: Ctx, state: State, opts: { acceptRefs: boolean; date: 
     const text = ctx.read(stamp.file);
     if (stamp.read(text) !== version) ctx.write(stamp.file, stamp.write(text, version));
   }
-  const olds = new Set([state.branchVersion, state.entry ? versionOfHeader(state.entry.header) ?? '' : ''].filter((v) => v && v !== version));
+  const olds = new Set([state.branchVersion, state.entry ? versionOfHeader(state.entry.header) ?? '' : ''].filter((v) => v && v !== version && isVersionToken(v)));
+  if (existsSync(join(ctx.root, BEHAVIOR_NOTICE_FILE))) {
+    const notice = ctx.read(BEHAVIOR_NOTICE_FILE);
+    const lines = new Set(addedLines(ctx, state.masterRef, ['--', BEHAVIOR_NOTICE_FILE]).map((l) => l.line));
+    let stamped = stampTbdSince(notice, version);
+    for (const old of olds) stamped = restampSinceLines(stamped, lines, old, version);
+    if (stamped !== notice) ctx.write(BEHAVIOR_NOTICE_FILE, stamped);
+  }
   if (state.entry) {
     const old = versionOfHeader(state.entry.header) ?? state.branchVersion;
     ctx.write('CHANGELOG.md', rebuildChangelog(ctx.read('CHANGELOG.md'), state.entry, old, version, opts.date));
@@ -440,6 +449,7 @@ function printDryRun(ctx: Ctx, state: State, date: string): void {
     const cur = stamp.read(ctx.git('show', `HEAD:${stamp.file}`));
     L(`  ${stamp.file}: ${cur} -> ${version}${cur === version ? ' (unchanged)' : ''}`);
   }
+  if (state.entry) rebuildChangelog(ctx.git('show', 'HEAD:CHANGELOG.md'), state.entry, versionOfHeader(state.entry.header) ?? state.branchVersion, version, date);
   L(state.entry
     ? `  CHANGELOG.md: "${state.entry.header}" -> "## [${version}] - ${date}", kept above master's entries`
     : '  CHANGELOG.md: this branch has no entry yet; the drift check will stop until /ship writes one');

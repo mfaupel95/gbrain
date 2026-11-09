@@ -7,7 +7,8 @@
 import type { BrainEngine } from './engine.ts';
 import { syncFailureJsonFields, type ManagedSyncFailure } from './persistence/sync-failures.ts';
 import { syncHoldJsonFields } from './persistence/sync-holds.ts';
-import { submitEmbedBackfill } from './embed-backfill-submit.ts';
+import { keylessEmbedBackfill, submitEmbedBackfill } from './embed-backfill-submit.ts';
+import { cliRenderContext, renderNotice, type Notice, type RenderedNotice } from './agent-output.ts';
 import { resolveWorkerBackedSyncEmbedMode } from './embedding.ts';
 import {
   embedBackfillManualDrainCommand,
@@ -15,6 +16,7 @@ import {
   type EmbedBackfillWorkerSurface,
 } from './minions/embed-backfill-admission.ts';
 import { runInlineCostGate } from './sync-cost-gate.ts';
+import { renderUpstreamDivergence, type UpstreamDivergenceReport } from './sync-upstream-rewrite.ts';
 
 type SyncCostGateSource = {
   id: string;
@@ -31,6 +33,8 @@ type SyncCostGateFlags = {
   full: boolean;
   includeGitignored: boolean;
   noAutoEmbed: boolean;
+  /** GBRA-133 2b.3: the run will not pull, so the inline estimate skips its remote fetch. */
+  noPull?: boolean;
 };
 
 export async function resolveSyncAllEmbedPlan(
@@ -71,6 +75,7 @@ export async function resolveSyncAllEmbedPlan(
       yesFlag: opts.yesFlag,
       full: opts.full,
       includeGitignored: opts.includeGitignored,
+      noPull: opts.noPull,
       label: 'sync --all',
       workerSurface,
       autoSubmitEnabled: !opts.noAutoEmbed,
@@ -102,6 +107,7 @@ export async function resolveSingleSyncEmbedPlan(
     yesFlag: opts.yesFlag,
     full: opts.full,
     includeGitignored: opts.includeGitignored,
+    noPull: opts.noPull,
     label: 'sync',
     workerSurface,
     autoSubmitEnabled: !opts.noAutoEmbed,
@@ -135,7 +141,10 @@ export type SyncEmbedBackfillOutcome =
       reason: 'no_worker_surface' | 'auto_submit_disabled';
     }
   | { status: 'skipped'; reason: 'cooldown'; command: string }
-  | { status: 'skipped'; reason: 'spend_capped'; command: string; spend_cap_usd: number };
+  | { status: 'skipped'; reason: 'spend_capped'; command: string; spend_cap_usd: number }
+  | { status: 'skipped'; reason: 'stalled'; command: string; failures: number }
+  /** The brain is keyless by choice; `notice` (embed_backfill_skipped) only on the first skip for this brain state. */
+  | { status: 'skipped'; reason: 'embedding_disabled'; notice?: RenderedNotice };
 
 export async function resolveSyncEmbedBackfill(
   engine: BrainEngine,
@@ -145,6 +154,8 @@ export async function resolveSyncEmbedBackfill(
     autoSubmitDisabled: boolean;
   },
 ): Promise<SyncEmbedBackfillOutcome> {
+  const keyless = await keylessEmbedBackfill(engine);
+  if (keyless) return keylessOutcome(keyless.notice);
   const command = embedBackfillManualDrainCommand(sourceId);
   if (embedBackfillWorkerSurface(engine).status === 'no_worker_surface') {
     return { status: 'manual_drain_required', command, reason: 'no_worker_surface' };
@@ -168,10 +179,18 @@ export async function resolveSyncEmbedBackfill(
       };
     case 'no_worker_surface':
       return { status: 'manual_drain_required', command, reason: 'no_worker_surface' };
+    case 'stalled':
+      return { status: 'skipped', reason: 'stalled', command, failures: submitted.failures };
+    case 'embedding_disabled':
+      return keylessOutcome(submitted.notice);
     default:
       submitted satisfies never;
       throw new Error('unreachable embed-backfill submission result');
   }
+}
+
+function keylessOutcome(notice: Notice | null): SyncEmbedBackfillOutcome {
+  return { status: 'skipped', reason: 'embedding_disabled', ...(notice ? { notice: renderNotice(notice, cliRenderContext()) } : {}) };
 }
 
 export function formatSyncEmbedBackfillOutcome(
@@ -185,6 +204,16 @@ export function formatSyncEmbedBackfillOutcome(
     case 'manual_drain_required':
       return `embed-backfill not queued; manual drain required: \`${outcome.command}\`${source}`;
     case 'skipped': {
+      if (outcome.reason === 'embedding_disabled') {
+        const enable = outcome.notice?.fix?.command;
+        return outcome.notice
+          ? `embed-backfill skipped${source}: embedding is disabled on this brain (keyless by choice; keyword search works)${enable ? `. To turn on semantic search: \`${enable}\`` : ''}`
+          : `embed-backfill skipped (embedding disabled)${source}`;
+      }
+      if (outcome.reason === 'stalled') {
+        return `embed-backfill skipped${source}: the last ${outcome.failures} runs failed on the same blocked pages with nothing embedded; `
+          + `see \`gbrain doctor --only embed_backfill_stalled\` (manual drain: \`${outcome.command}\`)`;
+      }
       const detail = outcome.reason === 'cooldown'
         ? 'cooldown'
         : `24h spend cap $${outcome.spend_cap_usd}`;
@@ -213,6 +242,7 @@ export function buildSingleSyncJsonEnvelope(
     fromCommit?: string | null;
     toCommit?: string;
     bankedFiles?: number;
+    upstream?: UpstreamDivergenceReport;
   },
   embedBackfill?: SyncEmbedBackfillOutcome,
   costGate?: Record<string, unknown>,
@@ -224,6 +254,7 @@ export function buildSingleSyncJsonEnvelope(
     ...syncFailureJsonFields(result),
     ...syncHoldJsonFields(result),
     ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.upstream ? { upstream: renderUpstreamDivergence(result.upstream) } : {}),
     added: result.added,
     modified: result.modified,
     deleted: result.deleted,

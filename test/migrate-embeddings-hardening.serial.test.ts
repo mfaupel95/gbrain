@@ -387,7 +387,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'voyage:voyage-4', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.exposed!.model).toBe(OUTGOING_RERANKER);
-      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-2.5' });
+      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-3-lite' });
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -404,7 +404,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'openai:text-embedding-3-small', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.action.kind).toBe('none');
-      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-2.5');
+      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-3-lite');
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -1094,6 +1094,25 @@ describe('empty-brain migration (plan pin 15)', () => {
     } finally {
       await e2.disconnect();
       writeFileConfig('openai:text-embedding-3-small', TO_DIMS);
+    }
+  }, 120000);
+});
+
+describe('concurrent-writer census', () => {
+  test('an unreadable worker registry does not also drop the embed-job count', async () => {
+    const registry = join(tmpHome, '.gbrain', 'workers');
+    rmSync(registry, { recursive: true, force: true });
+    writeFileSync(registry, 'not a directory');
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'embed-backfill', 'default', 'waiting', now(), now())`,
+    );
+    try {
+      const ctx = await planMigrationFlow(engine, { to: 'openai:text-embedding-3-small', dim: TO_DIMS });
+      expect(ctx.concurrentWriters).toEqual({ workers: null, embedJobs: 1 });
+    } finally {
+      await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed-backfill'`);
+      rmSync(registry, { force: true });
     }
   }, 120000);
 });

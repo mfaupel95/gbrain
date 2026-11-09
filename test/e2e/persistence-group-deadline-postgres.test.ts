@@ -223,11 +223,53 @@ describe.skipIf(!hasDatabase())('grouped preparation deadlines (Postgres, #6278)
     } finally { release.resolve(); await consumer.stop(); await closeLaneRun(run, 1_000); }
   }), 90_000);
 
+  // F4: the laneFallback case above flaked when another lane slot claimed the group again while the expired member's
+  // abandoned preparation still ran, prepared it a second time and laneFallback released it `group_member_waiting`.
+  test('under lanes, an abandoned member bars its root: no lane claims it again while it runs, and it commits once it settles', () => withBrain(async ({ engine, config, sources }) => {
+    const run = randomUUID();
+    const worktreeId = sources[0]!.binding.worktree_id;
+    const predecessor = await admitWrite(engine, admission(config, sources[1]!, 'lanes/predecessor', 'predecessor body'));
+    await engine.executeRaw(`UPDATE persistence_requests SET worktree_id=NULL,source_id=$2,source_incarnation=$3::uuid WHERE id=$1::uuid`, [predecessor.id, 'group-deadline-other', sources[1]!.incarnation]);
+    const rows = await admitGroup(engine, config, sources[0]!, 'lanes-barred', 3, 'ordered', { lane: run, after: predecessor.request_id });
+    openLanes(worktreeId, run, 2, null);
+    const release = Promise.withResolvers<void>();
+    const attempts = new Map<string, number>();
+    const consumer = new PersistenceConsumer(engine, { engine: 'postgres' }, hangingPreparer(sources, new Set([rows[2]!.id]), release.promise, attempts),
+      { hostId: config.hostId, concurrency: 1, pollMs: 50, renewalIntervalMs: 20, phaseMs: 2_000, preparationMs: 80,
+        preparationBudgets: { maxAttempts: 5, ceilingMs: 60_000 }, onError: () => {} });
+    const internals = consumer as unknown as { rootRetryAfter: Map<string, number>; active: Set<Promise<void>>; tick: (afterProgress?: boolean) => Promise<void> };
+    let ticks = 0;
+    const tick = internals.tick.bind(consumer);
+    internals.tick = afterProgress => tick(afterProgress).finally(() => { ticks++; });
+    const predecessorRoot = `db:${sources[1]!.incarnation}`;
+    try {
+      internals.rootRetryAfter.set(predecessorRoot, Date.now() + 60_000);
+      consumer.start();
+      await waitFor(async () => (await getWriteRequestById(engine, rows[2]!.id))?.blocked_reason === 'preparation_deadline', { timeoutMs: 15_000 });
+      await waitFor(async () => (await stateOf(engine, rows.slice(0, 2))).every(s => s.state === 'queued'), { timeoutMs: 15_000, label: 'laneFallback releases the live prefix' });
+      // Hold the read until three more claim cycles ran and nothing they claimed is still running.
+      const from = ticks;
+      await waitFor(() => ticks >= from + 3 && internals.active.size === 0, { timeoutMs: 15_000, label: 'three more claim cycles' });
+      expect(attempts.get(rows[2]!.id)).toBe(1);
+      expect(await stateOf(engine, rows)).toEqual([
+        { state: 'queued', reason: 'group_member_waiting', attempts: 0, error: null },
+        { state: 'queued', reason: 'group_member_waiting', attempts: 0, error: null },
+        { state: 'queued', reason: 'preparation_deadline', attempts: 1, error: null },
+      ]);
+      // Once it settles and the predecessor runs, the group is claimed again and commits on a fresh preparation.
+      release.resolve();
+      internals.rootRetryAfter.delete(predecessorRoot);
+      for (const row of rows) await waitFor(async () => (await getWriteRequestById(engine, row.id))?.state === 'committed', { timeoutMs: 20_000, label: `${row.slug} commits after the retry` });
+      expect(attempts.get(rows[2]!.id)).toBe(2);
+    } finally { release.resolve(); await consumer.stop(); await closeLaneRun(run, 1_000); }
+  }), 90_000);
+
   test('the expired-claim sweep charges only the members whose dispatch was marked (the kill case)', () => withBrain(async ({ engine, config, sources }) => {
     const rows = await admitGroup(engine, config, sources[0]!, 'kill', 6, 'ordered');
     const release = Promise.withResolvers<void>();
     const attempts = new Map<string, number>();
-    // Every dispatched member hangs: wave one (members 0-3) is marked preparing, members 4 and 5 are claimed but never dispatched.
+    // Every dispatched member hangs: wave one (members 0-3) is marked preparing, members 4 and 5 are claimed but never dispatched
+    // (#6650: they carry their own token and owner with no phase, so the sweep does not charge them).
     const owner = new PersistenceConsumer(engine, { engine: 'postgres' }, hangingPreparer(sources, new Set(rows.map(row => row.id)), release.promise, attempts),
       { hostId: config.hostId, concurrency: 1, pollMs: 60_000, renewalIntervalMs: 60_000, phaseMs: 2_000, preparationMs: 60_000,
         preparationBudgets: { maxAttempts: 5, ceilingMs: 120_000 }, onError: () => {} });
@@ -238,7 +280,7 @@ describe.skipIf(!hasDatabase())('grouped preparation deadlines (Postgres, #6278)
       await waitFor(() => [0, 1, 2, 3].every(i => attempts.get(rows[i]!.id) === 1), { timeoutMs: 15_000, label: 'the first wave is dispatched' });
       const stamps = await engine.executeRaw<{ slug: string; phase: string | null; own: boolean }>(`SELECT slug,claim_phase->>'phase' AS phase,
         claim_phase->>'token'=execution_token::text AS own FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY sequence`, [rows.map(row => row.id)]);
-      expect(stamps.map(s => [s.phase, s.own])).toEqual([['preparing', true], ['preparing', true], ['preparing', true], ['preparing', true], [null, null], [null, null]]);
+      expect(stamps.map(s => [s.phase, s.own])).toEqual([['preparing', true], ['preparing', true], ['preparing', true], ['preparing', true], [null, true], [null, true]]);
       // The owner dies (its renewals never run again); the leases lapse and another consumer's sweep reclaims them.
       await engine.executeRaw(`UPDATE persistence_requests SET claim_expires_at=now()-interval '1 second' WHERE id=ANY($1::uuid[])`, [rows.map(row => row.id)]);
       (sweeper as unknown as { rootRetryAfter: Map<string, number> }).rootRetryAfter.set(rows[0]!.worktree_id!, Date.now() + 60_000);

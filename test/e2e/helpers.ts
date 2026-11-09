@@ -10,6 +10,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, resolve, relative, dirname, basename, extname } from 'path';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { ORIGIN_INDEX } from '../../src/core/persistence/origin-index.ts';
 import * as db from '../../src/core/db.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import { parseMarkdown } from '../../src/core/markdown.ts';
@@ -42,6 +43,18 @@ const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
 let engine: PostgresEngine | null = null;
 
 const ALL_TABLES = [
+  // Per-member read access (members, groups, folder rules): a member left behind makes every later file's brain restricted.
+  'access_group_members',
+  'access_groups',
+  'access_members',
+  'access_pending_coverage',
+  'access_rules',
+  'access_policy_revisions',
+  'access_policy_migrations',
+  'access_policy_state',
+  // C4 pinned questions: no FKs (pointers only); cleared so pins never leak across files.
+  'question_evidence',
+  'pinned_questions',
   'fact_withdrawals',
   // v0.31: facts must come BEFORE pages too (FK to sources, but tests
   // seed via direct SQL so the row stays referenced until truncated).
@@ -170,6 +183,9 @@ export async function setupDB(options: { replayMigrations?: boolean } = {}): Pro
   // MIGRATIONS array and only run when engine.initSchema() executes them.
   // Idempotent: re-running migrations on an already-migrated DB is a no-op.
   await engine.initSchema();
+  // #6948: a test that seeds legacy origin twins drops pages_live_origin_key, which the migrations do not rebuild on
+  // an already-migrated database; the emptied tables hold no twin, so every file starts with the index a fresh brain has.
+  await engine.executeRaw(ORIGIN_INDEX.sql);
   return engine;
 }
 

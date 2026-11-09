@@ -14,6 +14,7 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
 import { CONVERSATION_EXTRACTOR_VERSION, NON_EXTRACTABLE_AUDIT_SOURCE, outcomeExtractorVersion, TERMINAL_AUDIT_SOURCE } from '../../../core/facts/audit-sources.ts';
 
 export const OUTCOME_SCAN_CAP = 5000;
@@ -34,6 +35,12 @@ export async function conversationOutcomesStaleCheck(engine: BrainEngine, source
     const details = { extractor_version: CONVERSATION_EXTRACTOR_VERSION, scanned: scanned.length, capped,
       stale: stale.length, unstamped, sample, docs: 'docs/guides/repair.md#conversation-labels' };
     const atLeast = capped ? 'at least ' : '';
+    // #7145: stale outcomes are the old rows, which this newest-first cap reaches last: none found under it is unknown, not clear.
+    if (!stale.length && capped) {
+      return { name, status: 'warn', details: { ...details, ...boundUnknownDetails('rows'), limit: OUTCOME_SCAN_CAP },
+        message: `Stale conversation extraction outcomes unknown: only the newest ${OUTCOME_SCAN_CAP} outcome rows were read (OUTCOME_SCAN_CAP, no setting), `
+          + `and outcomes older than those, where a stale extractor version would be, were not. None of the rows read predates extractor version ${CONVERSATION_EXTRACTOR_VERSION}.` };
+    }
     if (!stale.length) {
       return { name, status: 'ok', details,
         message: `No conversation extraction outcome predates extractor version ${CONVERSATION_EXTRACTOR_VERSION}`

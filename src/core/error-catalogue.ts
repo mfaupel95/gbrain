@@ -32,7 +32,31 @@ export interface CatalogueEntry {
 }
 
 export const ERROR_CATALOGUE = {
+  // GBRA-218 per-member read access: member ids, credential bindings and local --as.
+  access_member_invalid: { code: 'access_member_invalid', docs: 'docs/guides/write-refusals.md#access_member_invalid' },
+  access_member_id_retired: { code: 'access_member_id_retired', docs: 'docs/guides/write-refusals.md#access_member_id_retired' },
+  access_member_disabled: { code: 'access_member_disabled', docs: 'docs/guides/write-refusals.md#access_member_disabled' },
+  // GBRA-231 shared agents: the audience a harness asserts (X-Gbrain-On-Behalf-Of, _meta.on_behalf_of).
+  on_behalf_of_invalid_audience: { code: 'on_behalf_of_invalid_audience', docs: 'docs/guides/write-refusals.md#on_behalf_of_invalid_audience' },
+  on_behalf_of_unknown_member: { code: 'on_behalf_of_unknown_member', docs: 'docs/guides/write-refusals.md#on_behalf_of_unknown_member' },
+  on_behalf_of_not_permitted: { code: 'on_behalf_of_not_permitted', docs: 'docs/guides/write-refusals.md#on_behalf_of_not_permitted' },
+  on_behalf_of_in_arguments: { code: 'on_behalf_of_in_arguments', docs: 'docs/guides/write-refusals.md#on_behalf_of_in_arguments' },
+  // GST-359 C1 attested actor: the person a trusted system names (x-qm-actor) on a credential holding the attest right.
+  actor_not_attested: { code: 'actor_not_attested', docs: 'docs/guides/write-refusals.md#actor_not_attested' },
+  actor_unlinked: { code: 'actor_unlinked', docs: 'docs/guides/write-refusals.md#actor_unlinked' },
+  // GBRA-218 (A2) folder rules: invalid rules and policy files, pending narrowing.
+  access_rule_invalid: { code: 'access_rule_invalid', docs: 'docs/guides/write-refusals.md#access_rule_invalid' },
+  access_policy_invalid: { code: 'access_policy_invalid', docs: 'docs/guides/write-refusals.md#access_policy_invalid' },
+  access_policy_pending: { code: 'access_policy_pending', docs: 'docs/guides/write-refusals.md#access_policy_pending' },
+  // W2 page-at-time: recorded-time reads (`known_as_of`).
+  coverage_from: { code: 'coverage_from', docs: 'docs/guides/repair.md#coverage-from' },
+  coverage_gap: { code: 'coverage_gap', docs: 'docs/guides/repair.md#coverage-gap' },
+  clock_mismatch: { code: 'clock_mismatch', docs: 'docs/guides/repair.md#clock-mismatch' },
+  known_as_of_unproven: { code: 'known_as_of_unproven', docs: 'docs/guides/repair.md#known-as-of-unproven' },
   legacy_jobs_active: { code: 'legacy_jobs_active', docs: 'docs/guides/repair.md#legacy-jobs-active' },
+  // D4 / D2 notice codes (agent-output Notice through the notice ledger).
+  grant_blocked_operations: { code: 'grant_blocked_operations', docs: 'docs/guides/repair.md#grant-blocked-operations' },
+  hidden_tool_content: { code: 'hidden_tool_content', docs: 'docs/guides/repair.md#hidden-tool-content' },
   legacy_job_selection_invalid: { code: 'legacy_job_selection_invalid', docs: 'docs/guides/repair.md#legacy-job-selection-invalid' },
   legacy_job_authority: { code: 'permission_denied', docs: 'docs/guides/repair.md#legacy-job-authority' },
   preview_changed: { code: 'preview_changed', docs: 'docs/guides/repair.md#preview-changed' },
@@ -42,17 +66,35 @@ export const ERROR_CATALOGUE = {
   page_projection_conflict: { code: 'page_projection_conflict', docs: 'docs/guides/repair.md#page-projection-conflict' },
   explicit_kind_required: { code: 'explicit_kind_required', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
   repair_kind_unavailable: { code: 'unavailable', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
+  // #6650: gbrain repair stuck-recovery resolves page recovery records only; a shared-skill bundle record is refused.
+  recovery_bundle_unsupported: { code: 'recovery_bundle_unsupported', docs: 'docs/guides/repair.md#recovery-bundle-unsupported' },
+  // #6650: a (request state, --keep) pair stuck-recovery cannot make safe: a terminal request, or a choice the record cannot support.
+  recovery_choice_refused: { code: 'recovery_choice_refused', docs: 'docs/guides/repair.md#recovery-choice-refused' },
+  // #6650: a withdrawal-mirror effect recovery only finishes forward, so stuck-recovery lists it as refused.
+  recovery_effect_unsupported: { code: 'recovery_effect_unsupported', docs: 'docs/guides/repair.md#recovery-effect-unsupported' },
+  // LPH (d): a recovery record a newer gbrain wrote is refused unread; a segmented mirror waits for older writers.
+  recovery_version_unsupported: { code: 'recovery_version_unsupported', docs: 'docs/guides/write-refusals.md#recovery_version_unsupported' },
+  segmented_mirror_writer_gate: { code: 'segmented_mirror_writer_gate', docs: 'docs/guides/write-refusals.md#segmented_mirror_writer_gate' },
   colon_slug_windows_write_through: { code: 'colon_slug_windows_write_through', docs: 'docs/guides/write-refusals.md#colon_slug_windows_write_through' },
   embedding_auth_failed: { code: 'embedding_auth_failed', docs: 'docs/guides/write-refusals.md#embedding_auth_failed' },
   activation_source_path_missing: { code: 'source_changed', docs: 'docs/guides/write-refusals.md#activation_source_path_missing' },
   facts_absorb_write_refused: { code: 'facts_absorb_write_refused', docs: 'docs/guides/write-refusals.md#facts_absorb_write_refused' },
   source_checkout_missing: { code: 'recovery_required', docs: 'docs/guides/write-refusals.md#source_checkout_missing' },
   managed_pull_skipped: { code: 'managed_pull_skipped', docs: 'docs/guides/write-refusals.md#managed_pull_skipped' },
+  // #6696 C2: --skip-failed / --include-gitignored on a managed source, refused at parse and before delegation.
+  managed_sync_flag_refused: { code: 'managed_sync_flag_refused', docs: 'docs/guides/write-refusals.md#managed_sync_flag_refused' },
   no_pricing: { code: 'no_pricing', docs: 'docs/guides/write-refusals.md#no_pricing' },
   timeline_comment_markup: { code: 'timeline_comment_markup', docs: 'docs/guides/repair.md#timeline-comments' },
   timeline_rows_would_be_removed: { code: 'timeline_rows_would_be_removed', docs: 'docs/guides/write-refusals.md#timeline_rows_would_be_removed' },
+  // GBRA-218: a remote write's frontmatter readable_by is malformed, drops the field, or locks the writer out.
+  readable_by_invalid: { code: 'readable_by_invalid', docs: 'docs/guides/write-refusals.md#readable_by_invalid' },
   reconcile_private_facts: { code: 'permission_denied', docs: 'docs/guides/write-refusals.md#reconcile-private-facts' },
   maintenance_backpressure: { code: 'maintenance_backpressure', docs: 'docs/guides/write-refusals.md#maintenance_backpressure' },
+  // #6696: cumulative write caps (A5 background pause, A6 refusal at the cap, A7 bulk-run preflight).
+  write_capacity_backpressure: { code: 'write_capacity_backpressure', docs: 'docs/guides/write-refusals.md#write_capacity_backpressure' },
+  write_quota_exhausted: { code: 'write_quota_exhausted', docs: 'docs/guides/write-refusals.md#write_quota_exhausted' },
+  write_quota_insufficient: { code: 'write_quota_insufficient', docs: 'docs/guides/write-refusals.md#write_quota_insufficient' },
+  write_capacity_low: { code: 'write_capacity_low', docs: 'docs/guides/write-refusals.md#write_capacity_low' },
   // F0 `gbrain sources refresh` (worktree-wide coordinated ff-only refresh).
   refresh_not_managed: { code: 'refresh_not_managed', docs: 'docs/guides/write-refusals.md#refresh_not_managed' },
   refresh_not_owner: { code: 'refresh_not_owner', docs: 'docs/guides/write-refusals.md#refresh_not_owner' },
@@ -63,6 +105,8 @@ export const ERROR_CATALOGUE = {
   sync_in_progress: { code: 'sync_in_progress', docs: 'docs/guides/write-refusals.md#sync_in_progress' },
   refresh_in_progress: { code: 'refresh_in_progress', docs: 'docs/guides/write-refusals.md#refresh_in_progress' },
   refresh_drain_timeout: { code: 'refresh_drain_timeout', docs: 'docs/guides/write-refusals.md#refresh_drain_timeout' },
+  refresh_lock_timeout: { code: 'refresh_lock_timeout', docs: 'docs/guides/write-refusals.md#refresh_lock_timeout' },
+  refresh_sync_timeout: { code: 'refresh_sync_timeout', docs: 'docs/guides/write-refusals.md#refresh_sync_timeout' },
   refresh_source_changed: { code: 'refresh_source_changed', docs: 'docs/guides/write-refusals.md#refresh_source_changed' },
   refresh_recovery_required: { code: 'refresh_recovery_required', docs: 'docs/guides/write-refusals.md#refresh_recovery_required' },
   worktree_refreshing: { code: 'worktree_refreshing', docs: 'docs/guides/write-refusals.md#worktree_refreshing' },
@@ -76,10 +120,21 @@ export const ERROR_CATALOGUE = {
   sync_drain_preparation_systemic: { code: 'preparation_systemic', docs: 'docs/guides/write-refusals.md#preparation_systemic' },
   sync_drain_write_capacity: { code: 'queue_capacity', docs: 'docs/guides/write-refusals.md#drain-write-capacity' },
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
+  sync_drain_capacity_paused: { code: 'capacity_paused', docs: 'docs/guides/write-refusals.md#drain-capacity-paused' },
+  sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
+  sync_drain_lease_held: { code: 'sync_drain_lease_held', docs: 'docs/guides/write-refusals.md#sync_drain_lease_held' },
+  // #6712 PR 4b: the live pass's stops (design v3.2 §9).
+  sync_drain_not_converged: { code: 'not_converged', docs: 'docs/guides/write-refusals.md#drain-not-converged' },
+  sync_drain_admission_paused: { code: 'admission_paused', docs: 'docs/guides/write-refusals.md#drain-admission-paused' },
+  sync_drain_grant_scope: { code: 'grant_scope', docs: 'docs/guides/write-refusals.md#drain-grant-scope' },
+  sync_drain_reconcile_host_required: { code: 'reconcile_host_required', docs: 'docs/guides/write-refusals.md#drain-reconcile-host-required' },
+  sync_drain_reconcile_read_incomplete: { code: 'reconcile_read_incomplete', docs: 'docs/guides/write-refusals.md#drain-reconcile-read-incomplete' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },
   setup_owner_conflict: { code: 'setup_owner_conflict', docs: 'docs/guides/repair.md#setup-owner-conflict' },
   setup_hosted_connection: { code: 'setup_hosted_connection', docs: 'docs/guides/repair.md#setup-hosted-connection' },
+  turn_hook_not_loaded: { code: 'turn_hook_not_loaded', docs: 'docs/guides/repair.md#turn-hook-not-loaded' },
+  hook_session_cwd: { code: 'hook_session_cwd', docs: 'docs/guides/repair.md#hook-session-cwd' },
 } as const satisfies Record<string, CatalogueEntry>;
 
 export type CatalogueName = keyof typeof ERROR_CATALOGUE;
@@ -144,19 +199,27 @@ export function canonicalCodeFor(wire: string): string {
   return CANONICAL_BY_LEGACY.get(wire) ?? wire;
 }
 
-/** An unregistered code is a server fault by construction (the AST test keeps that set empty). */
-export function codeClass(code: string): ErrorClass {
-  return isRegistryCode(code) ? (CODES[code] as CodeEntry).class : 'server';
+function reasonOverride(code: string, reason: string | undefined): { class: ErrorClass; exit?: number } | undefined {
+  return reason === undefined || !isRegistryCode(code) ? undefined : (CODES[code] as CodeEntry).reason_overrides?.[reason];
 }
 
-export function codeRetryable(code: string): boolean {
+/** An unregistered code is a server fault by construction (the AST test keeps that set empty). A reason override replaces the code's class. */
+export function codeClass(code: string, reason?: string): ErrorClass {
+  return reasonOverride(code, reason)?.class ?? (isRegistryCode(code) ? (CODES[code] as CodeEntry).class : 'server');
+}
+
+export function codeRetryable(code: string, reason?: string): boolean {
   if (!isRegistryCode(code)) return false;
+  const override = reasonOverride(code, reason);
+  if (override) return override.class === 'retryable';
   const e = CODES[code] as CodeEntry;
   return e.retryable ?? e.class === 'retryable';
 }
 
-/** CLI exit code for an error code (A3 table): entry override, else 1. */
-export function exitCodeForCode(code: string): number {
+/** CLI exit code for an error code (A3 table): reason override, then entry override, else 1. */
+export function exitCodeForCode(code: string, reason?: string): number {
+  const override = reasonOverride(code, reason);
+  if (override) return override.exit ?? 1;
   return isRegistryCode(code) ? (CODES[code] as CodeEntry).exit ?? 1 : 1;
 }
 

@@ -9,6 +9,7 @@ import type { Operation } from './contract.ts';
 
 const OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   get_health: ['gbrain', 'doctor', '--json'],
+  set_memory_writeback: ['gbrain', 'config', 'set', 'memory.agent_writeback', '<mode>'],
   sync_brain: ['gbrain', 'sync'],
   submit_job: ['gbrain', 'jobs', 'submit'],
   get_job: ['gbrain', 'jobs', 'get'],
@@ -16,6 +17,11 @@ const OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   open_loops: ['gbrain', 'loops', 'list'],
   loops_close: ['gbrain', 'loops', 'done'],
   loops_mute: ['gbrain', 'loops', 'mute'],
+  questions_pin: ['gbrain', 'questions', 'pin'],
+  questions_list: ['gbrain', 'questions', 'list'],
+  questions_status: ['gbrain', 'questions', 'status'],
+  questions_refresh: ['gbrain', 'questions', 'refresh'],
+  questions_unpin: ['gbrain', 'questions', 'unpin'],
   get_active_schema_pack: ['gbrain', 'schema', 'active'],
   list_schema_packs: ['gbrain', 'schema', 'list'],
   schema_stats: ['gbrain', 'schema', 'stats'],

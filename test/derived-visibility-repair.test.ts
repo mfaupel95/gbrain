@@ -276,7 +276,8 @@ describe('#5525 tighten-only visibility backfill', () => {
         const scope = await resolveRepairScope(engine);
         const preview = await runRepair(ctx(engine, false), visibilityRepair, scope, { apply: false });
         expect(preview.affected).toBe(4);
-        expect(preview.residuals).toEqual({ atoms_origin_gone_to_private: 1, concepts_without_lineage: 1 });
+        expect(preview.residuals).toEqual({ atoms_origin_gone_to_private: 1, concepts_without_lineage: 1, events_origin_gone: 0,
+          world_facts_remotely_readable: 0 });
         expect(await visibilityOf(engine, 'atoms/unstamped-world')).toBeNull();
         const applied = await runRepair(ctx(engine, false), visibilityRepair, scope, { apply: true });
         expect(applied).toMatchObject({ applied: 4, complete: true });

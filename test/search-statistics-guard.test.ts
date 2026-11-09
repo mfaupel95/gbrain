@@ -43,8 +43,8 @@ describe('missing search planner statistics on Postgres', () => {
     db = new PGlite();
     engine = postgresLike(db);
     await db.exec(`CREATE TABLE pages (id integer PRIMARY KEY, source_id text, type text, slug text, deleted_at timestamptz,
-        text_projection_revision uuid, knowledge_revision uuid);
-      CREATE TABLE content_chunks (id integer PRIMARY KEY, page_id integer, model text, modality text);
+        text_projection_revision uuid, knowledge_revision uuid, body_generation bigint NOT NULL DEFAULT 0);
+      CREATE TABLE content_chunks (id integer PRIMARY KEY, page_id integer, model text, modality text, body_generation bigint);
       CREATE TABLE planner_probe_unused (id integer);
       INSERT INTO pages SELECT i, 'src-' || (i % 8), 'note', 'note-' || i, NULL,
         '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001' FROM generate_series(1, 2000) i;
@@ -61,8 +61,8 @@ describe('missing search planner statistics on Postgres', () => {
     const empty = new PGlite();
     try {
       await empty.exec(`CREATE TABLE pages (id integer, source_id text, type text, slug text, deleted_at timestamptz,
-          text_projection_revision uuid, knowledge_revision uuid);
-        CREATE TABLE content_chunks (id integer, page_id integer, model text, modality text);`);
+          text_projection_revision uuid, knowledge_revision uuid, body_generation bigint NOT NULL DEFAULT 0);
+        CREATE TABLE content_chunks (id integer, page_id integer, model text, modality text, body_generation bigint);`);
       await empty.exec(PROJECTION_STATISTICS_SQL);
       expect(await missingSearchStatistics(postgresLike(empty))).toEqual([]);
     } finally { await empty.close(); }

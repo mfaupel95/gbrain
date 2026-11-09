@@ -46,6 +46,7 @@ const REGISTRATIONS: Record<string, Kind> = {
   'src/core/facts/queue.ts': 'owns-queue',
   'src/core/feedback/record.ts': 'owns-queue',
   'src/core/last-retrieved.ts': 'owns-queue',
+  'src/core/persistence/sync-ghosts.ts': 'owns-queue',
   'src/core/search/hybrid.ts': 'owns-queue',
   'src/core/search/telemetry.ts': 'owns-queue',
   'src/core/ai/gateway.ts': 'self',

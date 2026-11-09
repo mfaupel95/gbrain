@@ -349,7 +349,9 @@ describe('brain_put_page pins undeclared model-authored types (#4852)', () => {
       ]) {
         const error = await tool.execute({ slug: 'wiki/personal/patterns/rejected', content, request_id: randomUUID() },
           { engine, jobId: 1, remote: true }).then(() => null, error => error);
-        expect(error).toMatchObject({ code, writeRequest: { state: 'failed' } });
+        // Invalid YAML fails its admitted request; an over-ceiling body is refused before admission (no request).
+        if (code === 'request_too_large') expect(error).toMatchObject({ code, writeRequest: undefined });
+        else expect(error).toMatchObject({ code, writeRequest: { state: 'failed' } });
         expect(error.message).not.toContain('private_marker');
         expect(await engine.getPage('wiki/personal/patterns/rejected', { sourceId: 'default' })).toBeNull();
       }

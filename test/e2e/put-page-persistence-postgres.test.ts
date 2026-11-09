@@ -14,6 +14,7 @@ import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../../src/co
 import { localHostId, registerLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { runPersistenceEffects } from '../../src/core/persistence/effects.ts';
+import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { _resetWriteThroughCacheForTest } from '../../src/core/write-through.ts';
 
 const d = hasDatabase() ? describe : describe.skip;
@@ -211,5 +212,28 @@ d('Postgres put_page persistence', () => {
     expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Replacement saved revision.');
     expect((await engine.getChunks(slug, { sourceId: 'default' })).map(chunk => chunk.chunk_text)).toEqual(['Replacement saved revision.']);
     expect((await dispatch('put_page', original.params)).payload.revision).toBe(original.payload.revision);
+  });
+  test('an embedding effect whose page moves on between its page read and its projection read is superseded on that attempt', async () => {
+    config.embedding_disabled = false;
+    configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    __setEmbedTransportForTests(async ({ values }) => ({ values, warnings: [], embeddings: values.map(() => new Array(1536).fill(0.1)), usage: { tokens: 1 } }));
+    // The first embedding effect has read its page at the older revision; the newer one commits (sealed) before it reads the projection.
+    const moved = Promise.withResolvers<Awaited<ReturnType<typeof put>>>();
+    let held = false;
+    installFaultHook(async point => {
+      if (point !== 'effect:embedding:page_read' || held) return;
+      held = true;
+      moved.resolve(await put('Newer saved revision.'));
+    });
+    try {
+      const older = await put('Older saved revision.');
+      expect(older.payload.state).toBe('committed');
+      expect((await moved.promise).payload.state).toBe('committed');
+      const observed = await embedding(older, 'revision_changed');
+      expect(observed.payload.effects).toContainEqual({ kind: 'embedding', state: 'committed', reason: 'revision_changed' });
+      // One attempt: never requeued as projection_pending for a revision no projection will be sealed at.
+      expect(await engine.executeRaw(`SELECT e.attempts, e.error_code FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
+        WHERE r.request_id=$1::uuid AND e.kind='embedding'`, [older.params.request_id])).toEqual([{ attempts: 1, error_code: null }]);
+    } finally { installFaultHook(undefined); }
   });
 });

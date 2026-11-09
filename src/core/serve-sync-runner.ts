@@ -54,9 +54,13 @@
  * CLI's effective flags (the managed cursor owns processing options).
  */
 
+import { readMarkersForRun, settleRunMarkers } from './notifier/handoff.ts';
+import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
 import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
+import { retiredWireNotice } from './wire-skew.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
+import { readManagedMode } from './persistence/managed-mode.ts';
 import { OperationError } from './ops/contract.ts';
 import { trustedCliRequired } from './ops/op-fix.ts';
 import { withHumanLineSink } from './console-prefix.ts';
@@ -119,9 +123,50 @@ interface DeferredEmbeds {
   timer?: ReturnType<typeof setTimeout>;
   stopped: boolean;
   unregister: () => void;
+  /** Consecutive passes that failed (a provider error or failed chunks); picks the retry tier. */
+  failures: number;
+  /** Consecutive passes deferred because a delegated sync was running. */
+  busy: number;
 }
 /** Each datastore owns its backlog and actual provider/SQL lifetime. */
 const deferredEmbeds = new Map<BrainEngine, DeferredEmbeds>();
+
+/**
+ * GBRA-133 2b.3: what the deferred-embed drain decided, oldest first (bounded), for tests and the serve log.
+ * `retry` re-arms the drain after a pass left work (progress, a provider failure); `busy` defers while a delegated sync
+ * runs, at most DEFERRED_EMBED_BUSY_MAX times in a row before `busy_override` drains beside it; `keyless` keeps the
+ * backlog without a provider call or a timer.
+ */
+export type DeferredEmbedDecision = { decision: 'drained' | 'retry' | 'busy' | 'busy_override' | 'keyless' | 'no_sources'; delayMs?: number; failures?: number; ms?: number };
+export const deferredEmbedDecisions: DeferredEmbedDecision[] = [];
+const DEFERRED_EMBED_RETRY_TIERS = [1, 3, 12, 60];
+const DEFERRED_EMBED_BUSY_MAX = 3;
+let deferredEmbedBusyProbe: () => boolean = () => isDelegatedSyncRunning();
+
+/** The retry unit: GBRAIN_DEFERRED_EMBED_RETRY_MS (default 5000; tiers 1x, 3x, 12x, 60x after failures). */
+function deferredEmbedRetryMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.GBRAIN_DEFERRED_EMBED_RETRY_MS;
+  const value = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 5_000;
+}
+
+/** Records the decision and logs it (GBRA-133: the drain is a concurrent actor beside searches, so every pass outcome is in the log). */
+function decideDeferredEmbed(entry: DeferredEmbedDecision): void {
+  log(`embed-drain decision=${entry.decision}${entry.delayMs !== undefined ? ` delay_ms=${entry.delayMs}` : ''}`
+    + `${entry.failures !== undefined ? ` failures=${entry.failures}` : ''}${entry.ms !== undefined ? ` ms=${entry.ms}` : ''}`);
+  deferredEmbedDecisions.push(entry);
+  if (deferredEmbedDecisions.length > 200) deferredEmbedDecisions.splice(0, deferredEmbedDecisions.length - 200);
+}
+
+function armDeferredEmbeds(engine: BrainEngine, state: DeferredEmbeds, delayMs: number): void {
+  if (state.timer || state.stopped || shuttingDown) return;
+  state.timer = setTimeout(() => {
+    state.timer = undefined;
+    if (state.stopped) return;
+    void maybeDrainDeferredEmbeds(engine);
+  }, delayMs);
+  state.timer.unref?.();
+}
 
 const isTerminal = (s: DelegatedSyncState): boolean => s === 'done' || s === 'error';
 
@@ -152,12 +197,28 @@ export function isDelegatedSyncRunning(): boolean {
  * payload; when present the start is asynchronous (one verification read).
  */
 export function startDelegatedSync(engine: BrainEngine, rawOptions: unknown, clientToken: string, opts?: { boundSourceId?: string }): SyncStartResponse;
-export function startDelegatedSync(engine: BrainEngine, rawOptions: unknown, clientToken: string, opts: { boundSourceId?: string; registration?: unknown }): SyncStartResponse | Promise<SyncStartResponse>;
+/**
+ * `opts.logLines` (in-process callers only, never the wire): also write the job's human lines to the serve log, for a
+ * run nobody polls (the resident notifier's background passes, #7243), whose phase and progress lines would otherwise
+ * reach only the job's line buffer.
+ */
+export function startDelegatedSync(engine: BrainEngine, rawOptions: unknown, clientToken: string, opts: { boundSourceId?: string; registration?: unknown; logLines?: boolean }): SyncStartResponse | Promise<SyncStartResponse>;
 export function startDelegatedSync(
   engine: BrainEngine,
   rawOptions: unknown,
   clientToken: string,
-  opts: { boundSourceId?: string; registration?: unknown } = {},
+  opts: { boundSourceId?: string; registration?: unknown; logLines?: boolean } = {},
+): SyncStartResponse | Promise<SyncStartResponse> {
+  // #6696 (A5): the client's admission origin scopes every write of the job (validated below; a client that sends none is background).
+  const origin = (rawOptions as { origin?: unknown } | null)?.origin;
+  return withAdmissionOrigin(isAdmissionOrigin(origin) ? origin : 'background', () => startDelegatedSyncScoped(engine, rawOptions, clientToken, opts));
+}
+
+function startDelegatedSyncScoped(
+  engine: BrainEngine,
+  rawOptions: unknown,
+  clientToken: string,
+  opts: { boundSourceId?: string; registration?: unknown; logLines?: boolean },
 ): SyncStartResponse | Promise<SyncStartResponse> {
   if (typeof clientToken !== 'string' || clientToken.length === 0 || clientToken.length > 128) {
     return { ok: false, protocol: 2, error: 'invalid_options:clientToken' };
@@ -200,6 +261,12 @@ export function startDelegatedSync(
     settled: Promise.resolve(),
   };
   current = job;
+  // An older client's retired fields (src/core/wire-skew.ts) were dropped: say so in the serve log and to that client.
+  if (v.ignored) {
+    const notice = retiredWireNotice(v.ignored);
+    log(notice);
+    job.lines.push({ seq: ++job.lineSeq, text: notice });
+  }
   ensureDrainerRegistered();
 
   // Per-job hard deadline: 0 is the single unbounded encoding (an explicit
@@ -208,7 +275,7 @@ export function startDelegatedSync(
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   if (options.timeoutSeconds > 0) {
     deadlineTimer = setTimeout(() => {
-      if (!isTerminal(job.state)) {
+      if (!isTerminal(job.state) && !job.result) {
         log(`abort job=${job.id} reason=deadline after ${options.timeoutSeconds}s`);
         job.state = 'aborting';
         controller.abort();
@@ -228,7 +295,7 @@ export function startDelegatedSync(
   };
 
   if (opts.registration !== undefined) {
-    return startVerifiedDelegatedSync(engine, job, options, opts.registration as SyncStartRegistration, { settle, fail });
+    return startVerifiedDelegatedSync(engine, job, options, opts.registration as SyncStartRegistration, { settle, fail }, opts.logLines === true);
   }
 
   job.settled = withLegacySyncDelegation(async () => {
@@ -240,6 +307,7 @@ export function startDelegatedSync(
         `start job=${job.id} source=${sourceId ?? 'default'} ` +
         `opts=${JSON.stringify({ ...options, timeoutSeconds: undefined })} deadline=${options.timeoutSeconds}s`,
       );
+      const markers = options.dryRun ? [] : await readMarkersForRun(engine, sourceId ?? 'default');
       const r = await performSync(engine, {
         ...classicSyncOpts(options, sourceId),
         // ALWAYS deferred — see module header. Drained by maybeDrainDeferredEmbeds.
@@ -251,16 +319,17 @@ export function startDelegatedSync(
         },
       });
       job.result = toWireSyncResult(r);
-      job.state = 'done';
       log(
         `done job=${job.id} status=${r.status} added=${r.added} modified=${r.modified} ` +
         `deleted=${r.deleted} in=${Math.round((Date.now() - job.startedAt) / 1000)}s`,
       );
+      if (!options.dryRun) await settleRunMarkers(engine, sourceId ?? 'default', markers, { pulled: !options.noPull, full: options.full === true }, { queue: false });
       // Wire noEmbed means the USER declined embeds — honor it by skipping
       // the drain too (performSync above always ran noEmbed regardless).
       if (!options.dryRun && !options.noEmbed && r.added + r.modified > 0) {
         scheduleDeferredSyncEmbeds(engine, sourceId);
       }
+      job.state = 'done';
     } catch (e) {
       fail(e);
     } finally {
@@ -306,6 +375,7 @@ async function startVerifiedDelegatedSync(
   options: DelegatedSyncOptions,
   registration: SyncStartRegistration,
   hooks: { settle: () => void; fail: (e: unknown) => void },
+  logLines = false,
 ): Promise<SyncStartResponse> {
   const refuse = (e: unknown): SyncStartResponse => {
     hooks.fail(e);
@@ -321,6 +391,7 @@ async function startVerifiedDelegatedSync(
   }
   job.managed = true;
   const push = (text: string): void => {
+    if (logLines) log(`job=${job.id} ${text}`);
     job.lines.push({ seq: ++job.lineSeq, text });
     if (job.lines.length > LINE_BUFFER_MAX) job.lines.splice(0, job.lines.length - LINE_BUFFER_MAX);
   };
@@ -329,8 +400,8 @@ async function startVerifiedDelegatedSync(
       await withVerifiedLocalRegistration(engine, registration, () => withHumanLineSink(push, async () => {
         const { performSync } = await import('../commands/sync.ts');
         const sourceId = await resolveJobSource(engine, job);
-        const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-        const managed = brain?.enabled === true;
+        const managed = await readManagedMode(engine);
+        const markers = options.dryRun ? [] : await readMarkersForRun(engine, sourceId ?? 'default');
         log(
           `start job=${job.id} source=${sourceId ?? 'default'} writer=${verified.principal.id} managed=${managed} ` +
           `opts=${JSON.stringify({ ...options, timeoutSeconds: undefined })} deadline=${options.timeoutSeconds}s`,
@@ -340,7 +411,9 @@ async function startVerifiedDelegatedSync(
           // The managed drain is the CLI's own path: the cursor owns processing options, so the CLI's effective
           // flags ride through; the classic path keeps the always-deferred embed rule of the legacy lane.
           ...(managed
-            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, explicitProcessing: options.explicitProcessing }
+            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, embedDeferred: options.embedDeferred,
+              // #6712 PR 1: the CLI's run follows a live drain-lease holder inside the serve, as it would in its own process.
+              followDrainLease: true, drainHolder: { kind: 'serve' as const, id: String(job.id) } }
             : { noEmbed: true }),
           signal: job.controller.signal,
           onProgress: (p) => {
@@ -350,20 +423,25 @@ async function startVerifiedDelegatedSync(
         });
         job.result = toWireSyncResult(r);
         job.drain = r.drain;
+        let stopFields = '';
         if (managed) {
-          const { drainNext } = await import('./persistence/sync-drain.ts');
+          const { drainNext, drainStopFields } = await import('./persistence/sync-drain.ts');
+          stopFields = drainStopFields(r);
           const { managedSyncResumeArgs, syncResumeCommand } = await import('./sync-reconcile.ts');
           const id = sourceId ?? 'default';
           job.next = drainNext(r, syncResumeCommand(managedSyncResumeArgs({ sourceId: id, processingOptions: options })), id);
         }
-        job.state = 'done';
         log(
           `done job=${job.id} status=${r.status} added=${r.added} modified=${r.modified} ` +
-          `deleted=${r.deleted}${r.drain ? ` drain=${r.drain.outcome}` : ''} in=${Math.round((Date.now() - job.startedAt) / 1000)}s`,
+          `deleted=${r.deleted}${r.drain ? ` drain=${r.drain.outcome}` : ''}${stopFields} in=${Math.round((Date.now() - job.startedAt) / 1000)}s`,
         );
+        if (stopFields && job.next) log(`next job=${job.id}: ${job.next.command} (${job.next.why})`);
+        // GBRA-133 PR 2a.3: the post-run re-check (generation-checked); whatever is still due goes to this serve's notifier.
+        if (!options.dryRun) await settleRunMarkers(engine, sourceId ?? 'default', markers, { pulled: !managed && !options.noPull, full: options.full === true }, { queue: false });
         if (!managed && !options.dryRun && !options.noEmbed && r.added + r.modified > 0) {
           scheduleDeferredSyncEmbeds(engine, sourceId);
         }
+        job.state = 'done';
       }));
     } catch (e) {
       hooks.fail(e);
@@ -406,7 +484,7 @@ export function abortDelegatedSync(jobId: string): SyncAbortResponse {
   if (!job || job.id !== jobId) {
     return { ok: false, protocol: 2, error: 'unknown_job' };
   }
-  if (!isTerminal(job.state)) {
+  if (!isTerminal(job.state) && !job.result) {
     log(`abort job=${job.id} reason=client`);
     job.state = 'aborting';
     job.controller.abort();
@@ -479,6 +557,11 @@ function ensureDrainerRegistered(): void {
  * wall clock; `pending` clears only when a run finds nothing left to embed,
  * so successive idle ticks converge on a fully-embedded brain. Keyless rule:
  * no embedding provider ⇒ leave pending (a later keyed serve drains it).
+ * GBRA-133 2b.3: the drain re-arms itself until the backlog is gone: a pass
+ * that left work retries after the retry unit, a failing provider backs off
+ * through the tiers, and a sync backlog defers it at most
+ * DEFERRED_EMBED_BUSY_MAX times before it drains beside the running sync, so
+ * commit-triggered syncs (which always defer) never strand their embeddings.
  * Never throws.
  */
 export async function maybeDrainDeferredEmbeds(engine: BrainEngine): Promise<void> {
@@ -486,7 +569,16 @@ export async function maybeDrainDeferredEmbeds(engine: BrainEngine): Promise<voi
   if (!state || state.stopped || shuttingDown) return;
   if (state.running) return state.running;
   if (!state.pending.size) return;
-  if (isDelegatedSyncRunning()) return;
+  if (deferredEmbedBusyProbe()) {
+    if (state.busy < DEFERRED_EMBED_BUSY_MAX) {
+      state.busy++;
+      decideDeferredEmbed({ decision: 'busy', delayMs: deferredEmbedRetryMs() });
+      armDeferredEmbeds(engine, state, deferredEmbedRetryMs());
+      return;
+    }
+    decideDeferredEmbed({ decision: 'busy_override' });
+  }
+  state.busy = 0;
   const work = (async () => {
     const { companyBrainProfile, getCompanyBrainProfile } = await import('./company-brain/profile.ts');
     if (state.pending.has(undefined)) {
@@ -495,24 +587,36 @@ export async function maybeDrainDeferredEmbeds(engine: BrainEngine): Promise<voi
       for (const source of sources) if (!companyBrainProfile(source.config)) state.pending.add(source.id);
     }
     for (const source of [...state.pending]) if (source && await getCompanyBrainProfile(engine, source)) state.pending.delete(source);
-    if (!state.pending.size) return;
+    if (!state.pending.size) { decideDeferredEmbed({ decision: 'no_sources' }); return; }
     const { detectCapabilities } = await import('./capability.ts');
-    if (!detectCapabilities().embeddings.available) return;
+    if (!detectCapabilities().embeddings.available) { decideDeferredEmbed({ decision: 'keyless' }); return; }
+    const passStart = performance.now();
+    log(`embed-drain started sources=${state.pending.size}`);
     const { runEmbedCore } = await import('../commands/embed.ts');
+    let failed = false;
     // Snapshot one fair pass. A source queued again during its own provider
     // call stays pending, even when that earlier call reports no stale work.
     for (const sourceId of [...state.pending]) {
       if (state.stopped) break;
       state.pending.delete(sourceId);
+      const sourceStart = performance.now();
       try {
         const r = await runEmbedCore(engine, { stale: true, sourceId, signal: state.controller.signal, quiet: true });
-        log(`embed-drain embedded=${r.embedded} failures=${r.failures} source=${sourceId ?? 'all'}`);
+        log(`embed-drain embedded=${r.embedded} failures=${r.failures} source=${sourceId ?? 'all'} ms=${Math.round(performance.now() - sourceStart)}`);
         if (r.embedded !== 0 || r.failures !== 0) state.pending.add(sourceId);
+        if (r.failures !== 0) failed = true;
       } catch (error) {
         state.pending.add(sourceId);
-        log(`embed-drain failed: ${error instanceof Error ? error.message : String(error)}`);
+        failed = true;
+        log(`embed-drain failed: ${error instanceof Error ? error.message : String(error)} source=${sourceId ?? 'all'} ms=${Math.round(performance.now() - sourceStart)}`);
       }
     }
+    const ms = Math.round(performance.now() - passStart);
+    state.failures = failed ? state.failures + 1 : 0;
+    if (!state.pending.size) { decideDeferredEmbed({ decision: 'drained', ms }); return; }
+    const delayMs = deferredEmbedRetryMs() * DEFERRED_EMBED_RETRY_TIERS[Math.max(0, Math.min(state.failures, DEFERRED_EMBED_RETRY_TIERS.length) - 1)]!;
+    decideDeferredEmbed({ decision: 'retry', delayMs, failures: state.failures, ms });
+    armDeferredEmbeds(engine, state, delayMs);
   })().catch(error => { log(`embed-drain failed: ${error instanceof Error ? error.message : String(error)}`); });
   state.running = work;
   try { await work; }
@@ -524,7 +628,7 @@ export function scheduleDeferredSyncEmbeds(engine: BrainEngine, sourceId?: strin
   if (shuttingDown) return;
   let state = deferredEmbeds.get(engine);
   if (!state) {
-    state = { pending: new Set(), controller: new AbortController(), stopped: false, unregister: () => {} };
+    state = { pending: new Set(), controller: new AbortController(), stopped: false, unregister: () => {}, failures: 0, busy: 0 };
     const owned = state;
     state.unregister = engine.registerBeforeDisconnect(async () => {
       owned.stopped = true;
@@ -540,14 +644,7 @@ export function scheduleDeferredSyncEmbeds(engine: BrainEngine, sourceId?: strin
   }
   if (state.stopped) return;
   state.pending.add(sourceId);
-  if (state.timer) return;
-  const owned = state;
-  state.timer = setTimeout(() => {
-    owned.timer = undefined;
-    if (owned.stopped) return;
-    void maybeDrainDeferredEmbeds(engine);
-  }, 5_000);
-  state.timer.unref?.();
+  armDeferredEmbeds(engine, state, 5_000);
 }
 
 /** Test seam: reset every module singleton (serial tests only). */
@@ -560,6 +657,13 @@ export function __resetDelegatedSyncForTests(): void {
     if (state.timer) clearTimeout(state.timer);
   }
   deferredEmbeds.clear();
+  deferredEmbedDecisions.length = 0;
+  deferredEmbedBusyProbe = () => isDelegatedSyncRunning();
+}
+
+/** Test seam: stand in for "a delegated sync is running" (serial tests only; reset by __resetDelegatedSyncForTests). */
+export function __setDeferredEmbedBusyProbeForTests(probe: () => boolean): void {
+  deferredEmbedBusyProbe = probe;
 }
 
 /** Test seam: report whether the deferred-embed backlog is pending. */

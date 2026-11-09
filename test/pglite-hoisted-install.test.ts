@@ -16,6 +16,11 @@
  *   broken   — no pglite anywhere above the package
  *              → tier 3, actionable error naming the reinstall command
  *
+ * The subprocess runs `bun --no-install`: Bun's script auto-install otherwise fetches @electric-sql/pglite from
+ * the registry into ~/.bun/install/cache for the broken layout, so an eager runtime import of the package in the
+ * assets module passed this test for the wrong reason on networked machines (#6512). With auto-install off the
+ * broken layout proves the resolver's tier-3 sentence is reachable: the module must load without the package.
+ *
  * Serial: spawns subprocesses + writes tmpdirs.
  */
 import { describe, test, expect, afterAll } from 'bun:test';
@@ -23,8 +28,9 @@ import { mkdtempSync, mkdirSync, rmSync, copyFileSync, symlinkSync } from 'node:
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
-const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 const nodeRequire = createRequire(import.meta.url);
 const REAL_PGLITE_PKG_DIR = dirname(dirname(nodeRequire.resolve('@electric-sql/pglite'))); // <pkg>/dist/index.js -> <pkg>
 
@@ -59,7 +65,7 @@ async function resolveInSubprocess(root: string): Promise<{ exitCode: number; st
     'const r = await m.resolvePgliteAssetPaths();',
     'console.log(JSON.stringify({ source: r.source }));',
   ].join('\n');
-  const proc = Bun.spawn(['bun', '-e', script], {
+  const proc = Bun.spawn(['bun', '--no-install', '-e', script], {
     cwd: root, // NOT the repo — resolution must not walk into the repo via cwd
     env: { ...process.env },
     stdout: 'pipe',
@@ -95,6 +101,9 @@ describe('hoisted-install asset resolution (#4116, serial)', () => {
     const root = makeFakePackage();
     const r = await resolveInSubprocess(root);
     expect(r.exitCode).not.toBe(0);
+    // #6512: the raw resolver error is what an eager `import … from '@electric-sql/pglite'` prints at module load,
+    // before resolvePgliteAssetPaths() can run; the diagnostic sentence must be the surface.
+    expect(r.stderr).not.toContain("Cannot find module '@electric-sql/pglite'");
     expect(r.stderr).toContain('PGLite runtime assets not found');
     expect(r.stderr).toContain('Reinstall');
     // The failure users hit pre-fix must not be the surface we show now.

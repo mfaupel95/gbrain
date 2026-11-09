@@ -7,8 +7,8 @@
  * no title word in common, through the coordinated file repair (file
  * rewritten, imported, hold cleared, Git commit `gbrain: repair frontmatter
  * slug in <path>` with the `gbrain-repair:` trailer, a content_repair
- * receipt); a slug that resolves through an alias to the file's own page is
- * `already_exempt`; a duplicate pair goes to the model tier at apply time
+ * receipt); a slug that resolves through an alias to the file's own page,
+ * which sync still holds, is `slug_page_mismatch` (#6696 C8); a duplicate pair goes to the model tier at apply time
  * while the preview calls no model; a stubbed `merge_into` writes nothing,
  * records the verdict on the hold as codes and slugs, and `sync status`
  * renders `needs_human` with a paragraph naming the canonical; a stubbed
@@ -44,7 +44,7 @@ import { dailyLedger, FENCE_REPAIR_LEDGER } from '../src/core/budget/daily-ledge
 import { resolveRepairScope, type RepairResult } from '../src/core/repair/core.ts';
 import { repairRunner, repairSpec } from '../src/core/repair/registry.ts';
 import { parseRepairArgs } from '../src/commands/repair.ts';
-import type { SlugConflictsPreviewDetails } from '../src/core/repair/slug-conflicts.ts';
+import { slugConflictsRepair, type SlugConflictsPreviewDetails } from '../src/core/repair/slug-conflicts.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-slug-conflicts-'));
@@ -126,7 +126,7 @@ test('registry: preview-bound, spends llm, clears no doctor check, not explicit-
   expect(parseRepairArgs(['slug-conflicts', '--source', 's', '--only', 'notes/a.md', '--no-llm', '--apply', '--expect', 'abc'])).toMatchObject({ kind: 'slug-conflicts', only: ['notes/a.md'], noLlm: true, expect: 'abc' });
 });
 
-test('deterministic tier: a stray slug (no page, no file) and a slug naming a page of another type lose the line; an alias to the own page is exempt; the preview writes nothing', () => each(async () => {
+test('deterministic tier: a stray slug (no page, no file) and a slug naming a page of another type lose the line; an alias to the own page, which sync holds, is slug_page_mismatch; the preview writes nothing', () => each(async () => {
   const s = await managed({
     'companies/acme-example.md': page('Acme Widgets', 'company', 'A synthetic company.'),
     'people/carol-example.md': page('Carol Example', 'person', 'A synthetic person.'),
@@ -134,7 +134,7 @@ test('deterministic tier: a stray slug (no page, no file) and a slug naming a pa
     'people/bob-example.md': page('Bob Example', 'person', 'A synthetic person who works at the company.', 'slug: companies/acme-example\n'),
   });
   expect((await s.sync()).held_count).toBe(2);
-  // An alias to the file's own page: held by the screen, exempt for the lane.
+  // An alias to the file's own page: held by the screen, so the lane (#6696 C8: the same screen) keeps it as slug_page_mismatch.
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('gbrain.write_sources', $1, true)", [JSON.stringify([s.id])]);
     await tx.executeRaw('INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug) VALUES ($1, $2, $3)', [s.id, 'people/carol', 'people/carol-example']);
@@ -145,8 +145,8 @@ test('deterministic tier: a stray slug (no page, no file) and a slug naming a pa
   const preview = await s.run();
   expect(calls).toHaveLength(0);
   expect(preview.listing!.map(entry => [entry.item, entry.class]).sort()).toEqual([
-    [`${s.id}:notes/stray.md`, 'deterministic'], [`${s.id}:people/bob-example.md`, 'deterministic'], [`${s.id}:people/carol-example.md`, 'already_exempt']]);
-  expect(details(preview).counts).toEqual({ deterministic: 2, llm: 0, held: 0, skipped: 1 });
+    [`${s.id}:notes/stray.md`, 'deterministic'], [`${s.id}:people/bob-example.md`, 'deterministic'], [`${s.id}:people/carol-example.md`, 'slug_page_mismatch']]);
+  expect(details(preview).counts).toEqual({ deterministic: 2, llm: 0, held: 1, skipped: 0 });
   expect(details(preview).diffs.map(d => d.rule).sort()).toEqual(['absent_page', 'different_type']);
   expect(details(preview).diffs[0]!.diff).toContain('-slug: ');
   expect(preview.cost.llm_usd).toBe(0);
@@ -171,7 +171,7 @@ test('deterministic tier: a stray slug (no page, no file) and a slug naming a pa
   expect(git(s.root, 'log', '-1', '--format=%(trailers:key=gbrain-repair,valueonly)')).toMatch(/^frontmatter_slug_conflict deterministic high/);
   expect(git(s.root, 'status', '--porcelain')).toBe('');
   expectNoSecrets([holds, rows, surfaceOf(applied), log]);
-  // The hold fix of the remaining (exempt) hold names the content repair preview.
+  // The hold fix of the remaining (slug_page_mismatch) hold names the content repair preview.
   expect(gitHoldItem(holds[0]!).fix.argv).toEqual(['gbrain', 'repair', 'content', '--source', s.id, '--only', 'people/carol-example.md']);
 }), 240_000);
 
@@ -305,4 +305,42 @@ test('a transient provider error keeps the memo and schedules a retry; changed_s
   expect(await s.run({ apply: true })).toMatchObject({ remaining: { content_repair_needs_human: 1 } });
   expect(calls).toHaveLength(1);
   expectNoSecrets([await s.holds(), surfaceOf(down), surfaceOf(capped)]);
+}), 240_000);
+
+// #6749: the issue's fixture. autoFixFrontmatter reports [NESTED_QUOTES, SLUG_MISMATCH] (a style-only re-quote of a valid JSON-style
+// alias array beside the slug), so the lane used to hold it still_invalid. Now the slug: line alone is removed, the aliases line stays
+// byte-for-byte, and the preview, the result and the receipt list the untouched NESTED_QUOTES alongside remove_slug.
+const ACME = '---\ntitle: "Acme Capital"\ntype: company\nslug: acme-capital\naliases: ["Acme", "Acme Capital Management"]\n---\nbody\n';
+
+test('#6749: a mismatched slug beside a style-only NESTED_QUOTES alias array is a deterministic remove_slug; the aliases line is untouched', () => each(async () => {
+  const s = await managed({ 'companies/acme-capital.md': ACME });
+  expect((await s.sync()).held_count).toBe(1);
+  const preview = await s.run({ noLlm: true });
+  expect(preview.listing!.map(entry => [entry.item, entry.class])).toEqual([[`${s.id}:companies/acme-capital.md`, 'deterministic']]);
+  expect(preview.listing![0]!.detail).toContain('remove_slug (absent_page)');
+  expect(preview.listing![0]!.detail).toContain('NESTED_QUOTES');
+  expect(details(preview).diffs).toEqual([expect.objectContaining({ rule: 'absent_page', style_only: ['NESTED_QUOTES'] })]);
+  expect(details(preview).diffs[0]!.diff).toContain('-slug: acme-capital');
+  expect(details(preview).diffs[0]!.diff).not.toContain('aliases');
+  const rendered = slugConflictsRepair.render!(preview.details!, { diff: true } as never).join('\n');
+  expect(rendered).toContain('remove_slug, absent_page; style-only NESTED_QUOTES left as written');
+  const applied = await s.run({ apply: true, expect: hashOf(preview), noLlm: true });
+  expect(applied).toMatchObject({ applied: 1, repaired: 1 });
+  expect(s.read('companies/acme-capital.md')).toBe(ACME.replace('slug: acme-capital\n', ''));
+  expect(await s.holds()).toEqual([]);
+  const [row] = await receipts(s.id);
+  expect(row!.outcome.content_repair).toMatchObject({ action: 'remove_slug', tier: 'deterministic', style_only: ['NESTED_QUOTES'] });
+  expect(JSON.stringify(applied)).toContain('NESTED_QUOTES');
+}), 240_000);
+
+test('#6749: a slug conflict that also needs NULL_BYTES stays still_invalid and the hold message names the code', () => each(async () => {
+  const content = '---\ntitle: "Acme Capital"\ntype: company\nslug: acme-capital\n---\nbo\u0000dy\n';
+  const s = await managed({ 'companies/acme-capital.md': content });
+  expect((await s.sync()).held_count).toBe(1);
+  const preview = await s.run({ noLlm: true });
+  expect(preview.listing!.map(entry => entry.class)).toEqual(['still_invalid']);
+  expect(preview.listing![0]!.detail).toContain('NULL_BYTES');
+  expect(details(preview).diffs).toEqual([]);
+  expect(await s.run({ apply: true, noLlm: true })).toMatchObject({ applied: 0 });
+  expect(s.read('companies/acme-capital.md')).toBe(content);
 }), 240_000);

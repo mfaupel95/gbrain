@@ -11,7 +11,8 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import { setCliExitVerdict } from '../../core/cli-force-exit.ts';
 import { connectorProviders, getConnectorProvider } from '../../core/connectors/registry.ts';
-import { credentialMode, resolveCredential } from '../../core/connectors/credentials.ts';
+import { credentialMode, resolveApiToken, resolveCredential } from '../../core/connectors/credentials.ts';
+import { isTokenProviderName } from '../../core/connectors/types.ts';
 import {
   authErrorAtKey,
   autoSyncKey,
@@ -24,6 +25,14 @@ import { fullSyncArgv, readFailedLedger } from '../../core/connectors/failed-led
 export async function runConnectorStatus(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
   const only = args.find((a) => !a.startsWith('-'));
+  if (only && isTokenProviderName(only)) {
+    const key = resolveApiToken(only);
+    const row = { provider: only, credential_present: !!key, credential_source: key?.source ?? null, credential_file_mode: credentialMode(only) };
+    if (json) console.log(JSON.stringify({ providers: [row] }, null, 2));
+    else console.log(key ? `${only}  credential: ${key.source}` : `${only}  no credential (gbrain connectors auth ${only} --token -)`);
+    if (!key) setCliExitVerdict(1);
+    return;
+  }
   const providers = only
     ? [getConnectorProvider(only)].filter(Boolean)
     : [...connectorProviders];
@@ -43,6 +52,7 @@ export async function runConnectorStatus(engine: BrainEngine, args: string[]): P
       attempts: e.attempts,
       updated_at: e.updatedAt,
       next_retry_at: e.nextRetryAt ?? null,
+      ...(e.code ? { code: e.code } : {}),
       needs_full_sync: !!prov.routesByOrg && !e.orgId,
     }));
     rows.push({

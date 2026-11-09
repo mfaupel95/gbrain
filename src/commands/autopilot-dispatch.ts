@@ -5,14 +5,19 @@
  * submits. Called by runAutopilotDaemon (src/commands/autopilot-daemon.ts).
  */
 import type { BrainEngine } from '../core/engine.ts';
+import { assertNever, type BrainHealth } from '../core/types.ts';
+import { syncIntervalMinutes } from '../core/meetings/source-config.ts';
+import { MEETINGS_DEFAULT_SYNC_INTERVAL_MIN } from '../core/meetings/types.ts';
+import { SLACK_DEFAULT_SYNC_INTERVAL_MIN } from '../core/slack/types.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { loadAllSources, parseSourceConfig, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, type SourceRow } from '../core/sources-load.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
-import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
-import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
+import { attemptedConnectorSourceIds, type ConnectorAccountMismatch } from '../core/persistence/connector-state.ts';
+import { connectorAccountMismatches, connectorAccountMismatchSkipWarning } from '../core/persistence/connector-account-mismatch.ts';
+import { AUTOPILOT_GIT_PULL_KEY, automaticGitPullDisabled, automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { isSyncDisabledConfig } from '../core/sync-policy.ts';
-import { loadActivationPendingSourceIds, skipActivationPendingSync } from '../core/sync-policy.ts';
-import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
+import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip, skipActivationPendingSync } from '../core/sync-policy.ts';
+import { resolveAutopilotAutoDrainBounds, resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
   autopilotTargetedSteps,
@@ -21,14 +26,23 @@ import {
 } from './autopilot-remediation-policy.ts';
 import type { AutopilotDaemonState } from './autopilot-daemon.ts';
 import { logError } from './autopilot.ts';
+import { readTickHealth } from './autopilot-health.ts';
+import { readCheckoutHead } from '../core/checkout-head.ts';
+import { SYNC_ON_COMMIT_KEY } from '../core/sync-config-keys.ts';
+import { autopilotPaused } from '../core/autopilot-paths.ts';
+import { cooldownMinForCount, resolveFailureCooldownOpts } from './autopilot-fanout.ts';
 
-/** Returns cycleOk: false only when the dispatch itself threw. */
+/**
+ * cycleOk is false only when the dispatch itself threw. health is the snapshot the plan routed on (null: the bounded
+ * read timed out), for the daemon's adaptive interval (#7236); absent when the tick threw before reading it.
+ */
 export async function dispatchAutopilotTick(
   engine: BrainEngine,
   state: AutopilotDaemonState,
   { repoPath, baseInterval, jsonMode }: { repoPath: string; baseInterval: number; jsonMode: boolean },
-): Promise<boolean> {
+): Promise<{ cycleOk: boolean; health?: BrainHealth | null }> {
   let cycleOk = true;
+  let health: BrainHealth | null | undefined;
   // v0.36+ brain-health-100 wave (T8): targeted-submit loop.
   //
   // Pre-fix: every tick submitted ONE autopilot-cycle job, full phase
@@ -62,9 +76,11 @@ export async function dispatchAutopilotTick(
     const slot = new Date(slotMs).toISOString();
     const timeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, false);
 
-    await dispatchFreshnessSyncs(engine, queue, { baseInterval, slot, timeoutMs, jsonMode });
+    await dispatchFreshnessSyncs(engine, queue, { baseInterval, slot, timeoutMs, jsonMode, freshnessHeads: state.freshnessHeads });
     await dispatchAutoDrain(engine, queue, { timeoutMs, jsonMode });
-    const { score, plan, estTotal } = await computeAutopilotPlan(engine, repoPath);
+    const autopilotPlan = await computeAutopilotPlan(engine, repoPath, jsonMode);
+    health = autopilotPlan.health;
+    const { score, plan, estTotal } = autopilotPlan;
 
     // Track time since last full cycle for the 60-min floor.
     const minutesSinceLastFull = (Date.now() - state.lastFullCycleAt) / 60000;
@@ -101,8 +117,9 @@ export async function dispatchAutopilotTick(
       // maintenance' carry a 30-min handler anchor (handler-timeouts.ts)
       // because a full cycle can outlive short daemon intervals — unlike
       // the lighter interval-derived `timeoutMs` above (sync/freshness,
-      // extract-atoms-drain, targeted small-plan steps), which have no
-      // such anchor and are meant to stay interval-derived. Naming this
+      // targeted small-plan steps), which have no such anchor and are meant
+      // to stay interval-derived; auto-drains co-stamp their window and
+      // deadline (resolveAutopilotAutoDrainBounds). Naming this
       // separately (rather than reusing the outer `timeoutMs`) avoids
       // the #2781 bug class: dispatchGlobalMaintenance previously reused
       // the outer non-full-cycle `timeoutMs` by shorthand, silently
@@ -125,6 +142,13 @@ export async function dispatchAutopilotTick(
           await dispatchGlobalMaintenance(engine, queue, { repoPath, slot, timeoutMs: fullCycleTimeoutMs, jsonMode });
         } catch (e) {
           if (jsonMode) process.stderr.write(JSON.stringify({ event: 'global_maintenance_dispatch_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
+        }
+        // GBRA-130 C-6: the verdict `autopilot --status` reads without the database.
+        try {
+          const { recordGlobalMaintenanceStallStatus } = await import('../core/minions/global-maintenance-stall.ts');
+          await recordGlobalMaintenanceStallStatus(engine);
+        } catch (e) {
+          if (jsonMode) process.stderr.write(JSON.stringify({ event: 'global_maintenance_verdict_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
         }
       }
       // Opt-in scheduled chat-connector sync (OV#4). Credential-gated +
@@ -219,7 +243,7 @@ export async function dispatchAutopilotTick(
       }
     }
   } catch (e) { logError('dispatch', e); cycleOk = false; }
-  return cycleOk;
+  return { cycleOk, health };
 }
 
 const connectorNoticePrinted = new Set<string>();
@@ -244,14 +268,110 @@ export function connectorAwaitingFirstSync(src: { id: string; config: unknown },
   return true;
 }
 
+/** What the freshness loop decided for one checkout source (connector sources are not reported). */
+export interface FreshnessDecision {
+  source_id: string;
+  outcome: 'dispatched' | 'coalesced' | 'fresh' | 'live_job' | 'skipped' | 'failed';
+  /** Why a sync was due: the checkout's HEAD differs from the last synced commit, or the wall-clock backstop. */
+  trigger?: 'head' | 'interval';
+  head?: string | null;
+  job_id?: number;
+}
+
+/**
+ * GBRA-133 2a.4: why a checkout source is due a freshness sync. HEAD-driven first: HEAD differs from the source's last
+ * synced commit and this daemon has not already dispatched (or decided) for that HEAD; no ancestry assumption. The
+ * wall-clock rule (last_sync_at older than the interval) stays as the backstop for retries, pulls and unreadable HEADs.
+ * A HEAD in the middle of a rebase or merge waits for the operation to finish.
+ */
+export function freshnessTrigger(input: { head: { head: string; operation: string | null } | null; lastCommit: string | null;
+  ageMs: number; intervalMs: number; decidedHead?: string }): 'head' | 'interval' | null {
+  if (input.ageMs >= input.intervalMs) return 'interval';
+  const head = input.head;
+  if (!head || head.operation || head.head === input.lastCommit || head.head === input.decidedHead) return null;
+  return 'head';
+}
+
+/** Whether a checkout source is due a freshness sync: its trigger and HEAD, or why not (fresh, or a live sync job). */
+async function checkoutFreshness(engine: BrainEngine, src: SourceRow, root: string, input: { ageMs: number; intervalMs: number; decidedHead?: string }):
+  Promise<{ trigger: 'head' | 'interval'; head: { head: string; operation: string | null } | null } | { decision: FreshnessDecision }> {
+  const head = await readCheckoutHead(root);
+  const trigger = freshnessTrigger({ head, lastCommit: src.last_commit, ...input });
+  if (!trigger) return { decision: { source_id: src.id, outcome: 'fresh', head: head?.head ?? null } };
+  // #6706: a live sync job (any submitter) is already draining this source; coalescing into another submitter's row is refused.
+  if (await (await import('../core/persistence/sync-movement.ts')).liveSyncJob(engine, src.id) !== null) {
+    return { decision: { source_id: src.id, outcome: 'live_job', trigger, head: head?.head ?? null } };
+  }
+  return { trigger, head };
+}
+
 /**
  * v0.40 D17 freshness: runs first each tick, independent of the score gate.
+ * `freshnessHeads` (the daemon's per-source map of the HEAD it last dispatched or decided for) keeps a HEAD-driven
+ * dispatch to one per HEAD; `onlySourceIds` narrows the pass to the sources the between-tick HEAD probe saw move.
+ * A HEAD-driven job is keyed on its HEAD, never the wall-clock slot, so a new commit cannot coalesce into the slot's
+ * completed job. A source with a live sync job keeps its HEAD undecided; the next tick or probe dispatches it.
  */
+/** #7239: a source whose automatic sync keeps being refused, and until when its freshness sync waits. */
+export interface SyncRefusalHold { code: string; job_id: number; count: number; retry_at: number }
+
+const REFUSAL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const reportedRefusalJobs = new Set<number>();
+
+/**
+ * #7239: a refused sync job (`job_outcome: 'refused'`, refusal.ts) fails the same way until someone fixes its cause, so
+ * the freshness dispatch stops queueing a new one per slot and per commit. A source's refusals since its last completed
+ * sync job (looking back a day) hold it for the autopilot failure cooldown of that count (10 minutes doubling to the
+ * 2-hour cap; `autopilot.failure_cooldown_min` / `_cap_min`, 0 disables), counted from the newest refusal. A completed
+ * sync job clears the hold; an explicit `gbrain sync --source <id>` is never held. Fails open (no holds) on a read error.
+ */
+export async function readSyncRefusalHolds(engine: BrainEngine, now = Date.now()): Promise<Map<string, SyncRefusalHold>> {
+  const holds = new Map<string, SyncRefusalHold>();
+  const opts = await resolveFailureCooldownOpts(engine);
+  if (opts.baseMin <= 0) return holds;
+  const rows = await engine.executeRaw<{ source_id: string | null; n: number; last_at: string | Date; job_id: number; code: string | null }>(
+    `SELECT COALESCE(j.data->>'sourceId', j.data->>'source_id', 'default') AS source_id, count(*)::int AS n, max(j.finished_at) AS last_at,
+            (array_agg(j.id ORDER BY j.finished_at DESC))[1] AS job_id,
+            (array_agg(j.result->'refusal'->>'code' ORDER BY j.finished_at DESC))[1] AS code
+       FROM minion_jobs j
+      WHERE j.name = 'sync' AND j.status = 'dead' AND j.result->>'job_outcome' = 'refused' AND j.finished_at > $1
+        AND NOT EXISTS (SELECT 1 FROM minion_jobs c
+                         WHERE c.name = 'sync' AND c.status = 'completed' AND c.finished_at > j.finished_at
+                           AND COALESCE(c.data->>'sourceId', c.data->>'source_id', 'default') = COALESCE(j.data->>'sourceId', j.data->>'source_id', 'default'))
+      GROUP BY 1`,
+    [new Date(now - REFUSAL_LOOKBACK_MS).toISOString()],
+  );
+  for (const r of rows) {
+    const last = r.last_at instanceof Date ? r.last_at.getTime() : new Date(r.last_at).getTime();
+    if (!r.source_id || !Number.isFinite(last)) continue;
+    const retryAt = last + cooldownMinForCount(Number(r.n), opts) * 60_000;
+    if (retryAt > now) holds.set(r.source_id, { code: r.code ?? 'refused', job_id: Number(r.job_id), count: Number(r.n), retry_at: retryAt });
+  }
+  return holds;
+}
+
+/** Whether a refusal hold skips this source's freshness sync now; reports the hold once per refused job. */
+function skipRefusedSync(holds: ReadonlyMap<string, SyncRefusalHold>, sourceId: string, jsonMode: boolean): boolean {
+  const hold = holds.get(sourceId);
+  if (!hold) return false;
+  if (!reportedRefusalJobs.has(hold.job_id)) {
+    reportedRefusalJobs.add(hold.job_id);
+    const retryAt = new Date(hold.retry_at).toISOString();
+    process.stderr.write((jsonMode
+      ? JSON.stringify({ event: 'freshness_sync_refused', source_id: sourceId, job_id: hold.job_id, code: hold.code, refusals: hold.count, retry_at: retryAt })
+      : `[dispatch] sync of ${sourceId} waits until ${retryAt}: its last sync job #${hold.job_id} was refused (${hold.code}) and would be refused again. `
+        + `gbrain jobs get ${hold.job_id} --json shows the fix; after fixing it, gbrain sync --source ${sourceId} runs now.`) + '\n');
+  }
+  return true;
+}
+
 export async function dispatchFreshnessSyncs(
   engine: BrainEngine,
   queue: MinionQueue,
-  { baseInterval, slot, timeoutMs, jsonMode }: { baseInterval: number; slot: string; timeoutMs: number; jsonMode: boolean },
-): Promise<void> {
+  { baseInterval, slot, timeoutMs, jsonMode, freshnessHeads = new Map(), onlySourceIds }: { baseInterval: number; slot: string; timeoutMs: number; jsonMode: boolean;
+    freshnessHeads?: Map<string, string>; onlySourceIds?: ReadonlySet<string> },
+): Promise<FreshnessDecision[]> {
+  const decisions: FreshnessDecision[] = [];
   // ── v0.40 D17: per-source freshness check ────────────────────
   // Runs first; independent of score gate. Submits a 'sync' job per
   // source whose last_sync_at is older than the interval. The sync
@@ -261,23 +381,37 @@ export async function dispatchFreshnessSyncs(
     const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
     if (await isFederatedV2Enabled(engine)) {
       const attempted = await attemptedConnectorSourceIds(engine).catch(() => null);
+      // #6803: unreadable mismatch records fail open; the connector sync refuses again on its own.
+      const mismatched = await connectorAccountMismatches(engine).catch(() => new Map<string, ConnectorAccountMismatch>());
       const sources = await loadAllSources(engine);
-      const activationPending = await loadActivationPendingSourceIds(engine);
+      // #6451: one status line per tick when the operator turned automatic pulls off.
+      if (await automaticGitPullDisabled(engine)) {
+        process.stderr.write((jsonMode
+          ? JSON.stringify({ event: 'git_pull_disabled', key: AUTOPILOT_GIT_PULL_KEY })
+          : `[autopilot] git_pull: off (${AUTOPILOT_GIT_PULL_KEY}=false); remote sources sync their local checkout without pulling`) + '\n');
+      }
       const intervalMs = baseInterval * 1000;
       const now = Date.now();
+      const rateLimits = await readConnectorRateLimits(engine, now).catch(() => new Map<string, number>());
+      const activationPending = await loadActivationPendingSourceIds(engine);
+      const refusalHolds = await readSyncRefusalHolds(engine, now).catch(() => new Map<string, SyncRefusalHold>());
       for (const src of sources) {
+        if (onlySourceIds && !onlySourceIds.has(src.id)) continue;
+        if (skipRefusedSync(refusalHolds, src.id, jsonMode)) { decisions.push({ source_id: src.id, outcome: 'skipped' }); continue; }
         if (isConnectorSourceKind(parseSourceConfig(src.config).kind)) {
-          await dispatchConnectorFreshnessSync(queue, src, attempted, activationPending, { intervalMs, now, slot, timeoutMs, jsonMode });
+          await dispatchConnectorFreshnessSync(queue, src, attempted, activationPending, mismatched, { intervalMs, now, slot, timeoutMs, jsonMode, rateLimits });
           continue;
         }
         if (!src.local_path) continue;
-        // #4399: config.syncEnabled=false excludes a source from AUTOMATIC
-        // sync (this loop, the full-cycle fan-out, `sync --all`); an
-        // explicit `gbrain sync --source <id>` is unaffected.
-        if (isSyncDisabledConfig(src.config)) continue;
-        if (skipActivationPendingSync(activationPending, src.id, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'))) continue; // #5198
-        // A local_path this machine cannot use — relative (#3696: cwd is
-        // launchd's, not the registering shell's) or absent on disk and
+        // #4399 / #5198 / P4.2 (supersedes #6465): one predicate decides whether AUTOMATIC sync runs for this source
+        // (disabled config, claim awaiting activation, gbrain-owned content directory where sync does not apply); the
+        // reason is stated once per source and reason, and an explicit `gbrain sync --source <id>` is unaffected.
+        const skip = await automaticSyncSkip(engine, src, activationPending);
+        if (skip?.reason !== 'sync_disabled') reportAutomaticSyncSkip(src.id, skip, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'));
+        if (skip) decisions.push({ source_id: src.id, outcome: 'skipped' });
+        if (skip) continue;
+        // A local_path this machine cannot use — relative (#3696, #7630: it
+        // names whatever directory the daemon runs from) or absent on disk and
         // not a managed clone sync can re-create — would sync a phantom
         // path. Skip loudly (sourceLocalPathSkipWarning carries the
         // fix); under --json the skip is an NDJSON event like every
@@ -287,11 +421,14 @@ export async function dispatchFreshnessSyncs(
           process.stderr.write(
             (jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, reason: skipWarn }) : skipWarn) + '\n',
           );
+          decisions.push({ source_id: src.id, outcome: 'skipped' });
           continue;
         }
         const lastSyncMs = src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0;
         const ageMs = now - lastSyncMs;
-        if (ageMs < intervalMs) continue; // fresh enough
+        const due = await checkoutFreshness(engine, src, src.local_path, { ageMs, intervalMs, decidedHead: freshnessHeads.get(src.id) });
+        if ('decision' in due) { decisions.push(due.decision); continue; }
+        const { trigger, head } = due;
         try {
           const job = await queue.add(
             'sync',
@@ -304,21 +441,26 @@ export async function dispatchFreshnessSyncs(
             },
             {
               queue: 'default',
-              idempotency_key: `autopilot-sync:${src.id}:${slot}`,
+              idempotency_key: `autopilot-sync:${src.id}:${trigger === 'head' ? `head:${head!.head}` : slot}`,
               max_attempts: 2,
               timeout_ms: timeoutMs,
-              maxWaiting: 1,
+              // #6706: single-flight per source. A sync job drains until synced or its deadline, so a tick while one runs
+              // coalesces into it (waiting or live-lock active) instead of starting a second drainer on the same cursor.
+              maxPending: 1,
             },
           );
+          if (head) freshnessHeads.set(src.id, head.head);
+          decisions.push({ source_id: src.id, outcome: job.coalesced ? 'coalesced' : 'dispatched', trigger, head: head?.head ?? null, job_id: job.id });
           if (jsonMode) {
             process.stderr.write(JSON.stringify({
               event: 'dispatched', job_id: job.id, mode: 'freshness',
-              source_id: src.id, age_ms: ageMs,
+              source_id: src.id, age_ms: ageMs, trigger, ...(head ? { head: head.head } : {}),
             }) + '\n');
           } else {
-            console.log(`[dispatch] job #${job.id} sync (freshness: ${src.id}; age=${Math.floor(ageMs / 60000)}min)`);
+            console.log(`[dispatch] job #${job.id} sync (freshness: ${src.id}; ${trigger === 'head' ? `HEAD ${head!.head.slice(0, 8)} not synced` : `age=${Math.floor(ageMs / 60000)}min`})`);
           }
         } catch (e) {
+          decisions.push({ source_id: src.id, outcome: 'failed', trigger, head: head?.head ?? null });
           logError('dispatch.freshness', e);
         }
       }
@@ -326,6 +468,88 @@ export async function dispatchFreshnessSyncs(
   } catch (e) {
     logError('dispatch.freshness-gate', e);
   }
+  return decisions;
+}
+
+export const HEAD_PROBE_MS_DEFAULT = 3_000;
+const HEAD_PROBE_FLAG_EVERY_MS = 30_000;
+const HEAD_PROBE_LIST_EVERY_MS = 60_000;
+
+export interface HeadProbeDeps {
+  env?: Record<string, string | undefined>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  readHead?: (root: string) => Promise<{ head: string; operation: string | null } | null>;
+  dispatch?: typeof dispatchFreshnessSyncs;
+  /** True while this process runs a resident commit notifier (lane 2a.1): it, or the host's notifier owner, syncs on commit, so the probe stands down. */
+  notifierActive?: () => boolean;
+}
+
+/** One probe pass's record: the sources whose HEAD moved past what was synced or decided, and what the dispatch decided. */
+export interface HeadProbeRecord { at: number; moved: string[]; decisions: FreshnessDecision[] }
+
+/**
+ * GBRA-133 2a.4: the daemon's wait between ticks, HEAD-driven. With `sync.on_commit` on, it reads every checkout's
+ * HEAD every `GBRAIN_AUTOPILOT_HEAD_PROBE_MS` (default 3 s, 1 to 30 s; git only, no database read) and runs the freshness
+ * dispatch for the sources whose HEAD moved past both their last synced commit and the HEAD this daemon last decided
+ * for, so a commit is queued within seconds instead of at the next tick (150 to 600 s). The flag is re-read every 30 s
+ * and the source list every 60 s. With the flag off, or while this process runs a resident commit notifier (which owns
+ * on-commit syncs for the host), it only sleeps, and the tick's HEAD check stays the trigger.
+ * Returns each pass that saw a move (the recorded decisions the tests read).
+ */
+export async function sleepWatchingHeads(
+  engine: BrainEngine,
+  state: Pick<AutopilotDaemonState, 'stopping' | 'freshnessHeads'>,
+  { sleepMs, baseInterval, jsonMode }: { sleepMs: number; baseInterval: number; jsonMode: boolean },
+  deps: HeadProbeDeps = {},
+): Promise<HeadProbeRecord[]> {
+  const env = deps.env ?? process.env;
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const readHead = deps.readHead ?? readCheckoutHead;
+  const dispatch = deps.dispatch ?? dispatchFreshnessSyncs;
+  const raw = Number(env.GBRAIN_AUTOPILOT_HEAD_PROBE_MS);
+  const probeMs = env.GBRAIN_AUTOPILOT_HEAD_PROBE_MS?.trim() && Number.isFinite(raw) ? Math.min(30_000, Math.max(1_000, Math.round(raw))) : HEAD_PROBE_MS_DEFAULT;
+  const records: HeadProbeRecord[] = [];
+  const deadline = now() + sleepMs;
+  let flagReadAt = -Infinity, enabled = false, listedAt = -Infinity;
+  let sources: Array<{ id: string; local_path: string; last_commit: string | null }> = [];
+  while (!state.stopping && now() < deadline) {
+    await sleep(Math.max(0, Math.min(probeMs, deadline - now())));
+    if (state.stopping || now() >= deadline) break;
+    try {
+      if (now() - flagReadAt >= HEAD_PROBE_FLAG_EVERY_MS) {
+        flagReadAt = now();
+        enabled = /^(1|true|on|yes)$/i.test((await engine.getConfig(SYNC_ON_COMMIT_KEY))?.trim() ?? '');
+      }
+      if (!enabled || autopilotPaused() || deps.notifierActive?.()) continue;
+      if (now() - listedAt >= HEAD_PROBE_LIST_EVERY_MS) {
+        listedAt = now();
+        sources = (await loadAllSources(engine)).filter(s => !s.archived && s.local_path && !isConnectorSourceKind(parseSourceConfig(s.config).kind))
+          .map(s => ({ id: s.id, local_path: s.local_path!, last_commit: s.last_commit }));
+      }
+      const moved = new Map<string, string>();
+      for (const src of sources) {
+        const head = await readHead(src.local_path);
+        if (head && !head.operation && head.head !== src.last_commit && head.head !== state.freshnessHeads.get(src.id)) moved.set(src.id, head.head);
+      }
+      if (!moved.size) continue;
+      const { MinionQueue } = await import('../core/minions/queue.ts');
+      const slotMs = Math.floor(now() / (baseInterval * 1000)) * baseInterval * 1000;
+      const decisions = await dispatch(engine, new MinionQueue(engine), { baseInterval, slot: new Date(slotMs).toISOString(),
+        timeoutMs: resolveAutopilotDispatchTimeoutMs(baseInterval, false), jsonMode, freshnessHeads: state.freshnessHeads, onlySourceIds: new Set(moved.keys()) });
+      // A source the dispatch skipped or found fresh keeps the HEAD decided, so a skipped source is not re-run every probe;
+      // a live sync job or a failed submit leaves it undecided and the next probe tries again.
+      for (const d of decisions) {
+        const head = moved.get(d.source_id);
+        if (head && d.outcome !== 'live_job' && d.outcome !== 'failed') state.freshnessHeads.set(d.source_id, d.head ?? head);
+      }
+      records.push({ at: now(), moved: [...moved.keys()], decisions });
+    } catch (e) {
+      logError('dispatch.head-probe', e);
+    }
+  }
+  return records;
 }
 
 /**
@@ -334,18 +558,67 @@ export async function dispatchFreshnessSyncs(
  * capture is opt-in: the DX O1 gate (`connectorAwaitingFirstSync`) keeps a
  * connector with no recorded sync attempt idle and prints the enable command once.
  */
+const rateLimitNoticePrinted = new Set<string>();
+
+/**
+ * D1: how often autopilot syncs a connector source. GitHub and Google keep the base interval; a meetings or slack
+ * source syncs every `sync_interval_min` minutes (default 60 for meetings, 30 for slack; floor 5).
+ */
+export function connectorSyncIntervalMs(config: unknown, baseIntervalMs: number): number {
+  const parsed = parseSourceConfig(config) as Record<string, unknown> & { kind?: unknown };
+  const kind = parsed.kind;
+  if (!isConnectorSourceKind(kind)) return baseIntervalMs;
+  switch (kind) {
+    case 'google':
+    case 'github': return baseIntervalMs;
+    case 'meetings': return syncIntervalMinutes(parsed, MEETINGS_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
+    case 'slack': return syncIntervalMinutes(parsed, SLACK_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
+    default: return assertNever(kind);
+  }
+}
+
+/** Connector sources whose provider asked for a wait the last sync recorded (connectors/api-source.ts `recordRateLimit`): id → epoch ms. */
+export async function readConnectorRateLimits(engine: BrainEngine, now: number): Promise<Map<string, number>> {
+  const rows = await engine.executeRaw<{ fingerprint: string; retry_at: string | null }>(
+    `SELECT fingerprint, completed_keys->0->>'retry_at' AS retry_at FROM op_checkpoints WHERE op='connector-rate-limit'`);
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    const at = row.retry_at ? Date.parse(row.retry_at) : NaN;
+    if (Number.isFinite(at) && at > now) out.set(row.fingerprint, at);
+  }
+  return out;
+}
+
 async function dispatchConnectorFreshnessSync(
   queue: MinionQueue,
   src: SourceRow,
   attempted: Set<string> | null,
   activationPending: Awaited<ReturnType<typeof loadActivationPendingSourceIds>>,
-  { intervalMs, now, slot, timeoutMs, jsonMode }: { intervalMs: number; now: number; slot: string; timeoutMs: number; jsonMode: boolean },
+  mismatched: ReadonlyMap<string, ConnectorAccountMismatch>,
+  { intervalMs, now, slot, timeoutMs, jsonMode, rateLimits }: { intervalMs: number; now: number; slot: string; timeoutMs: number; jsonMode: boolean;
+    rateLimits?: ReadonlyMap<string, number> },
 ): Promise<void> {
   if (isSyncDisabledConfig(src.config)) return;
   if (skipActivationPendingSync(activationPending, src.id, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'))) return;
   if (connectorAwaitingFirstSync(src, attempted, jsonMode)) return;
+  const mismatch = mismatched.get(src.id);
+  if (mismatch) {
+    const reason = connectorAccountMismatchSkipWarning(src.id, mismatch);
+    process.stderr.write((jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, code: 'connector_account_changed', reason }) : reason) + '\n');
+    return;
+  }
+  const retryAt = rateLimits?.get(src.id);
+  if (retryAt !== undefined && retryAt > now) {
+    if (!rateLimitNoticePrinted.has(`${src.id}:${retryAt}`)) {
+      rateLimitNoticePrinted.add(`${src.id}:${retryAt}`);
+      const at = new Date(retryAt).toISOString();
+      process.stderr.write((jsonMode ? JSON.stringify({ event: 'freshness_sync_rate_limited', source_id: src.id, retry_at: at })
+        : `[dispatch] ${src.id}: the provider rate-limited the last sync; the next one waits until ${at}`) + '\n');
+    }
+    return;
+  }
   const ageMs = now - (src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0);
-  if (ageMs < intervalMs) return;
+  if (ageMs < connectorSyncIntervalMs(src.config, intervalMs)) return;
   try {
     const job = await queue.add(
       'sync',
@@ -430,7 +703,8 @@ export async function submitAutoDrains(
     return Number.isFinite(n) && n >= 0 ? n : d;
   };
   const threshold = parsePosInt(await engine.getConfig('autopilot.auto_drain.threshold'), 25);
-  const windowSeconds = parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120);
+  const { AI_CHAT_TIMEOUT_MS } = await import('../core/ai/gateway.ts');
+  const bounds = resolveAutopilotAutoDrainBounds(timeoutMs, parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120), AI_CHAT_TIMEOUT_MS);
   const maxUsdPerDay = parseNonNegFloat(await engine.getConfig('autopilot.auto_drain.max_usd_per_day'), 2.0);
   // Each drain attempt runs under one BudgetTracker capped at ~$0.30
   // (cycle.extract_atoms.budget_usd); bound the brain-wide daily attempt
@@ -509,7 +783,7 @@ export async function submitAutoDrains(
       }
       const job = await queue.add(
         'extract-atoms-drain',
-        { sourceId: src.id, window: windowSeconds, ...(kind === 'checkout' ? { repoPath: src.local_path } : {}) },
+        { sourceId: src.id, window: bounds.windowSeconds, ...(kind === 'checkout' ? { repoPath: src.local_path } : {}) },
         {
           queue: 'default',
           idempotency_key: idemKey,
@@ -517,7 +791,7 @@ export async function submitAutoDrains(
           // all-provider-failed batch, so give the queue's
           // backoff a chance (was 1 — dead-lettered instantly).
           max_attempts: 3,
-          timeout_ms: timeoutMs,
+          timeout_ms: bounds.timeoutMs,
         },
         { allowProtectedSubmit: true },
       );
@@ -538,11 +812,11 @@ export async function submitAutoDrains(
   if (next !== pointer) await engine.setConfig(AUTO_DRAIN_NEXT_KIND_KEY, next);
 }
 
-/** The remediation plan autopilot routes on (brain score + doctor/onboard recommendations). */
-async function computeAutopilotPlan(engine: BrainEngine, repoPath: string) {
+/** The remediation plan autopilot routes on (brain score + doctor/onboard recommendations); score null when health is degraded. */
+async function computeAutopilotPlan(engine: BrainEngine, repoPath: string, jsonMode: boolean) {
   const { computeRecommendations, embeddingProviderConfigured, HOSTED_EMBED_KEY_CONFIG, chatApiKeyConfigured } = await import('../core/brain-score-recommendations.ts');
-  // Cheap path: engine.getHealth() is a single SQL count query.
-  const health = await engine.getHealth();
+  const health = await readTickHealth(engine, jsonMode);
+  if (!health) return { health, score: null, plan: [], estTotal: 0 };
   const score = health.brain_score;
   // v0.40.x: recipe-aware embedding-provider check shared with doctor.ts.
   // Resolve the configured model (gateway → DB fallback), then pre-await
@@ -602,5 +876,5 @@ async function computeAutopilotPlan(engine: BrainEngine, repoPath: string) {
   }
   const plan = computeRecommendations(health, ctx, extraRemediations).filter((r) => r.status === 'remediable');
   const estTotal = plan.reduce((s, r) => s + r.est_seconds, 0);
-  return { score, plan, estTotal };
+  return { health, score, plan, estTotal };
 }

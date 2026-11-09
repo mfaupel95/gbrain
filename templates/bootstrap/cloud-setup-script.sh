@@ -5,26 +5,29 @@
 # reused by later sessions). Printed by: gbrain bootstrap cloud-setup-script
 set -eu
 
-# 1. Bun runtime, at least GBrain's minimum (1.4.0; older Bun is refused).
+# 1. Bun runtime, at least GBrain's minimum (1.4.4; older Bun is refused).
 #    Installed VIA npm — bun's own package fetching is proxy-incompatible in
 #    cloud sandboxes; npm's is not. A preinstalled older Bun stays untouched.
+bun_ok() { "$1" -e 'process.exit(Bun.semver.satisfies(Bun.version, ">=1.4.4") ? 0 : 1)'; }
 GBRAIN_BUN=$(command -v bun || true)
-if [ -z "$GBRAIN_BUN" ] || ! "$GBRAIN_BUN" -e 'process.exit(Bun.semver.satisfies(Bun.version, ">=1.4.0") ? 0 : 1)'; then
+if [ -z "$GBRAIN_BUN" ] || ! bun_ok "$GBRAIN_BUN"; then
   npm install -g bun
   GBRAIN_BUN="$(npm prefix -g)/bin/bun"
+  # `gbrain --version` below answers on any Bun, so check the floor here.
+  bun_ok "$GBRAIN_BUN" || { echo "gbrain: the Bun npm installed ($GBRAIN_BUN) did not report 1.4.4 or newer" >&2; exit 1; }
 fi
 export PATH="$(dirname "$GBRAIN_BUN"):$PATH"
 
 # 2. gbrain from the canonical GitHub source. NEVER `npm install -g gbrain`:
 #    the npm registry package with that name is unrelated squatter code.
 GBRAIN_DIR=/opt/gbrain
-# Pinned to latest-stable — the SAME ref the canonical local install uses.
+# Pinned to stable — the SAME ref the canonical local install uses.
 if [ ! -d "$GBRAIN_DIR/.git" ]; then
-  git clone --depth 1 --branch latest-stable https://github.com/garrytan/gbrain "$GBRAIN_DIR"
+  git clone --depth 1 --branch stable https://github.com/garrytan/gbrain "$GBRAIN_DIR"
 else
   # Fail loud (set -e) on a broken update — never npm-install + run stale code
   # as root against a half-updated checkout.
-  git -C "$GBRAIN_DIR" fetch --depth 1 origin latest-stable
+  git -C "$GBRAIN_DIR" fetch --depth 1 origin stable
   git -C "$GBRAIN_DIR" checkout -q FETCH_HEAD
 fi
 cd "$GBRAIN_DIR"

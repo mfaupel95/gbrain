@@ -63,10 +63,29 @@ export function inertBlock(value: unknown, max = 1500): string {
   return s;
 }
 
-/** Production client: REST with GH_TOKEN/GITHUB_TOKEN (Actions), else the authenticated `gh api` CLI (local dry runs). */
-export function restClient(repo: string, token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN): GitHubClient {
+/** Delays before each retry of a GET that failed with a 5xx (GitHub's transient 502/503/504) or got no response at all; a 4xx fails at once and writes are never retried. */
+export const GET_RETRY_DELAYS_MS = [1_000, 3_000, 9_000];
+
+async function retryingGet<T>(method: string, sleep: (ms: number) => Promise<unknown>, call: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (e) {
+      const { status, network } = e as { status?: number; network?: boolean };
+      if (method !== 'GET' || !((status ?? 0) >= 500 || network) || attempt >= GET_RETRY_DELAYS_MS.length) throw e;
+      await sleep(GET_RETRY_DELAYS_MS[attempt]!);
+    }
+  }
+}
+
+/** Production client: REST with GH_TOKEN/GITHUB_TOKEN (Actions), else the authenticated `gh api` CLI (local dry runs); a GET that fails with a 5xx is retried per GET_RETRY_DELAYS_MS. */
+export function restClient(repo: string, token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN, sleep: (ms: number) => Promise<unknown> = Bun.sleep): GitHubClient {
   const resolve = (path: string) => path.replace('{repo}', repo).replace(/^\//, '');
-  if (!token) return ghCliClient(resolve);
+  const client = token ? tokenClient(resolve, token) : ghCliClient(resolve);
+  return { ...client, request: <T>(method: 'GET' | 'POST' | 'PATCH', path: string, body?: unknown) => retryingGet(method, sleep, () => client.request<T>(method, path, body)) };
+}
+
+function tokenClient(resolve: (path: string) => string, token: string): GitHubClient {
   return {
     async request<T>(method: 'GET' | 'POST' | 'PATCH', path: string, body?: unknown): Promise<T> {
       const url = `https://api.github.com/${resolve(path)}`;
@@ -79,6 +98,8 @@ export function restClient(repo: string, token = process.env.GH_TOKEN || process
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
+      }).catch((e: unknown) => {
+        throw Object.assign(new Error(`GitHub API ${method} ${url} -> no response: ${e instanceof Error ? e.message : String(e)}`), { network: true });
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -91,7 +112,12 @@ export function restClient(repo: string, token = process.env.GH_TOKEN || process
       const res = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json' }, redirect: 'manual' });
       const location = res.headers.get('location');
       const body = location ? await fetch(location) : res;
-      if (!body.ok) throw Object.assign(new Error(`GitHub download ${url} -> ${body.status}`), { status: body.status });
+      if (!body.ok) {
+        const text = await body.text().catch(() => '');
+        if (location) throw new Error(`GitHub download ${url} -> artifact storage answered ${body.status}: ${text.slice(0, 300)}`);
+        const rateLimited = body.headers.get('x-ratelimit-remaining') === '0' || body.headers.has('retry-after');
+        throw Object.assign(new Error(`GitHub download ${url} -> ${body.status}: ${text.slice(0, 300)}`), { status: body.status, rateLimited });
+      }
       return new Uint8Array(await body.arrayBuffer());
     },
   };
@@ -112,7 +138,11 @@ function ghCliClient(resolve: (path: string) => string): GitHubClient {
     },
     async download(path: string): Promise<Uint8Array> {
       const r = Bun.spawnSync(['gh', 'api', resolve(path)], { stdout: 'pipe', stderr: 'pipe' });
-      if (r.exitCode !== 0) throw new Error(`gh api ${resolve(path)} failed: ${r.stderr.toString().slice(0, 300)}. Fix: gh auth login, or export GH_TOKEN.`);
+      if (r.exitCode !== 0) {
+        const err = r.stderr.toString();
+        const status = Number(/HTTP (\d{3})/.exec(err)?.[1]) || undefined;
+        throw Object.assign(new Error(`gh api ${resolve(path)} failed: ${err.slice(0, 300)}. Fix: gh auth login, or export GH_TOKEN.`), { status });
+      }
       return new Uint8Array(r.stdout);
     },
   };
@@ -239,18 +269,28 @@ export function readZipEntry(zip: Uint8Array, name: string): Uint8Array | undefi
   return undefined;
 }
 
-/** One JSON file from a run's named artifact; `reason` says why it could not be read (missing, expired, unreadable). */
-export async function fetchArtifactJson(client: GitHubClient, runId: number, artifact: string, file: string): Promise<{ value?: unknown; reason?: string }> {
+/** One JSON file from a run's named artifact; `reason` says why it could not be read (missing, expired, unreadable), and `transient` marks a failed request that a later read may get past: no response, a 5xx, a 429, a rate-limit 403 (by its headers, or its text naming a rate limit or abuse detection) or a refusal from the artifact storage the download redirects to (a fresh read mints a new signed URL), never another 4xx such as a 403 or an expired artifact's 410. */
+export async function fetchArtifactJson(client: GitHubClient, runId: number, artifact: string, file: string): Promise<{ value?: unknown; reason?: string; transient?: boolean }> {
   if (!client.download) return { reason: 'this client cannot download artifacts' };
+  const failed = (e: unknown) => `reading run ${runId}'s '${artifact}' artifact failed: ${e instanceof Error ? e.message : String(e)}`;
+  let zip: Uint8Array;
   try {
     const list = await client.request<{ artifacts: Array<{ id: number; name: string; expired: boolean }> }>('GET', `repos/{repo}/actions/runs/${runId}/artifacts?name=${encodeURIComponent(artifact)}&per_page=10`);
     const found = list.artifacts.find(a => a.name === artifact);
     if (!found) return { reason: `run ${runId} has no '${artifact}' artifact` };
     if (found.expired) return { reason: `run ${runId}'s '${artifact}' artifact has expired` };
-    const bytes = readZipEntry(await client.download(`repos/{repo}/actions/artifacts/${found.id}/zip`), file);
+    zip = await client.download(`repos/{repo}/actions/artifacts/${found.id}/zip`);
+  } catch (e) {
+    const status = (e as { status?: number }).status ?? 0;
+    const rateLimited = status === 403 && ((e as { rateLimited?: boolean }).rateLimited || /rate limit|abuse detection/i.test(e instanceof Error ? e.message : ''));
+    const permanent = status >= 400 && status < 500 && status !== 429 && !rateLimited;
+    return permanent ? { reason: failed(e) } : { reason: failed(e), transient: true };
+  }
+  try {
+    const bytes = readZipEntry(zip, file);
     if (!bytes) return { reason: `run ${runId}'s '${artifact}' artifact has no readable ${file}` };
     return { value: JSON.parse(new TextDecoder().decode(bytes)) };
   } catch (e) {
-    return { reason: `reading run ${runId}'s '${artifact}' artifact failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { reason: failed(e) };
   }
 }

@@ -1,5 +1,6 @@
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { opError, OperationError } from '../ops/contract.ts';
+import { readPersistenceBrain } from './managed-mode.ts';
 
 const declared = new WeakSet<object>();
 /**
@@ -31,12 +32,30 @@ export async function declarePersistenceProtocol(tx: SqlEngine): Promise<void> {
  * under that lock timeout. Later `declarePersistenceProtocol` calls on the
  * same transaction engine are free.
  */
-/** Returns the brain id read under that lock (null when the row is missing). */
-export async function declareDurablePersistence(tx: SqlEngine, lockTimeout = '1s', statementTimeout = '5s'): Promise<string | null> {
-  const [row] = await tx.executeRaw<{ brain: string | null }>(`SELECT set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true),
-    set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),${BRAIN_SHARE}`, [lockTimeout, statementTimeout]);
+/**
+ * Returns the brain id read under that lock (null when the row is missing). `idleInTransaction` also sets a
+ * transaction-local idle bound in the same statement, first (a publication's, publication-deadline.ts).
+ */
+export async function declareDurablePersistence(tx: SqlEngine, lockTimeout = '1s', statementTimeout = '5s', idleInTransaction?: string): Promise<string | null> {
+  const idle = idleInTransaction === undefined ? '' : "set_config('idle_in_transaction_session_timeout',$3,true),";
+  const [row] = await tx.executeRaw<{ brain: string | null }>(`SELECT ${idle}set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true),
+    set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),${BRAIN_SHARE}`,
+    idleInTransaction === undefined ? [lockTimeout, statementTimeout] : [lockTimeout, statementTimeout, idleInTransaction]);
   if ((tx as { _pageTransaction?: boolean })._pageTransaction === true) declared.add(tx);
   return row?.brain ?? null;
+}
+
+const LOCAL_SETTING = String.raw`set_config\('[a-z_.]+',(?:\$\d+|'[^']*'),true\)`;
+const DECLARATION = new RegExp(`^SELECT ${LOCAL_SETTING}(?:,\\s*${LOCAL_SETTING})*(?:,\\s*${BRAIN_SHARE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})?$`);
+/**
+ * GBRA-156: whether `statement` is a declaration this module sends: one SELECT of transaction-local set_config calls,
+ * optionally with the brain row FOR SHARE. Run outside a transaction it changes nothing (a local setting ends with its
+ * statement, and so does the share lock), so a transaction whose first statement it is may send it before BEGIN's
+ * answer (`TransactionOptions.pipelineFirst`): if BEGIN fails, only this statement runs, in autocommit. It accepts no
+ * other text, writes included, and nothing containing `;` (a simple-protocol query may hold several statements).
+ */
+export function isPersistenceDeclaration(statement: string): boolean {
+  return !statement.includes(';') && DECLARATION.test(statement.trim());
 }
 
 export const PERSISTENCE_PROTOCOL_PREDICATE = "set_config('gbrain.persistence_protocol','2',true)='2'";
@@ -49,9 +68,8 @@ export function assertMutationProtocol(row: Pick<WriteRequest, 'target_kind' | '
 }
 
 export async function assertSharedSkillPersistence(engine: SqlEngine, sourceId?: string): Promise<void> {
-  const [brain] = await engine.executeRaw<{ enabled: boolean; skill_bundles_enabled: boolean; writer_protocol_floor: number }>(
-    'SELECT enabled,skill_bundles_enabled,writer_protocol_floor FROM persistence_brain WHERE singleton=1');
-  if (!brain?.enabled || !brain.skill_bundles_enabled || brain.writer_protocol_floor !== 2) {
+  const brain = await readPersistenceBrain(engine);
+  if (!brain.enabled || !brain.skill_bundles_enabled || brain.writer_protocol_floor !== 2) {
     throw new OperationError('writer_not_quiesced', 'Shared skill publication requires an activated protocol-2 canonical owner.',
       'Stop older writers and direct-file skill servers, then activate shared skill persistence on the canonical host.');
   }

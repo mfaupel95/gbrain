@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';
 import { acquireBootstrapLock } from '../bootstrap/lock.ts';
 import { claudeUserMcpConfigPath, codexConfigPath, opencodeGlobalConfigPath, opencodeGlobalSiblingPath, CODEX_TOML_BLOCK_BEGIN } from '../bootstrap/host-specs.ts';
-import { writeCodexHttpServerBlock, removeCodexHttpServerBlock } from '../bootstrap/codex-toml.ts';
+import { writeCodexHttpServerBlock, removeCodexHttpServerBlock, codexToolPolicy, codexToolsOutsideBlock } from '../bootstrap/codex-toml.ts';
 import { writeOpencodeMcpEntry, removeOpencodeMcpEntry, parseOpencodeConfig } from '../bootstrap/opencode-json.ts';
 import { renderAgentLauncher } from '../agent-install/launcher.ts';
 import { isValidName, shellQuote } from '../mcp-registration.ts';
@@ -18,9 +18,21 @@ import { assertNoSymlinks, checkedRoot, confinedPath, sha256, privateWrite } fro
 import { installSharedSkillsConnection } from './shared-skills.ts';
 import type { SharedSkillsToolCaller } from '../shared-skills/adapter.ts';
 import { harnessSharedSkillsRoot } from './status.ts';
+import { gitChildEnv } from '../git-env.ts';
+import { installerTurnHook, turnHookFix } from '../setup/turn-hook-check.ts';
+import type { TurnHookPaths } from '../setup/turn-hook.ts';
+import { resolveGbrainBin } from '../gbrain-bin.ts';
+import { brainFirstTargetAt, codexInstructionFile, installerBrainFirst, readBrainFirstLedger, renderBrainFirstSnippet, resolveBrainFirstDecision, type BrainFirstHarness } from '../setup/brain-first.ts';
+import { indexLauncher, inspectSkillsBlock, installerSkillsBlock, isSkillLoading, renderSkillsSnippet, resolveSkillLoading, skillsOutcomeFailed, type SkillLoading, type SkillsBlockOutcome } from '../setup/skills-block.ts';
 
 export interface InstallOptions { harness: string; name?: string; root?: string; configPath?: string; remove?: boolean;
-  sharedSkills?: HarnessCredentials['shared_skills']; toolCaller?: SharedSkillsToolCaller; nativeSkillsDir?: string; credentialsFile?: string; freshToken?: boolean }
+  sharedSkills?: HarnessCredentials['shared_skills']; toolCaller?: SharedSkillsToolCaller; nativeSkillsDir?: string; credentialsFile?: string; freshToken?: boolean;
+  /** false: opt out of the brain-first instruction block (removes an existing one); true: opt back in. */
+  instructions?: boolean;
+  /** The spring-loaded skills index beside the brain-first block (off by default; GBRAIN_SKILL_LOADING and the recorded choice apply). */
+  skillLoading?: SkillLoading;
+  /** The absolute gbrain the native-config index names (default: this gbrain, else the one on PATH). */
+  gbrainBin?: string }
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const readJson = (path: string): Record<string, any> => {
   assertNoSymlinks(path);
@@ -46,7 +58,7 @@ function nativeEntry(path: string, format: string, name: string): unknown {
 /** The Git working tree whose next commit would include `path`, or null when it is ignored or outside every tree. */
 function committingGitTree(path: string): string | null {
   const git = (args: string[]) => execFileSync('git', ['-C', dirname(path), ...args],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV } }).trim();
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }) }).trim();
   let tree: string;
   try { tree = git(['rev-parse', '--show-toplevel']); } catch { return null; }
   try { git(['check-ignore', '-q', '--', path]); return null; } catch { return tree; }
@@ -73,8 +85,37 @@ export function inlineTokenReceipt(c: HarnessCredentials, harness: string, name:
   };
 }
 
-function assertEntryOwned(entry: unknown, prior: Record<string, any>) {
-  if (entry !== undefined && (!prior.client_id || ![prior.entry_hash, prior.pending_entry_hash].includes(hash(entry)))) throw new Error('configuration_conflict: refusing to replace an unowned or edited MCP entry');
+/**
+ * #6799: the hash gbrain owns a native entry by. A Codex entry's `tools` table
+ * holds Codex's own per-tool settings ("always allow"), so it is left out;
+ * every other key, including any unexpected one, stays covered.
+ */
+function ownedEntryHash(entry: unknown, connection: string): string {
+  if (connection !== 'codex-toml' || !entry || typeof entry !== 'object' || codexToolPolicy((entry as Record<string, unknown>).tools) === null) return hash(entry);
+  const { tools: _tools, ...owned } = entry as Record<string, unknown>;
+  return hash(owned);
+}
+
+/** Owned when the receipt recorded either hash: the current one or the whole-entry hash older installs wrote. */
+function assertEntryOwned(entry: unknown, prior: Record<string, any>, connection: string) {
+  if (entry === undefined) return;
+  const recorded = [prior.entry_hash, prior.pending_entry_hash];
+  if (!prior.client_id || ![hash(entry), ownedEntryHash(entry, connection)].some(h => recorded.includes(h))) throw new Error('configuration_conflict: refusing to replace an unowned or edited MCP entry');
+}
+
+/** The harness's own instruction file, next to the config this install writes. */
+function instructionFileBeside(connection: string, configPath: string): { harness: BrainFirstHarness; path: string } {
+  const dir = dirname(configPath);
+  if (connection === 'codex-toml') return { harness: 'codex', path: codexInstructionFile(join(dir, 'AGENTS.override.md'), join(dir, 'AGENTS.md')) };
+  if (connection === 'opencode-json') return { harness: 'opencode', path: join(dir, 'AGENTS.md') };
+  return { harness: 'claude-code', path: process.env.CLAUDE_CONFIG_DIR?.trim() === dir ? join(dir, 'CLAUDE.md') : join(dir, '.claude', 'CLAUDE.md') };
+}
+
+/** The per-turn hook files next to a config this install was pointed at (tests, a non-default config). */
+function turnHookPathsBeside(connection: string, configPath: string): TurnHookPaths {
+  const dir = dirname(configPath);
+  if (connection === 'codex-toml') return { codexHooks: join(dir, 'hooks.json'), codexConfig: configPath };
+  return { claudeSettings: process.env.CLAUDE_CONFIG_DIR?.trim() === dir ? join(dir, 'settings.json') : join(dir, '.claude', 'settings.json') };
 }
 
 /** Install only in the current environment. Foreign entries are never adopted. */
@@ -113,7 +154,11 @@ export async function installHarnessConnection(c: HarnessCredentials, opts: Inst
     const prior = readJson(receiptPath);
     if (prior.client_id && (prior.client_id !== c.client_id || prior.mcp_url !== c.mcp_url)) throw new Error('configuration_conflict: connection name belongs to another client');
     const before = nativeEntry(configPath, adapter.connection, name);
-    assertEntryOwned(before, prior);
+    assertEntryOwned(before, prior, adapter.connection);
+    if (opts.remove && adapter.connection === 'codex-toml' && existsSync(configPath)) {
+      const orphaned = codexToolsOutsideBlock(readFileSync(configPath, 'utf8'), name);
+      if (orphaned.length) throw new Error(`configuration_conflict: Codex tool settings for ${orphaned.join(', ')} ([mcp_servers.${name}.tools.*]) sit outside the gbrain-managed block; removing the server would leave them without one. Delete those tables in ${configPath}, then re-run.`);
+    }
     if (adapter.connection === 'opencode-json') {
       const sibling = opencodeGlobalSiblingPath(configPath);
       if (sibling && nativeEntry(sibling, adapter.connection, name) !== undefined) throw new Error('configuration_conflict: same-name entry in sibling opencode config; preserve it and choose one explicit configuration before installing');
@@ -122,7 +167,7 @@ export async function installHarnessConnection(c: HarnessCredentials, opts: Inst
     const entry = adapter.connection === 'codex-toml' ? { url: c.mcp_url, http_headers: { Authorization: `Bearer ${token}` } }
       : adapter.connection === 'opencode-json' ? { type: 'remote', url: c.mcp_url, headers: { Authorization: `Bearer ${token}` }, enabled: true }
         : { type: 'http', url: c.mcp_url, headers: { Authorization: `Bearer ${token}` } };
-    if (!opts.remove) atomicWriteTextFile(receiptPath, `${JSON.stringify({ ...prior, ...common, status: 'prepared', entry_hash: before === undefined ? null : hash(before), pending_entry_hash: hash(entry), config_path: configPath })}\n`, { forceMode: 0o600 });
+    if (!opts.remove) atomicWriteTextFile(receiptPath, `${JSON.stringify({ ...prior, ...common, status: 'prepared', entry_hash: before === undefined ? null : ownedEntryHash(before, adapter.connection), pending_entry_hash: hash(entry), config_path: configPath })}\n`, { forceMode: 0o600 });
     if (adapter.connection === 'codex-toml') {
       if (opts.remove) removeCodexHttpServerBlock(configPath, name);
       else writeCodexHttpServerBlock(configPath, { name, url: c.mcp_url, bearerToken: token });
@@ -142,19 +187,33 @@ export async function installHarnessConnection(c: HarnessCredentials, opts: Inst
       config.mcpServers = servers;
       atomicWriteTextFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { forceMode: 0o600 });
     }
+    const beside = instructionFileBeside(adapter.connection, configPath);
+    const instructions = installerBrainFirst({ target: brainFirstTargetAt(beside.harness, beside.path), access: { kind: 'mcp', server: name },
+      writer: `gbrain connect --harness ${adapter.id} --install`, instructions: opts.instructions, remove: opts.remove });
+    const keptForOther = opts.remove && readBrainFirstLedger().some((b) => b.harness === beside.harness && b.path === beside.path && b.status === 'installed' && b.access.kind === 'mcp' && b.access.server !== name);
+    const skills = keptForOther
+      ? { harness: beside.harness, path: beside.path, decision: { value: 'off', source: 'flag' }, action: 'skip', state_before: inspectSkillsBlock(beside.path).state, detail: `the skills index in ${beside.path} sits beside another connection's brain-first block, so removing \`${name}\` leaves it` } satisfies SkillsBlockOutcome
+      : installerSkillsBlock({ target: brainFirstTargetAt(beside.harness, beside.path), launcher: opts.gbrainBin ?? indexLauncher() ?? 'gbrain',
+      writer: `gbrain connect --harness ${adapter.id} --install`, brainFirstDeclined: instructions.decision.value === 'declined', skillLoading: opts.skillLoading, audience: 'downstream', remove: opts.remove });
+    const skillsFailed = skillsOutcomeFailed(skills) ? { skills_failed: true } : {};
+    const turn = installerTurnHook({ harness: beside.harness, accepted: !opts.remove && instructions.decision.value === 'accepted' && instructions.action !== 'preserve',
+      gbrainBin: resolveGbrainBin(), gbrainHome: process.env.GBRAIN_HOME?.trim() || undefined, paths: opts.configPath ? turnHookPathsBeside(adapter.connection, configPath) : undefined,
+      rerun: `gbrain setup ${beside.harness} --instructions-only` });
+    const turn_hook = { ...turn.outcome, ...(turn.verdict ? { check: turn.verdict } : {}),
+      ...(turn.verdict && !turn.verdict.ok ? { error: { code: 'turn_hook_not_loaded', reason: turn.verdict.reason, message: turn.verdict.message, fix: turnHookFix(beside.harness, ['gbrain', 'setup', beside.harness, '--instructions-only']) } } : {}) };
     if (opts.remove) {
       if (existsSync(receiptPath)) unlinkSync(receiptPath);
       const shared_skills = deactivated ?? await installSharedSkillsConnection(c, { ...opts, root: join(dirname(configPath), `.gbrain-${adapter.id}-${name}`) });
       const pending = 'remote_membership_pending' in shared_skills && shared_skills.remote_membership_pending === true;
-      return { ...common, status: 'removed', config_path: configPath, shared_skills, remote_membership_pending: pending,
+      return { ...common, status: 'removed', config_path: configPath, shared_skills, remote_membership_pending: pending, instructions, skills, turn_hook, ...skillsFailed,
         next_action: pending ? 'Local configuration and unchanged owned skills were removed. Remote membership deactivation remains pending; retry when host authority is available.'
           : 'The client configuration was removed. Revoke the grant on the brain host if access should end.' };
     }
-    const nextReceipt = { ...common, entry_hash: hash(nativeEntry(configPath, adapter.connection, name)), status: 'installed',
+    const nextReceipt = { ...common, entry_hash: ownedEntryHash(nativeEntry(configPath, adapter.connection, name), adapter.connection), status: 'installed',
       ...inlineTokenReceipt(c, adapter.id, name, configPath, adapter.reload, opts.credentialsFile) };
     atomicWriteTextFile(receiptPath, `${JSON.stringify(nextReceipt, null, 2)}\n`, { forceMode: 0o600 });
     const shared_skills = deactivated ?? await installSharedSkillsConnection(c, { ...opts, root: join(dirname(configPath), `.gbrain-${adapter.id}-${name}`) });
-    return { ...nextReceipt, shared_skills, remote_membership_pending: 'remote_membership_pending' in shared_skills && shared_skills.remote_membership_pending === true };
+    return { ...nextReceipt, shared_skills, instructions, skills, turn_hook, remote_membership_pending: 'remote_membership_pending' in shared_skills && shared_skills.remote_membership_pending === true, ...skillsFailed };
   } finally { lock.release(); }
 }
 
@@ -181,11 +240,16 @@ async function installThinClient(c: HarnessCredentials, opts: InstallOptions, co
       oauth_client_id: c.client_id, oauth_client_secret: c.client_secret } };
     const sourceCli = fileURLToPath(new URL('../../cli.ts', import.meta.url));
     const launcher = join(root, 'bin', 'gbrain');
+    const brainFirst = resolveBrainFirstDecision(opts.instructions, prior.brain_first_instructions === 'declined' ? { status: 'declined' } : undefined).value;
+    const skillLoading = opts.remove || brainFirst === 'declined' ? 'off' : resolveSkillLoading(opts.skillLoading, isSkillLoading(prior.skill_loading) ? { mode: prior.skill_loading } : undefined).value;
+    const rerun = `gbrain connect ${shellQuote(c.mcp_url)} --harness ${shellQuote(opts.harness)} --credentials-file <private-handoff-file> --root ${shellQuote(root)} --install`;
+    const skillsIndex = skillLoading === 'spring' ? renderSkillsSnippet(opts.harness, launcher, 'downstream', { refresh: rerun, optOut: `${rerun} --skill-loading off` }) : '';
+    const instructionsHead = `${brainFirst === 'declined' ? '' : renderBrainFirstSnippet(opts.harness, { kind: 'cli', launcher }, 're-run gbrain connect with --no-instructions')}${skillsIndex}`;
     const files = [
       { path: '.gbrain/config.json', text: `${JSON.stringify(config, null, 2)}\n`, mode: 0o600 },
       { path: 'bin/gbrain', text: renderAgentLauncher({ root, bunPath: process.execPath, cliPath: sourceCli.includes('$bunfs') ? undefined : sourceCli, mode: 'thin-client',
         repairHint: `Reinstall GBrain in this environment, then repeat: gbrain connect ${shellQuote(c.mcp_url)} --harness ${shellQuote(opts.harness)} --credentials-file <private-handoff-file> --root ${shellQuote(root)} --install` }), mode: 0o700 },
-      { path: 'GBRAIN-INSTRUCTIONS.md', text: `${GBRAIN_MCP_INSTRUCTIONS}\n\nRun commands with the absolute launcher: ${launcher}\nThis is a hosted connection. The host grant controls sources and permissions.\n`, mode: 0o600 },
+      { path: 'GBRAIN-INSTRUCTIONS.md', text: `${instructionsHead ? `${instructionsHead}\n` : ''}${GBRAIN_MCP_INSTRUCTIONS}\n\nRun commands with the absolute launcher: ${launcher}\nThis is a hosted connection. The host grant controls sources and permissions.\n`, mode: 0o600 },
     ];
     const owned: Record<string, string> = prior.owned_files ?? {};
     const pending: Record<string, { before: string | null; after: string }> = prior.pending_files ?? {};
@@ -199,7 +263,7 @@ async function installThinClient(c: HarnessCredentials, opts: InstallOptions, co
       privateWrite(receiptPath, `${JSON.stringify({ ...common, root, status: 'removed', owned_files: {} }, null, 2)}\n`);
       return { ...common, status: 'removed', root, next_action: 'Disable the native skill and routine. Revoke the client on the host to end access; separately protect or remove retained handoff files.' };
     }
-    const receipt = { ...common, root, launcher, config_path: configPath, status: 'prepared', native_instructions: 'pending', owned_files: owned, pending_files: pending };
+    const receipt = { ...common, root, launcher, config_path: configPath, status: 'prepared', native_instructions: 'pending', brain_first_instructions: brainFirst, skill_loading: skillLoading, owned_files: owned, pending_files: pending };
     const save = () => privateWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
     save();
     for (const file of files) {

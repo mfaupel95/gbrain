@@ -58,6 +58,7 @@ export {
 import { pagesOperations } from './ops/pages.ts';
 import { persistenceOperations } from './ops/persistence.ts';
 import { searchOperations } from './ops/search.ts';
+import { searchExactOperations } from './ops/search-exact.ts';
 import { takesOperations } from './ops/takes.ts';
 import { tagsOperations } from './ops/tags.ts';
 import { linksOperations } from './ops/links.ts';
@@ -84,11 +85,13 @@ import { brainMembershipOperations } from './ops/brain-membership.ts';
 import { syncStatusOperations } from './ops/sync-status.ts';
 import { rawDataOperations } from './ops/raw-data.ts';
 import { chunksOperations } from './ops/chunks.ts';
+import { whoisOperations } from './ops/whois.ts';
 import { ingestLogOperations } from './ops/ingest-log.ts';
 import { usageOperations } from './ops/usage.ts';
 import { filesOperations } from './ops/files.ts';
 import { jobsOperations } from './ops/jobs.ts';
 import { orphansOperations } from './ops/orphans.ts';
+import { graphRankOperations } from './ops/graph-rank.ts';
 import { calibrationOperations } from './ops/calibration.ts';
 import { salienceOperations } from './ops/salience.ts';
 
@@ -107,6 +110,7 @@ import { transcriptsOperations } from './ops/transcripts.ts';
 import { connectorsOperations } from './ops/connectors.ts';
 import { sourcesOperations } from './ops/sources.ts';
 import { factsOperations } from './ops/facts.ts';
+import { qmMemoryOperations } from './ops/qm-memory.ts';
 import { purgeOperations } from './ops/purge.ts';
 import { codeIntelOperations } from './ops/code-intel.ts';
 import { embeddingMigrationOperations } from './ops/embedding-migration.ts';
@@ -114,15 +118,21 @@ import { imageOperations } from './ops/image.ts';
 import { schemaPacksOperations } from './ops/schema-packs.ts';
 import { skilloptOperations } from './ops/skillopt.ts';
 import { loopsOperations } from './ops/loops.ts';
+import { questionsOperations } from './ops/questions.ts';
 import { chronicleOperations } from './ops/chronicle.ts';
 import { extractionOperations } from './ops/extraction.ts';
 import { entityIdentityOperations } from './ops/entity-identity.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
 import { noticesOperations } from './ops/notices.ts';
+import { memorySettingsOperations } from './ops/memory-settings.ts';
 import { pageEditOperations } from './ops/page-edit.ts';
+import { pageAppendOperations } from './ops/page-append.ts';
 import { pageBatchOperations } from './ops/page-batch.ts';
+import { pageUploadOperations } from './ops/page-upload.ts';
 import { feedbackOperations } from './ops/feedback.ts';
 import { trustOperations } from './ops/trust.ts';
+import { wakeshiftOperations } from './ops/wakeshift.ts';
+import { findPagesOperations } from './ops/find-pages.ts';
 
 // parseTtlParam moved to ops/facts.ts with the facts cluster; the `remember`
 // verb (verbs.ts) loads it from THIS module at runtime — re-exported so every
@@ -140,10 +150,10 @@ export const operations: Operation[] = [
   ...verbOperations,
   // Page CRUD (get_page, put_page, delete_page, list_pages + the v0.26.5
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
-  ...pagesOperations, ...pageEditOperations, ...pageBatchOperations,
+  ...pagesOperations, ...findPagesOperations, ...pageEditOperations, ...pageAppendOperations, ...pageBatchOperations, ...pageUploadOperations,
   ...persistenceOperations,
-  // Search (search, query) — ops/search.ts
-  ...searchOperations,
+  // Search (search, query) — ops/search.ts; search_exact — ops/search-exact.ts
+  ...searchOperations, ...searchExactOperations,
   ...feedbackOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
   ...imageOperations,
@@ -165,8 +175,8 @@ export const operations: Operation[] = [
   ...syncStatusOperations,
   // Raw data (put_raw_data, get_raw_data) — ops/raw-data.ts
   ...rawDataOperations,
-  // Resolution & chunks (resolve_slugs, get_chunks) — ops/chunks.ts
-  ...chunksOperations,
+  // Resolution & chunks (resolve_slugs, get_chunks) — ops/chunks.ts; whois — ops/whois.ts
+  ...chunksOperations, ...whoisOperations,
   // Ingest log (log_ingest, get_ingest_log) — ops/ingest-log.ts
   ...ingestLogOperations,
   // Usage accounting (get_usage, #4218) — ops/usage.ts
@@ -175,10 +185,10 @@ export const operations: Operation[] = [
   ...filesOperations,
   // Jobs (Minions: submit_job, get_job, list_jobs, cancel_job, retry_job,
   // get_job_progress, pause_job, resume_job, replay_job, send_job_message)
-  // + v0.38 Slice 3 agent lane (submit_agent, get_agent_job) — ops/jobs.ts
-  ...jobsOperations,
-  // Orphans (find_orphans) — ops/orphans.ts
-  ...orphansOperations,
+  // + v0.38 Slice 3 agent lane (submit_agent, get_agent_job) — ops/jobs.ts; Wakeshift watches (watch_job, list_watches, unwatch) — ops/wakeshift.ts
+  ...jobsOperations, ...wakeshiftOperations,
+  // Orphans (find_orphans) — ops/orphans.ts; rank_entities — ops/graph-rank.ts
+  ...orphansOperations, ...graphRankOperations,
   // v0.36.1.0 (T7) — Hindsight calibration wave (get_calibration_profile) —
   // ops/calibration.ts
   ...calibrationOperations,
@@ -206,7 +216,7 @@ export const operations: Operation[] = [
   ...entityIdentityOperations,
   // v0.31: hot memory (extract_facts, recall, context_pack, delta,
   // forget_fact) — ops/facts.ts
-  ...factsOperations, ...purgeOperations,
+  ...factsOperations, ...purgeOperations, ...qmMemoryOperations, ...memorySettingsOperations, // + GST-359 QM memory pair — ops/qm-memory.ts; GBRA-219 memory settings — ops/memory-settings.ts
   // v0.32.6: contradiction probe MCP surface (M3) — ops/insights.ts
   find_contradictions,
   // v0.33: expertise + relationship-proximity routing — ops/insights.ts
@@ -226,7 +236,7 @@ export const operations: Operation[] = [
   // v0.41.18.0 run_onboard + v0.41.20.0 run_skillopt — ops/skillopt.ts
   ...skilloptOperations,
   // v0.47: open-loop engine (who is waiting on you) — ops/loops.ts
-  ...loopsOperations, ...noticesOperations, // + agent contract v1 A6 mute_notice — ops/notices.ts
+  ...loopsOperations, ...questionsOperations, ...noticesOperations, // + agent contract v1 A6 mute_notice — ops/notices.ts
 ];
 
 // Area taxonomy + output redaction: one finalize step shared with the CLI's

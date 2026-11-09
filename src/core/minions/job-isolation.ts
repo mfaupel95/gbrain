@@ -35,12 +35,15 @@
 
 import { accessSync, constants, readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from '../spawn.ts';
 import { JobDeferredError, UnrecoverableError } from './types.ts';
+import { JobRefusedError, type JobRefusal } from './errors.ts';
+import { jobRefusal } from './refusal.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
 import { SpendGroupRefusedError, type SpendRefusalEnvelope } from './spend-authorization.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
-import { basename, delimiter, resolve } from 'node:path';
+import { basename, delimiter, resolve, win32 } from 'node:path';
+import { readProcessRss } from './proc-rss.ts';
 
 /** Grace between group-SIGTERM and group-SIGKILL on abort. Deliberately
  *  inside the worker's 30s force-evict window so the evict path stays a
@@ -91,7 +94,7 @@ export function childConfigurationError(reason: typeof CHILD_CONFIGURATION_REASO
   return new LocalConfigurationError(reason, `${messages[reason]} Verify worker and child readiness, then restart. See docs/guides/minions-fix.md#configuration-blocked.`);
 }
 
-export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
+export type ChildErrorKind = 'unrecoverable' | 'refused' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
 
 export type ChildOutcome =
   | { outcome: 'success'; result: unknown }
@@ -104,6 +107,8 @@ export type ChildOutcome =
       /** A group spend refusal's envelope (code, fix, group amounts). */
       spend?: SpendRefusalEnvelope;
       deferral?: { reason: string; retryInMs: number };
+      /** #7239: a deterministic refusal (refusal.ts), rebuilt as JobRefusedError on the worker side. */
+      refusal?: JobRefusal;
       protocolVersion?: number;
       reasonCode?: typeof CHILD_CONFIGURATION_REASONS[number];
     };
@@ -129,6 +134,7 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
   if (err instanceof JobDeferredError) {
     return { outcome: 'error', errorKind: 'deferred', message: err.message, deferral: { reason: err.reason, retryInMs: err.retryInMs } };
   }
+  if (err instanceof JobRefusedError) return { outcome: 'error', errorKind: 'refused', message: err.message, refusal: err.refusal };
   if (err instanceof UnrecoverableError) {
     return {
       outcome: 'error',
@@ -138,6 +144,8 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       ...(err instanceof SpendGroupRefusedError ? { spend: err.envelope } : {}),
     };
   }
+  const refusal = jobRefusal(err);
+  if (refusal) return { outcome: 'error', errorKind: 'refused', message: refusal.message, refusal };
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   return { outcome: 'error', errorKind: 'generic', message, ...(stack ? { stack } : {}) };
@@ -156,6 +164,7 @@ export function reconstructHandlerError(o: Extract<ChildOutcome, { outcome: 'err
   if (o.errorKind === 'rate_lease' && o.lease) {
     return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max, o.lease.retryInMs);
   }
+  if (o.errorKind === 'refused' && o.refusal) return new JobRefusedError(o.refusal);
   if (o.errorKind === 'unrecoverable') {
     return o.spend ? new SpendGroupRefusedError(o.spend) : new UnrecoverableError(o.message);
   }
@@ -221,8 +230,13 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
     // policy as the errorKind whitelist.
     const rawDeferral = (o as { deferral?: unknown }).deferral as { reason?: unknown; retryInMs?: unknown } | undefined;
     const deferralValid = rawDeferral != null && typeof rawDeferral.reason === 'string' && Number.isFinite(rawDeferral.retryInMs as number);
+    const rawRefusal = (o as { refusal?: unknown }).refusal as { code?: unknown; reason?: unknown; message?: unknown; fix?: unknown; docs_cmd?: unknown } | undefined;
+    const refusalValid = rawRefusal != null && typeof rawRefusal === 'object' && typeof rawRefusal.code === 'string' && typeof rawRefusal.message === 'string'
+      && (rawRefusal.reason === undefined || typeof rawRefusal.reason === 'string')
+      && Array.isArray(rawRefusal.docs_cmd) && rawRefusal.docs_cmd.every(a => typeof a === 'string');
     const errorKind =
       kind === 'unrecoverable' ? 'unrecoverable'
+      : kind === 'refused' && refusalValid ? 'refused'
       : kind === 'rate_lease' && leaseValid ? 'rate_lease'
       : kind === 'deferred' && deferralValid ? 'deferred'
       : 'generic';
@@ -238,6 +252,7 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
           ...(Number.isFinite(rawLease.retryInMs as number) && (rawLease.retryInMs as number) >= 0 ? { retryInMs: rawLease.retryInMs as number } : {}) } }
         : {}),
       ...(errorKind === 'unrecoverable' && spendValid ? { spend: rawSpend as SpendRefusalEnvelope } : {}),
+      ...(errorKind === 'refused' && refusalValid ? { refusal: rawRefusal as JobRefusal } : {}),
       ...(errorKind === 'deferred' && deferralValid
         ? { deferral: { reason: rawDeferral.reason as string, retryInMs: rawDeferral.retryInMs as number } }
         : {}),
@@ -375,6 +390,16 @@ export function captureChildCleanup(pid: number, groups: Set<number>): ChildClea
   };
 }
 
+/**
+ * GBRA-133: RssAnon + RssShmem summed over a job child's whole tree (the tini wrapper, the handler process and anything it
+ * spawned), in bytes; null where the process table cannot be read (non-Linux), so the caller applies no cap it cannot measure.
+ */
+export function childTreeRss(pid: number, groups: Set<number>, readRss: (pid: number) => number | null = readProcessRss): number | null {
+  const tree = captureChildCleanup(pid, groups).observed.filter(entry => entry.state !== 'Z' && entry.state !== 'X');
+  if (!tree.length) return null;
+  return tree.reduce((sum, entry) => sum + (readRss(entry.pid) ?? 0), 0);
+}
+
 export function confirmChildCleanup(snapshot: ChildCleanupSnapshot): boolean {
   if (!snapshot.supported) return false;
   const entries = readProcessSnapshot();
@@ -419,8 +444,23 @@ export function resolveChildCliInvocation(
   return null;
 }
 
+/** What signalling a process tree achieved: delivered to a live tree, the
+ * tree was already gone, or delivery failed (the tree's state is unknown). */
+export type ProcessTreeSignal = 'signalled' | 'gone' | 'failed';
+
+/** The Windows tree kill, by ABSOLUTE path like /bin/kill on POSIX:
+ * SIGTERM asks every process in the tree to close (`/T`), SIGKILL forces it
+ * (`/T /F`). A windowless console process refuses the polite form, so on
+ * Windows SIGTERM usually fails and the caller's SIGKILL escalation ends it. */
+export function taskkillCommand(pid: number, signal: 'SIGTERM' | 'SIGKILL'): [string, string[]] {
+  return [
+    win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'),
+    ['/PID', String(pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])],
+  ];
+}
+
 /**
- * Signal an entire process GROUP.
+ * Signal an entire process GROUP (POSIX) or process TREE (Windows).
  *
  * Children are spawned `detached: true`. Tini creates another group for its
  * child, so callers must also signal that observed group. Neither group
@@ -428,31 +468,45 @@ export function resolveChildCliInvocation(
  *
  * Bun's process.kill() rejects negative pids (oven-sh/bun#15791), so on any
  * throw other than ESRCH we fall back to POSIX /bin/kill, which
- * group-signals fine on darwin + linux. Returns true when the signal was
- * delivered to a live group; false when the group is already gone (ESRCH —
- * success for our purposes) or delivery failed.
+ * group-signals fine on darwin + linux.
+ *
+ * Windows has no process groups: taskkill `/T` walks the tree by parent pid
+ * from `pid`. A descendant whose parent already exited is no longer in that
+ * tree, so it survives (the orphaned-descendant limit); exit 128 means `pid`
+ * itself is gone.
  */
-export function killProcessGroup(pid: number, signal: 'SIGTERM' | 'SIGKILL'): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
+export function signalProcessTree(
+  pid: number, signal: 'SIGTERM' | 'SIGKILL', platform: NodeJS.Platform = process.platform,
+): ProcessTreeSignal {
+  if (!Number.isInteger(pid) || pid <= 1) return 'failed';
+  if (platform === 'win32') {
+    const [command, args] = taskkillCommand(pid, signal);
+    const res = spawnSync(command, args, { stdio: 'ignore', timeout: 10_000 });
+    return res.status === 0 ? 'signalled' : res.status === 128 ? 'gone' : 'failed';
+  }
   try {
     process.kill(-pid, signal);
-    return true;
+    return 'signalled';
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === 'ESRCH') return false; // group already gone
+    if ((e as NodeJS.ErrnoException).code === 'ESRCH') return 'gone';
     // RangeError on Bun (negative pid unsupported) or EPERM etc. — fall back
     // to /bin/kill by ABSOLUTE path (a PATH-resolved binary in a kill path is
     // an unnecessary indirection; security review). This is the NORMAL path
     // in Bun-compiled production binaries; the sync exec is ~1-3ms and only
     // runs on abort/shutdown, never in the claim/renewal hot loop.
     try {
-      const sigName = signal.replace(/^SIG/, '');
-      const res = spawnSync('/bin/kill', ['-s', sigName, '--', `-${pid}`], { stdio: 'ignore' });
-      return res.status === 0;
+      const res = spawnSync('/bin/kill', ['-s', signal.replace(/^SIG/, ''), '--', `-${pid}`], { stdio: 'ignore' });
+      return res.status === 0 ? 'signalled' : 'failed';
     } catch {
-      return false;
+      return 'failed';
     }
   }
+}
+
+/** True when the signal was delivered to a live group or tree; false when it
+ * is already gone or delivery failed (`signalProcessTree` tells them apart). */
+export function killProcessGroup(pid: number, signal: 'SIGTERM' | 'SIGKILL'): boolean {
+  return signalProcessTree(pid, signal) === 'signalled';
 }
 
 /**

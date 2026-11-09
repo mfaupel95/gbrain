@@ -29,7 +29,7 @@ import { formatFenceDate, parseFactsFence, upsertFactRow } from '../facts-fence.
 import { digest } from '../persistence/digest.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
-import { applyPreservingTakeResolutions, readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
+import { readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
 import { decideSingleFact } from './single-prepare.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { appendContextNote } from './subject-infer.ts';
@@ -127,6 +127,19 @@ async function classify(db: BrainEngine, row: WriteRequest, intent: RelinkIntent
       out.push(same.visibility === visibility ? { id: f.id, action: 'retire', duplicateOf: Number(same.id) }
         : { id: f.id, action: 'skip', reason: 'visibility_conflict' });
       continue;
+    }
+    // B-10: an ontology observation the page already holds at the same key would collide on
+    // idx_facts_ontology_stint_dedup once linked; it retires as that row's duplicate instead.
+    if (v.dimension != null) {
+      const [held] = await db.executeRaw<{ id: number | string }>(
+        `SELECT t.id FROM facts m JOIN facts t ON t.source_id = m.source_id AND t.dimension = m.dimension AND t.value_hash = m.value_hash
+             AND t.valid_from = m.valid_from AND t.id <> m.id
+           WHERE m.source_id=$1 AND m.id=$3 AND t.entity_slug=$2 AND t.source_markdown_slug=$2
+           ORDER BY (t.expired_at IS NULL) DESC, t.id LIMIT 1`, [row.source_id, row.slug, f.id]);
+      if (held) {
+        out.push({ id: f.id, action: 'retire', duplicateOf: Number(held.id) });
+        continue;
+      }
     }
     const exact = await decideSingleFact(db, row.source_id,
       { entity_slug: row.slug, fact: String(v.fact), kind: v.kind as never, visibility }, null);
@@ -226,7 +239,7 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
         outcome.skipped.push({ id: c.id, reason: c.reason });
       }
     }
-    const published = page ? await applyPreservingTakeResolutions(tx, row.page_id, page) : {};
+    const published = page ? await page.apply(tx) : {};
     for (const c of planned) {
       if (c.action === 'skip') continue;
       const f = byId.get(c.id)!;
@@ -274,7 +287,13 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   }
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { ok: false, reason: 'no_page', message: `${slug} no longer exists` };
-  const target = await resolveFactWriteTarget(engine, sourceId, source);
+  let target: Awaited<ReturnType<typeof resolveFactWriteTarget>>;
+  try {
+    target = await resolveFactWriteTarget(engine, sourceId, source, { fileBacked: Boolean(snapshot.page.source_path), remote: false });
+  } catch (error) {
+    if (error instanceof OperationError && error.code === 'owner_unavailable') return { ok: false, reason: 'unfenceable', message: error.message };
+    throw error;
+  }
   if (target.kind === 'unbound') return { ok: false, reason: 'unfenceable', message: `source ${sourceId} writes through to ${target.root} but has no canonical owner` };
   const authority = await submissionAuthority(ctx, RELINK_OPERATION, sourceId, source.incarnation, slug);
   if (target.databaseOnlyReason) authority.databaseOnlyReason = target.databaseOnlyReason;

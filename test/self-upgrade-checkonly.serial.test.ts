@@ -16,6 +16,7 @@ const realFetch = globalThis.fetch;
 const realLog = console.log;
 let home: string;
 let priorHome: string | undefined;
+let priorChannel: string | undefined;
 let captured: string[];
 
 function minorBump(): string {
@@ -31,7 +32,7 @@ function microBump(): string {
 function stub(tag: string | null, changelog: string): void {
   globalThis.fetch = (async (url: any) => {
     const u = String(url);
-    if (u.includes('/gbrain/master/VERSION')) {
+    if (u.includes('/gbrain/latest-stable/VERSION')) {
       if (tag === null) throw new Error('network down');
       return new Response(tag + '\n', { status: 200 });
     }
@@ -42,6 +43,9 @@ function stub(tag: string | null, changelog: string): void {
 
 beforeEach(() => {
   priorHome = process.env.GBRAIN_HOME;
+  priorChannel = process.env.GBRAIN_RELEASE_CHANNEL;
+  // These cases cover the alpha channel (every release, VERSION at latest-stable); stable has its own suites.
+  process.env.GBRAIN_RELEASE_CHANNEL = 'alpha';
   home = mkdtempSync(join(tmpdir(), 'gbrain-checkonly-'));
   process.env.GBRAIN_HOME = home;
   captured = [];
@@ -51,6 +55,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   console.log = realLog;
+  if (priorChannel === undefined) delete process.env.GBRAIN_RELEASE_CHANNEL;
+  else process.env.GBRAIN_RELEASE_CHANNEL = priorChannel;
   if (priorHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = priorHome;
   rmSync(home, { recursive: true, force: true });
@@ -65,7 +71,7 @@ describe('self-upgrade --check-only surfaces what you get', () => {
     const out = JSON.parse(captured.join('\n'));
     expect(out.update_available).toBe(true);
     expect(out.latest_version).toBe(latest);
-    expect(out.release_url).toBe('https://github.com/garrytan/gbrain/blob/master/CHANGELOG.md');
+    expect(out.release_url).toBe('https://github.com/garrytan/gbrain/blob/latest-stable/CHANGELOG.md');
     expect(out.changelog_diff).toContain('Shiny new thing');
   });
 

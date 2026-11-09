@@ -65,7 +65,7 @@ async function legacyFixture(engine: BrainEngine) {
   await engine.executeRaw('UPDATE pages SET contextual_retrieval_mode=NULL WHERE source_id=$1', [id]);
   await claimWorktree(engine, id, root);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  return { id, root, working: { sourceId: id, noPull: true, noEmbed: true, noExtract: true, workingTree: true, explicitProcessing: [] } };
+  return { id, root, working: { sourceId: id, noPull: true, noEmbed: true, noExtract: true, workingTree: true } };
 }
 const admitted = async (engine: BrainEngine, id: string) =>
   (await engine.executeRaw<{ slug: string }>("SELECT slug FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import' ORDER BY sequence", [id])).map(r => r.slug);
@@ -97,7 +97,9 @@ test('#5751 unchanged legacy working-tree files admit nothing on any run, and th
 test('#5751 a run mixing skipped legacy files and a new file commits its checkpoint', async () => each(async engine => {
   const f = await legacyFixture(engine);
   writeFileSync(join(f.root, 'fresh.md'), '---\ntitle: Fresh\n---\nA new untracked observation.\n');
-  const result = await performManagedSync(engine, f.working);
+  // #6712 PR 4b (design v3.2 §3.3): a pass stamps last_commit only at the configured selection, so working mode is the configuration here.
+  await engine.setConfig('sync.include_working_tree', 'true');
+  const result = await performManagedSync(engine, f.working).finally(() => engine.unsetConfig('sync.include_working_tree'));
   await disposePersistenceConsumer(engine);
   expect(result).toMatchObject({ status: 'first_sync', added: 2, legacySkips: { contextualMode: 1, canonicalBytes: 1 } });
   expect((await admitted(engine, f.id)).sort()).toEqual(['fresh', 'seed']);

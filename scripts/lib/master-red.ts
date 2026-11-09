@@ -68,6 +68,8 @@ export interface MasterRedState {
   blocked: string[];
   /** Expiry of the stress-gate exemption records this issue carries (14 days after the watcher last saw it red). */
   exemption_expires?: string;
+  /** The issue that was closed by hand while red; the watch ended that incident without proof its failing jobs passed. */
+  closed_by_hand?: number;
   rebuilt?: string;
 }
 export interface FlakeRecord {
@@ -150,6 +152,7 @@ export function applyRun(prev: MasterRedState, run: RunInfo, ev: RunEvidence): M
   if (ev.verdict === 'red') {
     if (state.status !== 'red') {
       state.status = 'red';
+      delete state.closed_by_hand;
       state.first_red = ref;
       state.suspect = { from_sha: state.last_green?.sha ?? null, to_sha: run.head_sha, prs: [], complete: false, note: 'not looked up yet' };
       state.open_jobs = [];
@@ -231,6 +234,7 @@ function filesList(state: MasterRedState): string[] {
 
 function nextStep(state: MasterRedState, repo: string, issue: number | undefined): string {
   const ref = issue ? `#${issue}` : 'this issue';
+  if (state.status === 'green' && state.closed_by_hand) return `None: #${state.closed_by_hand} was closed by hand while red, so this watch ended that incident without proof that its failing jobs passed. The next red push run opens a new incident.`;
   if (state.status === 'green') return 'None: every previously failing job ran and passed on a later run.';
   const lines: string[] = [];
   const owner = state.open_jobs.filter(j => j.owner_signal);
@@ -364,7 +368,9 @@ export async function planMasterRed(client: GitHubClient, repo: string, run: Run
   const title = masterRedTitle(run.name);
   const issue = await newestIssue(client, title);
   const blank = blankState(run);
-  const stored = issue ? validState(readJsonBlock(issue.body, MR_MARKER), blank.workflow_file) : undefined;
+  const found = issue ? validState(readJsonBlock(issue.body, MR_MARKER), blank.workflow_file) : undefined;
+  const stored: MasterRedState | undefined = found && { ...found, rebuilt: undefined };
+  if (stored?.status === 'red' && issue!.state === 'closed') Object.assign(stored, { status: 'green', open_jobs: [], open_files: [], blocked: [], closed_by_hand: issue!.number });
   const reason = !issue ? 'no master-red issue for this workflow yet' : 'the JSON block of the newest master-red issue was missing or malformed';
   const runs = await pushRuns(client, run);
   const { state: base, pending } = pendingRuns(stored, runs, blank, reason, !issue);
@@ -376,7 +382,17 @@ export async function planMasterRed(client: GitHubClient, repo: string, run: Run
   if (counted.length > window.length) state.rebuilt = `${counted.length - window.length} older unevaluated run(s) were not read (more than ${MAX_FOLD} pending)`;
   for (const r of window) {
     const key = r.id * 1000 + r.run_attempt;
-    const ev = cache.get(key) ?? await collectEvidence(client, r, opts);
+    let ev = cache.get(key);
+    if (!ev) {
+      try {
+        ev = await collectEvidence(client, r, opts);
+      } catch (e) {
+        const status = (e as { status?: number }).status ?? 0;
+        if (r.id === run.id || status < 500) throw e;
+        console.log(`::warning::nightly-watch skipped ${r.name} run ${r.id} attempt ${r.run_attempt}: GitHub kept failing (${status}) after retries (${inert(e instanceof Error ? e.message : String(e), 200)}). It is not evaluated; the newer runs are.`);
+        continue;
+      }
+    }
     cache.set(key, ev);
     const before = state.status;
     state = applyRun(state, r, ev);

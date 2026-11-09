@@ -19,9 +19,15 @@ export interface DriverPoolStats {
   inflight_oldest_ms: number;
   /** #6383: statements the pool has settled since it opened; a pool that is checked out but never advances this is stalled. */
   completed: number;
+  /**
+   * #6543 (A4): age of the oldest statement past its own budget (the pool's, raised for an operation that declared a longer
+   * statement_timeout, none for a declared 0), 0 when none is; absent when the driver predates per-statement budgets.
+   */
+  inflight_over_budget_ms?: number;
 }
 
-interface DriverQueues { max: number; open: number; busy: number; full: number; reserved: number; connecting: number; closed: number; ended: number; queued: number; inflight_oldest_ms?: number; completed?: number }
+interface DriverQueues { max: number; open: number; busy: number; full: number; reserved: number; connecting: number; closed: number; ended: number; queued: number; inflight_oldest_ms?: number; completed?: number;
+  inflight_over_budget_ms?: number }
 
 /** The pool numbers of one driver instance, or null when it exposes none. */
 export function driverPoolStats(sql: unknown): DriverPoolStats | null {
@@ -33,6 +39,7 @@ export function driverPoolStats(sql: unknown): DriverPoolStats | null {
     waiters: pool.queued,
     inflight_oldest_ms: pool.inflight_oldest_ms ?? 0,
     completed: pool.completed ?? 0,
+    ...(typeof pool.inflight_over_budget_ms === 'number' ? { inflight_over_budget_ms: pool.inflight_over_budget_ms } : {}),
   };
 }
 
@@ -51,17 +58,25 @@ export interface PoolHealthSnapshot extends DriverPoolStats {
   poisoned_discards: number;
   stuck_discards: number;
   build_failures: number;
+  desync_discards: number;
+  /** #6543 (A6): connections retired by an incident (stuck, desync, closed under statements) that reconnected, and reconnects that failed. */
+  recovered: number;
+  recovery_failed: number;
 }
 
 export function poolHealthSnapshot(engine: unknown): PoolHealthSnapshot | null {
   try {
-    const diagnostics = (engine as { getPoolDiagnostics?: () => { pool?: DriverPoolStats | null; poisonedDiscards?: number; stuckDiscards?: number; buildFailures?: number } | null } | null)?.getPoolDiagnostics?.();
+    const diagnostics = (engine as { getPoolDiagnostics?: () => { pool?: DriverPoolStats | null; poisonedDiscards?: number; stuckDiscards?: number; buildFailures?: number; desyncDiscards?: number;
+      recovered?: number; recoveryFailed?: number } | null } | null)?.getPoolDiagnostics?.();
     if (!diagnostics?.pool) return null;
     return {
       ...diagnostics.pool,
       poisoned_discards: diagnostics.poisonedDiscards ?? 0,
       stuck_discards: diagnostics.stuckDiscards ?? 0,
       build_failures: diagnostics.buildFailures ?? 0,
+      desync_discards: diagnostics.desyncDiscards ?? 0,
+      recovered: diagnostics.recovered ?? 0,
+      recovery_failed: diagnostics.recoveryFailed ?? 0,
     };
   } catch {
     return null;

@@ -10,7 +10,8 @@ import { pricingSetCommand } from '../../../core/budget/no-pricing.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { checkError } from '../check-fix.ts';
-import { isConnectorSourceKind } from '../../../core/persistence/connector-identity.ts';
+import { CONNECTOR_KINDS_SQL, isConnectorSourceKind } from '../../../core/persistence/connector-identity.ts';
+import { isCrossSourceLinksEnabled } from '../../../core/link-extraction.ts';
 
 /**
  * v0.40.4 graph_signals_coverage doctor check.
@@ -38,7 +39,7 @@ import { isConnectorSourceKind } from '../../../core/persistence/connector-ident
  * Errors during the SQL count → warn with the underlying message.
  * Best-effort: this check never breaks doctor.
  */
-export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Check> {
+export async function checkGraphSignalsCoverage(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     // Resolve the active graph_signals setting. Read the config key
     // explicitly; when unset, fall through to the mode bundle default.
@@ -71,8 +72,11 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
     }
 
     // Compute global inbound-link density. Counts DISTINCT pages with
-    // at least one inbound edge / total pages.
-    const totalRows = await engine.executeRaw(`SELECT COUNT(*)::int AS n FROM pages WHERE deleted_at IS NULL`);
+    // at least one inbound edge / total pages. A remote caller's grant
+    // confines both sides to its sources (no brain-wide ratio).
+    const scope = opts.sourceIds ? ' AND p.source_id = ANY($1::text[])' : '';
+    const params = opts.sourceIds ? [opts.sourceIds] : undefined;
+    const totalRows = await engine.executeRaw(`SELECT COUNT(*)::int AS n FROM pages p WHERE deleted_at IS NULL${scope}`, params);
     const totalPages = Number((totalRows as any)[0]?.n ?? 0);
 
     if (totalPages === 0) {
@@ -87,7 +91,8 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
       `SELECT COUNT(DISTINCT l.to_page_id)::int AS n
        FROM links l
        JOIN pages p ON p.id = l.to_page_id
-       WHERE p.deleted_at IS NULL`
+       WHERE p.deleted_at IS NULL${scope}`,
+      params,
     );
     const linkedPages = Number((linkedRows as any)[0]?.n ?? 0);
     const pct = (linkedPages / totalPages) * 100;
@@ -145,7 +150,7 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
  * are non-blocking warnings; brainstorm + LSD still work, just with degraded
  * signal.
  */
-export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check> {
+export async function checkBrainstormHealth(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   // (1) Column probe — fast, single-query.
   try {
     const probeRows = await engine.executeRaw<{ exists: boolean }>(
@@ -207,14 +212,15 @@ export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check>
     };
   }
 
-  // (4) Calibration cold-start — empty active_bias_tags.
+  // (4) Calibration cold-start — empty active_bias_tags. Profiles are per
+  // source; a remote caller's grant reads only its own sources' profiles.
   try {
     const calibRows = await engine.executeRaw<{ active_bias_tags: string[] | null }>(
       `SELECT active_bias_tags
-         FROM calibration_profiles
+         FROM calibration_profiles${opts.sourceIds ? '\n         WHERE source_id = ANY($1::text[])' : ''}
          ORDER BY generated_at DESC
          LIMIT 1`,
-      []
+      opts.sourceIds ? [opts.sourceIds] : []
     );
     if (calibRows.length === 0) {
       return {
@@ -423,6 +429,8 @@ export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): 
  */
 export const JUNK_HUB_EDGE_THRESHOLD = 1000;
 export const JUNK_HUB_MAX_CHUNKS = 2;
+/** Pages `junk_entity_hubs` lists before it reports a floor. */
+const JUNK_HUB_LIMIT = 20;
 
 /**
  * #4222 junk_entity_hubs doctor check.
@@ -455,14 +463,14 @@ export async function checkJunkEntityHubs(
   const edgeThreshold = opts?.edgeThreshold ?? JUNK_HUB_EDGE_THRESHOLD;
   const maxChunks = opts?.maxChunks ?? JUNK_HUB_MAX_CHUNKS;
   try {
-    const rows = await engine.executeRaw<{
+    const listed = await engine.executeRaw<{
       slug: string;
       source_id: string | null;
       edges: number;
       chunks: number;
       connector_page: boolean;
       source_kind: string | null;
-      default_twin: boolean;
+      canonical_twin_source: string | null;
     }>(
       `WITH edge_counts AS (
          SELECT page_id, COUNT(*)::int AS edges FROM (
@@ -481,8 +489,11 @@ export async function checkJunkEntityHubs(
        SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks,
               (p.frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_page,
               s.config ->> 'kind' AS source_kind,
-              EXISTS (SELECT 1 FROM pages t WHERE t.source_id = 'default' AND t.slug = p.slug
-                AND t.deleted_at IS NULL AND p.source_id <> 'default') AS default_twin
+              (SELECT t.source_id FROM pages t LEFT JOIN sources ts ON ts.id = t.source_id
+                WHERE t.slug = p.slug AND t.source_id <> p.source_id AND t.deleted_at IS NULL
+                  AND (t.frontmatter ->> 'google_contact_id') IS NULL
+                  AND COALESCE(ts.config ->> 'kind', '') NOT IN (${CONNECTOR_KINDS_SQL})
+                ORDER BY (t.source_id = 'default') DESC, t.source_id LIMIT 1) AS canonical_twin_source
        FROM edge_counts ec
        JOIN pages p ON p.id = ec.page_id AND p.deleted_at IS NULL
        LEFT JOIN sources s ON s.id = p.source_id
@@ -490,9 +501,13 @@ export async function checkJunkEntityHubs(
        WHERE COALESCE(cc.chunks, 0) <= $2
          AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
        ORDER BY ec.edges DESC
-       LIMIT 20`,
+       LIMIT ${JUNK_HUB_LIMIT + 1}`,
       [edgeThreshold, maxChunks],
     );
+    // #7145: a full list means more pages match; the counts below are then floors.
+    const capped = listed.length > JUNK_HUB_LIMIT;
+    const rows = listed.slice(0, JUNK_HUB_LIMIT);
+    const plus = capped ? '+' : '';
 
     if (rows.length === 0) {
       return {
@@ -511,27 +526,49 @@ export async function checkJunkEntityHubs(
     const parts: string[] = [];
     if (hubs.length > 0) {
       parts.push(
-        `${hubs.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `${hubs.length}${plus} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
         `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${hubs.map(line).join('\n')}\n` +
         `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
         `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
         `buildGazetteer drops single-generic-token person titles. If a page is an intentional thin ` +
         `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`);
     }
+    // #6158 / #4845 (W14 P4.5): the remedies are real now. With
+    // link_resolution.cross_source on, the mention pass binds a name in the
+    // connector's source to the canonical twin instead of the stub (the stub
+    // yields; by-mention.ts), and a Google source added with --contacts-dir
+    // keeps its contact pages out of people/ altogether.
+    const crossSource = twins.length > 0 ? await isCrossSourceLinksEnabled(engine) : false;
+    const withTwin = twins.filter(r => r.canonical_twin_source !== null).length;
     if (twins.length > 0) {
       parts.push(
-        `${twins.length} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
+        `${twins.length}${plus} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
         `These are not junk: a connector renders each contact as its own page, and mentions in that source link to it ` +
-        `before the main-brain page of the same name (by design). Frontmatter edits do not stick (the connector re-renders ` +
-        `the page) and gbrain has no merge command. Whether a contact page should defer to its main-brain twin is an open ` +
-        `policy question (issue #6158); nothing needs doing now, so ask the user before changing anything.`);
+        `before a page of the same name elsewhere unless link_resolution.cross_source is on. ` +
+        `${withTwin} of them ${withTwin === 1 ? 'has' : 'have'} a canonical twin in another source. ` +
+        (crossSource
+          ? `cross_source is on, so the next mention pass (gbrain extract --stale, or autopilot) re-binds those mentions to the twin; ` +
+            `edges already on the stub move as the pass reaches each page.`
+          : `Run gbrain config set link_resolution.cross_source true, then gbrain extract --stale: mentions in the connector source ` +
+            `bind to the twin from then on. `) +
+        `To keep a Google source's contacts out of people/ entirely, add it with --contacts-dir contacts (g_contacts_dir). ` +
+        `Frontmatter edits do not stick (the connector re-renders the page) and gbrain has no merge command.`);
     }
+    const verify = { argv: ['gbrain', 'doctor', '--only', 'junk_entity_hubs', '--json'] };
+    const twinFix = twins.length === 0 ? {} : crossSource
+      ? { fix: { argv: ['gbrain', 'extract', '--stale'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Runs the mention pass, which binds names in the connector source to their canonical twin now that cross_source is on.', verify } }
+      : { fix: { argv: ['gbrain', 'config', 'set', 'link_resolution.cross_source', 'true'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lets a mention resolve to a same-name page in another source; a connector contact stub then yields to its canonical twin on the next mention pass (gbrain extract --stale).',
+        user_message: 'Mentions in your Gmail source bind to the connector\'s own contact stubs instead of your real person pages. Turn on cross-source link resolution so they bind to the real pages?', verify } };
     return {
       name: 'junk_entity_hubs',
       status: 'warn',
       message: parts.join('\n'),
-      ...(twins.length > 0 ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
+      ...twinFix,
       details: {
+        exact: !capped,
+        ...(capped ? { limit: JUNK_HUB_LIMIT } : {}),
         hubs: hubs.map(r => ({
           slug: r.slug,
           source_id: r.source_id ?? 'default',
@@ -543,7 +580,8 @@ export async function checkJunkEntityHubs(
           source_id: r.source_id ?? 'default',
           edges: r.edges,
           chunks: r.chunks,
-          canonical_twin: r.default_twin ? r.slug : null,
+          canonical_twin: r.canonical_twin_source ? r.slug : null,
+          canonical_twin_source: r.canonical_twin_source,
         })),
       },
     };

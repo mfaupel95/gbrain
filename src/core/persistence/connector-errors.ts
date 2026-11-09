@@ -7,10 +7,13 @@
  * deterministically, from the code, the message and the receipt's own fields.
  */
 import { OperationError } from '../ops/contract.ts';
+import { assertNever } from '../types.ts';
 import { describeConnectorAccount, type ConnectorAccount } from './connector-state.ts';
 import type { ConnectorConfig, ConnectorKind } from './connector-identity.ts';
 import type { GitHubSourceConfig } from '../github-source.ts';
 import type { GoogleSourceConfig } from '../google/types.ts';
+import type { MeetingsSourceConfig } from '../meetings/types.ts';
+import type { SlackSourceConfig } from '../slack/types.ts';
 import { CONNECTOR_BOUND_HINT, CONNECTOR_BOUND_MESSAGE, UNBOUND_PUBLICATION_MESSAGE, UNBOUND_SOURCE_DOCS, unboundPublicationHint } from './unbound-source.ts';
 import { EMBEDDING_ZERO_NORM, EMBEDDING_ZERO_NORM_DOCS } from '../ai/embedding-guard.ts';
 
@@ -23,14 +26,17 @@ export function connectorAccountChanged(sourceId: string, kind: ConnectorKind, c
   const show = (value: ConnectorAccount | string | null) => value === null ? 'no resolvable account' : typeof value === 'string' ? value : describeConnectorAccount(value);
   let restore: string;
   let replace: string;
-  if (kind === 'google') {
+  switch (kind) {
+  case 'google': {
     const google = config as GoogleSourceConfig;
     const where = google.access === 'command' ? `the command configured as g_token_command (${google.tokenCommand ?? 'unset'})`
       : google.access === 'env' ? `the environment variable configured as g_token_env (${google.tokenEnv ?? 'unset'})` : `the vault credential (gbrain google connect --account ${google.account})`;
     restore = `restore ${where} so it yields a token for ${show(recorded)}, then retry: gbrain sync --source ${sourceId}`;
     replace = `add a new source for the new account (gbrain google setup --account ${typeof resolved === 'object' && resolved?.kind === 'google' ? resolved.email : '<email>'}), `
       + `then archive this one: gbrain sources archive ${sourceId}`;
-  } else {
+    break;
+  }
+  case 'github': {
     const github = config as GitHubSourceConfig;
     const installation = typeof resolved === 'object' && resolved?.kind === 'github' && resolved.installationId !== null ? resolved.installationId : '<installation-id>';
     restore = github.app ? `restore the GitHub App credential (gh_app_id ${github.app.appId}, key at gh_app_pem_path) for ${show(recorded)}, then retry: gbrain sync --source ${sourceId}`
@@ -38,6 +44,23 @@ export function connectorAccountChanged(sourceId: string, kind: ConnectorKind, c
     replace = `add a new source pinned to the intended installation (gbrain sources add <new-id> --kind github --scope ${github.scope}`
       + `${github.scope === 'repos' ? ` --repos ${github.repos.join(',')}` : ''}${github.app ? ` --app-id ${github.app.appId} --app-pem <path>` : ''} --app-install ${installation}), `
       + `then archive this one: gbrain sources archive ${sourceId}`;
+    break;
+  }
+  case 'meetings': {
+    const meetings = config as MeetingsSourceConfig;
+    const where = meetings.tokenEnv ? `the environment variable configured as m_token_env (${meetings.tokenEnv})` : `the saved key (gbrain connectors auth ${meetings.provider} --token -)`;
+    restore = `restore ${where} so it belongs to ${show(recorded)}, then retry: gbrain sync --source ${sourceId}`;
+    replace = `add a new source for the new account (gbrain sources add <new-id> --kind meetings --provider ${meetings.provider}), then archive this one: gbrain sources archive ${sourceId}`;
+    break;
+  }
+  case 'slack': {
+    const slack = config as SlackSourceConfig;
+    const where = slack.tokenEnv ? `the environment variable configured as s_token_env (${slack.tokenEnv})` : 'the saved token (gbrain connectors auth slack --token -)';
+    restore = `restore ${where} so it belongs to ${show(recorded)}, then retry: gbrain sync --source ${sourceId}`;
+    replace = `add a new source for the new workspace (gbrain sources add <new-id> --kind slack --channels ${slack.channels.join(',')}), then archive this one: gbrain sources archive ${sourceId}`;
+    break;
+  }
+  default: return assertNever(kind);
   }
   // Account emails and installation ids stay in the local suggestion: job records persist and serve the message remotely.
   const error = new OperationError('connector_account_changed',
@@ -71,6 +94,15 @@ export const DATABASE_REFUSAL_HINT = 'This is not a content conflict: a gbrain p
   + 'Do not force-write, edit SQL, or disable the guard; ask the user before changing which hosts own the brain.';
 
 /** #5974: another database trigger (named in write_error_detail.raiser) refused the write. */
+/** #6719: an owner exception's recorded identity (class, errno, frame, build) does not name its cause; nothing proves the database refused it. */
+export const ownerExceptionHint = (requestId: string) => 'An unexpected owner exception ended this write and nothing was committed; its cause is unknown from the recorded identity alone. '
+  + `On the brain host run gbrain write-request ${requestId} --json and read error_detail (error_class, errno, frame, attempt.consumer_version, and for a database error its redacted error_text, statement and position) beside the persistence consumer log; `
+  + 'report that identity and the gbrain version on the issue tracker, and upgrade when a fix ships. Do not replay the old intent to diagnose it.';
+
+/** #6719: an origin that names no database refusal (or none at all) stays unknown rather than read as a trigger. */
+export const unknownOriginHint = (requestId: string) => 'The recorded origin of this failure does not name a database refusal, so its cause is not established by this status. '
+  + `On the brain host run gbrain write-request ${requestId} --json and follow its diagnosis.fix; report the receipt's error_code and error_detail if it names no cause.`;
+
 export const DATABASE_TRIGGER_HINT = 'A database trigger refused this write and nothing was committed; write_error_detail.raiser names it. '
   + 'On the brain host run gbrain sources writer status --probe --json and compare recent_failures[].error_detail.attempt.consumer_version '
   + 'with the version of every gbrain process sharing this database; upgrade or restart the older one, run gbrain apply-migrations --yes, then retry with a new request ID. '

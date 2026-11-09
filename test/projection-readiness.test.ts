@@ -115,7 +115,7 @@ describe('canonical projection readiness', () => {
     } as any, { sourceId: "source-'quote", excludePrivate: true });
     expect(result.status).toBe('projection_pending');
     // Besides the probe, at most the cache's read-only generation read runs.
-    const probes = calls.filter(call => call.sql.includes('SELECT EXISTS'));
+    const probes = calls.filter(call => call.sql.includes('ORDER BY p.source_id, p.page_kind, p.slug LIMIT 1'));
     expect(probes).toHaveLength(1);
     expect(calls.length).toBeLessThanOrEqual(2);
     expect(probes[0].sql).toContain('IS DISTINCT FROM');
@@ -129,7 +129,8 @@ describe('canonical projection readiness', () => {
     await seed('code');
     const pending = await checkProjectionReadiness(engine, { sourceId: 'source-a' });
     expect(pending.status).toBe('warn');
-    expect(pending.details).toEqual({ readiness: 'projection_pending', ready: false });
+    expect(pending.details).toEqual({ readiness: 'projection_pending', ready: false, pending: 1, failed: 0, sealable: 0, sealable_with_visual: 0,
+      reimport: 0, ocr_required: 0, protected: 0, archived: 0, oldest_age_seconds: expect.any(Number), as_of: expect.any(String) });
     expect(JSON.stringify(pending)).not.toContain('source-a');
     const unknown = await checkProjectionReadiness({ executeRaw: async () => { throw new Error('private connection'); } } as any);
     expect(unknown.status).toBe('warn');
@@ -147,7 +148,7 @@ describe('projection readiness cache', () => {
   const counted = () => {
     let probes = 0;
     const wrapped = { executeRaw: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT EXISTS')) probes++;
+      if (sql.includes('ORDER BY p.source_id, p.page_kind, p.slug LIMIT 1')) probes++;
       return engine.executeRaw(sql, params);
     } };
     return { engine: wrapped as unknown as PGLiteEngine, probes: () => probes };
@@ -193,7 +194,7 @@ describe('projection readiness cache', () => {
   test('an unknown answer is never reused, and GBRAIN_PROJECTION_READINESS_CACHE=0 always probes', async () => {
     let fail = true;
     const flaky = { executeRaw: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT EXISTS') && fail) throw new Error('transient');
+      if (sql.includes('ORDER BY p.source_id, p.page_kind, p.slug LIMIT 1') && fail) throw new Error('transient');
       return engine.executeRaw(sql, params);
     } } as unknown as PGLiteEngine;
     expect((await probeProjectionReadiness(flaky)).status).toBe('unknown');
@@ -210,12 +211,26 @@ describe('projection readiness cache', () => {
   test('nothing is cached while a transaction is in flight', async () => {
     let probes = 0;
     const busy = { executeRaw: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT EXISTS')) probes++;
+      if (sql.includes('ORDER BY p.source_id, p.page_kind, p.slug LIMIT 1')) probes++;
       const rows = await engine.executeRaw<Record<string, unknown>>(sql, params);
       return sql.includes('pg_current_snapshot') ? rows.map(row => ({ ...row, quiescent: false })) : rows;
     } } as unknown as PGLiteEngine;
     await probeProjectionReadiness(busy);
     await probeProjectionReadiness(busy);
     expect(probes).toBe(2);
+  });
+});
+
+describe('a pending brain skips the by_design half (#8000)', () => {
+  test('while pages need work, only the pending subquery reads pages; by_design never runs', async () => {
+    await engine.executeRaw(`INSERT INTO pages (source_id,slug,title,type,page_kind,compiled_truth,chunker_version,frontmatter)
+      SELECT 'source-a', 'pending-' || i, 'Pending', 'concept', 'markdown', 'body', 999, '{}'::jsonb FROM generate_series(1, 300) AS i`);
+    const captured: Array<{ sql: string; params?: unknown[] }> = [];
+    const recording = { executeRaw: (sql: string, params?: unknown[]) => { captured.push({ sql, params }); return engine.executeRaw(sql, params); } };
+    const result = await withEnv({ GBRAIN_PROJECTION_READINESS_CACHE: '0' }, () => probeProjectionReadiness(recording as never, { sourceId: 'source-a' }));
+    expect(result.status).toBe('projection_pending');
+    const probe = captured.find(call => call.sql.includes('IS DISTINCT FROM'))!;
+    const plan = (await engine.executeRaw<Record<string, string>>(`EXPLAIN (ANALYZE, COSTS OFF) ${probe.sql}`, probe.params)).map(row => Object.values(row)[0]);
+    expect(plan.filter(line => / on pages p(_\d+)? /.test(line) && !line.includes('never executed'))).toHaveLength(1);
   });
 });

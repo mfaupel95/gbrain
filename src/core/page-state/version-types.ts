@@ -11,6 +11,22 @@ export interface PageVersion {
   tags?: string[] | null;
   /** The page's recorded canonical file when the version was taken; NULL on file-less pages and legacy versions. */
   source_path?: string | null;
+  /** Wave B: present only on a segmented version, whose compiled_truth and timeline are NULL (the body lives in segments). */
+  body_storage?: 'segmented';
+  /** Segmented versions: the body generation the version references. */
+  body_generation?: number;
+  /** Segmented versions: the referenced body's UTF-8 bytes. */
+  body_bytes?: number;
+  content_hash?: string | null;
+  /**
+   * GBRA-217: why the write that replaced this snapshot was made (`page_versions.change_reason`), as the reader may see it:
+   * a remote reader gets it only when this snapshot's successor is world-visible and was not pruned. Absent from rows
+   * read without the reason projection.
+   */
+  replaced_because?: string | null;
+  /** GBRA-217: the version's frontmatter valid_from / valid_until as YYYY-MM-DD (src/core/valid-time.ts), null when absent or unreadable. */
+  valid_from?: string | null;
+  valid_until?: string | null;
   id: number;
   page_id: number;
   compiled_truth: string;

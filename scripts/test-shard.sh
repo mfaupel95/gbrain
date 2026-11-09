@@ -119,7 +119,12 @@ SHARD_COUNT=$(printf '%s\n' "$SHARD_FILES" | grep -c '^' || true)
 # grep -c on empty input returns 0 even with trailing newline edge cases
 [ -z "$SHARD_FILES" ] && SHARD_COUNT=0
 
-echo "shard $SHARD_INDEX/$TOTAL_SHARDS: ${SHARD_COUNT}/${ALL_COUNT} files (LPT-balanced)"
+# Predicted weight of this shard (read-only over scripts/test-weights.json,
+# same p75 fallback the partition used). A measured shard far above it is a
+# runner or process-wide slowdown (GBRA-79: a leaked GBRAIN_PGLITE_SNAPSHOT
+# delete cold-booted every later engine), not a partition problem.
+SHARD_WEIGHT=$(printf '%s\n' "$SHARD_FILES" | bun run scripts/sharding.ts --sum 2>/dev/null || echo "predicted weight unavailable")
+echo "shard $SHARD_INDEX/$TOTAL_SHARDS: ${SHARD_COUNT}/${ALL_COUNT} files (LPT-balanced); $SHARD_WEIGHT"
 
 if [ "$SHARD_COUNT" -eq 0 ]; then
   echo "warning: shard $SHARD_INDEX has no files (total shards may exceed file count)" >&2
@@ -156,7 +161,7 @@ receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_
 [ "${#RECEIPT_ARGS[@]}" -eq 0 ] || XARGS_FLAGS=(-n 100000 -x)
 # --max-concurrency mirrors the local runner: unbounded intra-process
 # concurrency under parallel PGLite boots produced real shard deaths (the
-# 22-minute matrix timeout in test.yml records 13 of them).
+# matrix job's timeout-minutes in test.yml records 13 of them).
 #
 # The `./` prefix makes each argument a path, not a name filter: Bun runs
 # bare `test/x.test.ts` arguments in directory-scan order (filesystem

@@ -57,8 +57,8 @@ export interface AggregateResult {
   verdictMessage: string;
 }
 
-const PASS_MEAN_THRESHOLD = 7;
-const PASS_FLOOR_THRESHOLD = 5;
+export const PASS_MEAN_THRESHOLD = 7;
+export const PASS_FLOOR_THRESHOLD = 5;
 const MIN_SUCCESSES_FOR_VERDICT = 2;
 const TOP_IMPROVEMENTS_CAP = 10;
 const DEDUP_PREFIX_LEN = 40;

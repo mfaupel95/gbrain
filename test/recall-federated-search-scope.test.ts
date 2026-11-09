@@ -24,6 +24,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializeMarkdown } from '../src/core/markdown.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 import {
   federatedSearchScope,
   sourceScopeOpts,
@@ -134,11 +135,28 @@ describe("recall's page-search arm honors the federated set (#3242 parity)", () 
   });
 });
 
+describe('#4830: every recall hit names its source', () => {
+  test('a federated read labels each hit with the source it came from, never a blind default', async () => {
+    const res = await recall().handler(remoteNoGrant(), { query: 'zebra telescope' }) as any;
+    const bySlug = Object.fromEntries(res.results.map((r: any) => [r.slug, r.source_id]));
+    expect(bySlug['notes/home']).toBe('default');
+    expect(bySlug['wiki/topic']).toBe('wiki');
+    for (const r of res.results) expect(typeof r.source_id).toBe('string');
+  });
+
+  test('a scalar read labels its hits with the one source in scope', async () => {
+    const res = await recall().handler(ctxOf({ remote: true, sourceId: 'default' }), { query: 'zebra telescope' }) as any;
+    expect(res.results.map((r: any) => r.source_id)).toEqual(['default']);
+    const wiki = await recall().handler(ctxOf({ remote: false, sourceId: 'wiki' }), { query: 'zebra telescope', source_id: 'wiki' }) as any;
+    expect(wiki.results.map((r: any) => [r.slug, r.source_id])).toEqual([['wiki/topic', 'wiki']]);
+  });
+});
+
 describe("recall's fact arms honor the federated set too", () => {
   const factTexts = (res: any): string[] => (res?.facts ?? []).map((f: any) => f.fact);
   beforeAll(async () => {
     for (const [fact, source_id] of [['zebra fact in default', 'default'], ['zebra fact in wiki', 'wiki'], ['zebra fact in privsrc', 'privsrc']]) {
-      await engine.insertFact({ fact, kind: 'fact', entity_slug: `zebra-${source_id}`, source: 'test', visibility: 'world' }, { source_id });
+      await asOwner(engine, tx => tx.insertFact({ fact, kind: 'fact', entity_slug: `zebra-${source_id}`, source: 'test', visibility: 'world' }, { source_id }));
     }
   });
 

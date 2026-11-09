@@ -38,13 +38,17 @@ export const HERMES_SPEC_TARGET: HostSpecTarget = {
     'installed hermes-agent v0.20.0 hermes_state_common.py SCHEMA_SQL (schema source of truth)',
     'hermes-agent hermes_state.py DEFAULT_DB_PATH = <hermes home>/state.db',
     'test/fixtures/transcripts/hermes-fixture-builder.ts (synthetic, schema-matched)',
+    'hermes-agent tools/clarify_tool.py _result (clarify result shape; #7396)',
   ],
   note:
     'SQLite store, WAL mode. sessions: id TEXT PK, source, display_name, ' +
     'title, started_at REAL (epoch seconds), ended_at, cwd, model. messages: ' +
-    'session_id, role, content TEXT, timestamp REAL. The import keeps role ' +
-    "user/assistant rows with non-empty content; content that looks like a " +
-    'JSON block array is unwrapped to its text blocks. active/compacted ' +
+    'session_id, role, content TEXT, timestamp REAL, tool_call_id, tool_name. ' +
+    'The import keeps role user/assistant rows with non-empty content, and ' +
+    'the answered responses of a submitted clarify form (role tool, tool_name ' +
+    'clarify) as user rows; other tool rows are dropped. Content that looks like a ' +
+    'JSON block array (bare or json:-prefixed) is unwrapped to its text ' +
+    'blocks, image blocks as an [image] placeholder. active/compacted ' +
     'flags are IGNORED (the archive wants full history, not the live ' +
     'context window). PROVISIONAL: no populated production sample verified.',
 };
@@ -59,14 +63,20 @@ function epochToIso(v: unknown): string {
   return new Date(Math.round(v * 1000)).toISOString();
 }
 
-/** Unwrap content that is a JSON block array; pass plain text through. */
+/** Hermes stores list-shaped message content as this prefix plus the JSON array. */
+const CONTENT_JSON_PREFIX = 'json:';
+const IMAGE_PLACEHOLDER = '[image]';
+const IMAGE_BLOCK_TYPES = new Set(['image_url', 'image', 'input_image']);
+
+/** Unwrap content that is a JSON block array (bare or `json:`-prefixed); image blocks become a placeholder; pass plain text through. */
 function contentToText(content: unknown): string {
   if (typeof content !== 'string') return '';
   const t = content.trim();
   if (!t) return '';
-  if (t.startsWith('[')) {
+  const json = t.startsWith(CONTENT_JSON_PREFIX) ? t.slice(CONTENT_JSON_PREFIX.length).trimStart() : t;
+  if (json.startsWith('[')) {
     try {
-      const blocks = JSON.parse(t) as unknown;
+      const blocks = JSON.parse(json) as unknown;
       if (Array.isArray(blocks)) {
         const parts: string[] = [];
         for (const block of blocks) {
@@ -74,6 +84,7 @@ function contentToText(content: unknown): string {
           else if (typeof block === 'object' && block !== null) {
             const b = block as Record<string, unknown>;
             if (typeof b.text === 'string' && b.text.trim()) parts.push(b.text);
+            else if (typeof b.type === 'string' && IMAGE_BLOCK_TYPES.has(b.type)) parts.push(IMAGE_PLACEHOLDER);
           }
         }
         return parts.join('\n').trim();
@@ -99,6 +110,38 @@ interface MessageRow {
   role: string;
   content: string | null;
   timestamp: number | null;
+  tool_call_id: string | null;
+}
+
+/**
+ * #7396: the user's answers in a clarify tool result (hermes-agent
+ * tools/clarify_tool.py `_result`), in question order. A `status: 'answered'`
+ * response counts when the form was submitted or timed out part-way (Hermes
+ * keeps the answers the user already locked under `outcome: 'timed_out'`), or,
+ * in the earlier batch shape (no `outcome`, no `status`, unanswered as ""), a
+ * non-empty response of a form without `timed_out`. Cancelled and undelivered
+ * forms count for nothing. The legacy single-question shape is never read: it
+ * serializes a timeout into `user_response` as text. Offered choices are never
+ * returned.
+ */
+function clarifyAnswers(content: string | null): Array<{ question: string; text: string }> {
+  let result: unknown;
+  try { result = JSON.parse(content ?? ''); } catch { return []; }
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return [];
+  const { outcome, responses, timed_out: timedOut } = result as Record<string, unknown>;
+  if (!Array.isArray(responses)) return [];
+  const statusShape = outcome !== undefined;
+  if (statusShape ? outcome !== 'submitted' && outcome !== 'timed_out' : timedOut === true) return [];
+  const answers: Array<{ question: string; text: string }> = [];
+  for (const response of responses) {
+    if (typeof response !== 'object' || response === null) continue;
+    const { question, status, user_response: answer } = response as Record<string, unknown>;
+    if (statusShape ? status !== 'answered' : status !== undefined) continue;
+    const values = Array.isArray(answer) ? answer : [answer];
+    if (!values.length || !values.every(v => typeof v === 'string' && v.trim())) continue;
+    answers.push({ question: typeof question === 'string' ? question : '', text: values.join('\n') });
+  }
+  return answers;
 }
 
 export const hermesAdapter: TranscriptAdapter = {
@@ -161,14 +204,38 @@ export const hermesAdapter: TranscriptAdapter = {
           };
         }
 
+        // Older stores have no tool columns; they import user/assistant rows as before.
+        const columns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(messages)').all().map(c => c.name));
+        const toolColumns = columns.has('tool_name') && columns.has('tool_call_id');
         const msgQuery = db.query<MessageRow, [string]>(
-          "SELECT role, content, timestamp FROM messages WHERE session_id = ? " +
-            "AND role IN ('user','assistant') ORDER BY timestamp, id",
+          toolColumns
+            ? "SELECT role, content, timestamp, tool_call_id FROM messages WHERE session_id = ? " +
+              "AND (role IN ('user','assistant') OR (role = 'tool' AND tool_name = 'clarify')) ORDER BY timestamp, id"
+            : "SELECT role, content, timestamp, NULL AS tool_call_id FROM messages WHERE session_id = ? " +
+              "AND role IN ('user','assistant') ORDER BY timestamp, id",
         );
         for (const row of sessionRows) {
           if (typeof row.id !== 'string' || !row.id) continue;
           const messages: TranscriptMessage[] = [];
+          const raw: Record<string, unknown> = {
+            session_id: row.id,
+            source: row.source ?? null,
+            cwd: row.cwd ?? null,
+            source_path: path,
+          };
+          let clarified = 0;
           for (const m of msgQuery.all(row.id)) {
+            if (m.role === 'tool') {
+              for (const answer of clarifyAnswers(m.content)) {
+                // The question the assistant asked comes first, so the answer reads in context; it is never user speech.
+                if (answer.question.trim()) messages.push({ role: 'assistant', timestamp: epochToIso(m.timestamp), text: answer.question });
+                raw[`clarify_${clarified}_tool_call_id`] = m.tool_call_id;
+                raw[`clarify_${clarified}_question`] = answer.question;
+                raw[`clarify_${clarified++}_message_index`] = messages.length;
+                messages.push({ role: 'user', timestamp: epochToIso(m.timestamp), text: answer.text });
+              }
+              continue;
+            }
             const role = m.role === 'user' || m.role === 'assistant' ? m.role : null;
             if (!role) continue;
             const text = contentToText(m.content);
@@ -185,12 +252,7 @@ export const hermesAdapter: TranscriptAdapter = {
               cwd: row.cwd ?? undefined,
               model: row.model ?? undefined,
               startedAt: epochToIso(row.started_at) || messages[0].timestamp || undefined,
-              raw: {
-                session_id: row.id,
-                source: row.source ?? null,
-                cwd: row.cwd ?? null,
-                source_path: path,
-              },
+              raw,
             },
             messages,
           };

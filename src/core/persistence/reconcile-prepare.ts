@@ -1,12 +1,14 @@
-import { ownerImportTrust } from '../trust/channel.ts';
+import { ownerImportTrust, ownerSourceGateInput } from '../trust/channel.ts';
 import { basename } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { importFromContent, type ParsedPage } from '../import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import { alignWithStored } from './align-stored.ts';
 import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, restoreHiddenFactRows, type ParsedFact } from '../facts-fence.ts';
 import { opError } from '../ops/contract.ts';
+import { privateRequestRefusal } from './visibility-request.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { sealPageTextProjection } from '../page-state/projections.ts';
@@ -21,9 +23,13 @@ import { preserveProtectedTakes } from './protected-takes.ts';
 import { digest, sha256 } from './digest.ts';
 import { mergeReconcile, reconcileCanonical, type ReconcileDecision } from './reconcile-merge.ts';
 import { stabilizeSafetyAssessments } from './reconcile-safety.ts';
-import { assertReconcilePins, readReconcileState, staleReconcile, validateReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
+import { fileWinsContent } from './file-wins-content.ts';
+import { ABSENT_FILE_HASH, assertReconcilePins, readCanonicalFileText, readReconcileState, reconcileFileReading, reconcileReadOptions, staleReconcile, validateReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
 import { verifyReconcileBackup } from './reconcile-backup.ts';
 import { assertAutoDecisions } from './reconcile-additive.ts';
+import { admissionAllows, readSyncAdmission } from './sync-admission.ts';
+import { bindOrigin } from './origin-guard.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 
 const pageFix = (sourceId: string, slug: string): Action => readFix(`Shows page ${slug} in source ${sourceId} as stored now, with its revision, read-only.`,
   { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] });
@@ -102,9 +108,11 @@ export async function prepareReconcileResult(engine: BrainEngine, state: Reconci
   const imported = await importFromContent(engine, state.pins.slug, content, {
     sourceId: state.pins.source_id, sourcePath: state.snapshot.page.source_path ?? state.originSourcePath ?? undefined,
     filename: basename(state.path).replace(/\.mdx?$/i, ''), noEmbed: true, remote: false, preserveGateMarkers: true, allowEmptyOverwrite: true,
+    overrideTier: (await ownerSourceGateInput(engine, state.pins.source_id, result.frontmatter)).tier,
     prepareFrontmatter: page => stabilizeSafetyAssessments(page.frontmatter, state.snapshot.page.frontmatter, state.pins.assessment_at),
-    prepare: async prepared => { ready = prepared; return prepared.result; },
+    prepare: async prepared => { ready = prepared; return prepared.result; }, holdNoncanonicalPrivate: true,
   });
+  if (imported.refusal?.code === 'visibility_noncanonical') throw privateRequestRefusal(state.pins, result.frontmatter);
   if (!ready || ready.slug !== state.pins.slug) throw opError('invalid_params', imported.error ?? 'Reconciliation cannot change page identity or deduplicate to another page.',
     `The reconciled content of ${state.pins.slug} in source ${state.pins.source_id} does not import as that same page (a changed frontmatter slug or a match to another page), and reconcile never changes page identity. Keep its slug as ${state.pins.slug} in the file. ${freshPreview(state.pins.source_id, state.pins.slug)}`,
     { fix: pageFix(state.pins.source_id, state.pins.slug) });
@@ -114,11 +122,26 @@ export async function prepareReconcileResult(engine: BrainEngine, state: Reconci
   return { ...merged, result: resolved, ready, project };
 }
 
+/**
+ * #6712 PR 4b (design v3.2 §8 fencing point 2): a keep_db reconcile (`intent.keepDb`, admitted by the sync pass) re-reads
+ * `sync.admission` at preparation and inside the publication transaction; when it is not `normal` the request completes
+ * `cancelled` with `admission_paused` (coordinator.ts) and nothing is written. The path is a candidate again on the next pass.
+ */
+async function assertKeepDbAdmission(engine: Pick<BrainEngine, 'executeRaw'>, row: WriteRequest): Promise<void> {
+  if (!row.intent?.keepDb) return;
+  const admission = await readSyncAdmission(engine);
+  if (admissionAllows(admission, 'destructive')) return;
+  throw opError('admission_paused', `sync.admission is ${admission}, so this keep_db write was cancelled before it published.`,
+    `Nothing was written to ${row.slug} in source ${row.source_id}. keep_db writes resume when sync.admission is normal again (gbrain config set sync.admission normal); the next sync pass admits this page again.`,
+    { fix: readFix('Shows the sync admission switch and what the newest pass paused, read-only.', { argv: ['gbrain', 'sync', 'status', '--source', row.source_id, '--json'] }) });
+}
+
 export async function prepareReconcileMutation(engine: BrainEngine, row: WriteRequest, _config: GBrainConfig): Promise<PreparedMutation> {
   if (row.operation !== 'put_page' || row.intent?.kind !== 'canonical_reconcile' || row.authority.remote !== false || row.authority.principal.kind !== 'local_cli') {
     throw trustedCliRequired('Canonical reconciliation requires trusted local administration.');
   }
   await authorizeStoredRequest(engine, row);
+  await assertKeepDbAdmission(engine, row);
   const artifact = validateReconcileArtifact(row.intent.preview);
   const reference = row.intent.backup_reference;
   if (typeof reference !== 'string') throw opError('storage_error', 'Reconciliation has no retained preimages.',
@@ -130,37 +153,48 @@ export async function prepareReconcileMutation(engine: BrainEngine, row: WriteRe
       `The resolved preview applied by request ${row.request_id} is not ready or names a different source, page or page id than ${row.slug} in source ${row.source_id}. ${freshPreview(row.source_id, row.slug)}`,
       { fix: receiptFix(row) });
   }
-  const state = await readReconcileState(engine, row.source_id, row.slug, artifact.preconditions.assessment_at);
+  const adopt = reconcileReadOptions(artifact);
+  const state = await readReconcileState(engine, row.source_id, row.slug, artifact.preconditions.assessment_at, adopt);
   assertReconcilePins(artifact.preconditions, state.pins);
   assertAutoDecisions(artifact.auto_decisions ?? [], state.file, reconcileCanonical(state.snapshot.page, state.snapshot.tags), artifact.decisions);
   const prepared = await prepareReconcileResult(engine, state, artifact.decisions);
   if (!prepared.ready || digest(prepared.result) !== artifact.result_digest) staleReconcile('canonical policy result changed');
-  const content = serializePageToMarkdown({ ...state.snapshot.page, ...prepared.result }, prepared.result.tags);
+  // #6643 / GBRA-133: a request that asks to keep the file's bytes (repair file-drift --prefer file) leaves the file as it is plus
+  // the protected parts reconcile kept (appended keys and timeline rows), and refuses any result that would re-render the file.
+  // #6712 wave: a preview that observed the file absent recreates it from the page and expects no bytes there.
+  const absent = state.pins.raw_file_hash === ABSENT_FILE_HASH;
+  const content = !absent && row.intent.keep_file_bytes === true
+    ? fileWinsContent(state.raw.toString('utf8'), state.file, prepared.result, text => readCanonicalFileText(state, row.slug, text), { sourceId: row.source_id, slug: row.slug })
+    : serializePageToMarkdown({ ...state.snapshot.page, ...prepared.result }, prepared.result.tags);
   const ready = prepared.ready;
   return {
     observedRevision: state.snapshot.revision, trust: await ownerImportTrust(engine, row, prepared.result.frontmatter, state.path),
-    file: { path: state.path, root: state.root, content, expectedBeforeHash: state.pins.raw_file_hash },
+    file: { path: state.path, root: state.root, content, expectedBeforeHash: absent ? null : state.pins.raw_file_hash },
     // A database-only page matched by its slug path always records that file as its origin.
     noop: ready.noop && sha256(content) === state.pins.raw_file_hash && state.origin === 'recorded',
+    ...(ready.afterCommit ? { afterCommit: (target: BrainEngine) => ready.afterCommit!(target) } : {}),
     validate: async tx => {
       await authorizeStoredRequest(tx, row, true);
-      assertReconcilePins(artifact.preconditions, (await readReconcileState(tx, row.source_id, row.slug, artifact.preconditions.assessment_at)).pins);
+      await assertKeepDbAdmission(tx, row);
+      assertReconcilePins(artifact.preconditions, (await readReconcileState(tx, row.source_id, row.slug, artifact.preconditions.assessment_at, adopt)).pins);
       verifyReconcileBackup(reference, artifact);
       await ready.validate(tx);
     },
     apply: async tx => {
-      await ready.apply(tx);
+      const installed = await ready.apply(tx);
       if (state.originSourcePath) {
-        await tx.executeRaw(`UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL
-          AND source_path IS NULL`, [row.source_id, row.slug, state.originSourcePath]);
-        // The page now has a canonical origin: drop the #5254 database-only classification.
-        await tx.executeRaw(`UPDATE pages SET database_only_reason=NULL WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL
-          AND database_only_reason='unbound_source' AND source_path IS NOT NULL`, [row.source_id, row.slug]);
+        await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: state.originSourcePath, onlyIfUnset: true, liveOnly: true });
       }
-      if (!ready.noop) { await prepared.project!(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
-      const final = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id });
+      // The page has a canonical origin (adopted above, or already recorded, #6536): drop the #5254 database-only classification.
+      await tx.executeRaw(`UPDATE pages SET database_only_reason=NULL WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL
+        AND database_only_reason IN ('unbound_source', 'origin_twin', 'mirror_read_only') AND source_path IS NOT NULL`, [row.source_id, row.slug]);
+      // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
+      if (!ready.noop) { await prepared.project!(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
+      const final = await materializedSnapshot(tx, await tx.readPageSnapshot(row.slug, { sourceId: row.source_id }));
       const scanStateTransferred = final ? await transferLegacyAtomPageState(tx, state.snapshot, final) : false;
-      const file = parseMarkdown(readFileSync(state.path, 'utf8'), row.slug);
+      const reading = reconcileFileReading(readFileSync(state.path, 'utf8'), state.importPath, final?.page ?? state.snapshot.page);
+      const file = parseMarkdown(reading.content, row.slug);
+      if (final) alignWithStored(file, final.page, reading.inferred);
       if (!sameCanonicalImport(final, prepared.result) || digest(reconcileCanonical(file, file.tags)) !== artifact.result_digest) {
         throw opError('storage_error', 'Reconciliation canonical readback did not match the reviewed result.',
           `After publishing, ${row.slug} in source ${row.source_id} read back differently from the reviewed result, so the database change rolled back and the owner's recovery restores the file. Inspect request ${row.request_id}'s receipt before anything else and do not apply the preview again until it is terminal.`,

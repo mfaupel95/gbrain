@@ -7,13 +7,13 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { rankFindings, runAdvisor } from '../src/core/advisor/run.ts';
+import { COLLECTORS, rankFindings, runAdvisor } from '../src/core/advisor/run.ts';
 import { collectUsageShape } from '../src/core/advisor/collect-usage-shape.ts';
 import { collectStalledJobs } from '../src/core/advisor/collect-stalled-jobs.ts';
 import { collectSetupSmells } from '../src/core/advisor/collect-setup-smells.ts';
 import { appendAdvisorRun, summarizeDeltas } from '../src/core/advisor/history.ts';
 import { renderAdvisorReport } from '../src/core/advisor/render.ts';
-import type { AdvisorContext, AdvisorFinding, AdvisorReport } from '../src/core/advisor/types.ts';
+import type { AdvisorCollector, AdvisorContext, AdvisorFinding, AdvisorReport } from '../src/core/advisor/types.ts';
 
 function finding(over: Partial<AdvisorFinding>): AdvisorFinding {
   return {
@@ -74,11 +74,93 @@ describe('runAdvisor resilience', () => {
     expect(Array.isArray(report.findings)).toBe(true);
   });
 
+  test('an unreachable engine is reported as collector_failed, never as healthy, without the error text', async () => {
+    const secret = 'postgres://alice-example:hunter2@db.example.invalid:5432/brain';
+    const fail = async () => { throw new Error(`connect ECONNREFUSED ${secret}`); };
+    const engine = { getStats: fail, getHealth: fail, getConfig: fail, executeRaw: fail };
+    const report = await runAdvisor(ctx(engine));
+    const ids = report.findings.map((f) => f.id);
+    expect(ids).toContain('collector_failed:usage-shape');
+    expect(ids).toContain('collector_failed:stalled-jobs');
+    expect(report.worst).not.toBeNull();
+    expect(renderAdvisorReport(report)).not.toContain('looks healthy');
+    expect(JSON.stringify(report)).not.toContain('hunter2');
+  });
+
   test('drops workspace_dependent findings when remote', async () => {
     const wd = finding({ id: 'wd', workspace_dependent: true });
     // simulate by ranking + the remote filter logic via runAdvisor is internal;
     // assert the flag exists so the filter has something to act on.
     expect(wd.workspace_dependent).toBe(true);
+  });
+});
+
+const THROWN_SECRET = 'postgres://alice-example:hunter2@db.example.invalid:5432/brain connect ECONNREFUSED';
+
+const throwingCollector: AdvisorCollector = {
+  id: 'throwing-check',
+  collect: async () => { throw new Error(THROWN_SECRET); },
+};
+const cleanCollector: AdvisorCollector = { id: 'clean-check', collect: async () => [] };
+const criticalCollector: AdvisorCollector = {
+  id: 'critical-check',
+  collect: async () => [finding({ id: 'crit', severity: 'critical', collector: 'critical-check' })],
+};
+
+/** Swap the shared COLLECTORS array contents for the duration of fn (restored in finally). */
+async function withCollectors<T>(swap: AdvisorCollector[], fn: () => Promise<T>): Promise<T> {
+  const saved = COLLECTORS.slice();
+  COLLECTORS.splice(0, COLLECTORS.length, ...swap);
+  try {
+    return await fn();
+  } finally {
+    COLLECTORS.splice(0, COLLECTORS.length, ...saved);
+  }
+}
+
+describe('runAdvisor collector failure (#6936)', () => {
+  test('a thrown collector is a warn finding, never a clean report', async () => {
+    const report = await withCollectors([throwingCollector, cleanCollector], () => runAdvisor(ctx({})));
+    expect(report.findings.map((f) => f.id)).toEqual(['collector_failed:throwing-check']);
+    const f = report.findings[0]!;
+    expect(f.severity).toBe('warn');
+    expect(f.collector).toBe('throwing-check');
+    expect(f.fix.command_argv).toBeNull();
+    expect(f.fix.dispatch_id).toBeUndefined();
+    expect(report.worst).toBe('warn');
+  });
+
+  test('the thrown message, stack and connection details never reach the report', async () => {
+    const report = await withCollectors([throwingCollector], () => runAdvisor(ctx({})));
+    const out = JSON.stringify(report) + renderAdvisorReport(report);
+    expect(out).not.toContain('hunter2');
+    expect(out).not.toContain('ECONNREFUSED');
+    expect(out).not.toContain('db.example.invalid');
+    expect(out).not.toContain('alice-example');
+    expect(out).not.toContain('Error:');
+  });
+
+  test('findings from unaffected collectors are kept and a critical still wins', async () => {
+    const report = await withCollectors([throwingCollector, criticalCollector], () => runAdvisor(ctx({})));
+    expect(report.findings.map((f) => f.id)).toEqual(['crit', 'collector_failed:throwing-check']);
+    expect(report.worst).toBe('critical');
+  });
+
+  test('a fully successful clean run still reports nothing', async () => {
+    const report = await withCollectors([cleanCollector], () => runAdvisor(ctx({})));
+    expect(report.findings).toEqual([]);
+    expect(report.worst).toBeNull();
+  });
+
+  test('remote runs still drop workspace-dependent findings and still report the failure', async () => {
+    const wd: AdvisorCollector = {
+      id: 'wd-check',
+      collect: async () => [finding({ id: 'wd', workspace_dependent: true, collector: 'wd-check' })],
+    };
+    const remote = await withCollectors([wd, throwingCollector], () => runAdvisor(ctx({}, { remote: true })));
+    expect(remote.findings.map((f) => f.id)).toEqual(['collector_failed:throwing-check']);
+    const local = await withCollectors([wd, throwingCollector], () => runAdvisor(ctx({}, { remote: false })));
+    expect(local.findings.map((f) => f.id).sort()).toEqual(['collector_failed:throwing-check', 'wd']);
   });
 });
 
@@ -98,6 +180,19 @@ describe('collect-usage-shape', () => {
     expect(ids).toContain('orphan_pages');
   });
 
+  test('getStats failure → throws for runAdvisor, not an empty-brain pass', async () => {
+    const engine = { getStats: async () => { throw new Error('password authentication failed for user "x"'); } };
+    await expect(collectUsageShape.collect(ctx(engine as never))).rejects.toThrow('password authentication failed');
+  });
+
+  test('getHealth failure on a non-empty brain → throws for runAdvisor', async () => {
+    const engine = {
+      getStats: async () => ({ page_count: 100, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0, pages_by_type: {} }),
+      getHealth: async () => { throw new Error('statement timeout'); },
+    };
+    await expect(collectUsageShape.collect(ctx(engine as never))).rejects.toThrow('statement timeout');
+  });
+
   test('empty brain → no findings', async () => {
     const engine = { getStats: async () => ({ page_count: 0, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0, pages_by_type: {} }) };
     expect(await collectUsageShape.collect(ctx(engine as never))).toEqual([]);
@@ -105,9 +200,36 @@ describe('collect-usage-shape', () => {
 });
 
 describe('collect-stalled-jobs', () => {
+  // Fails only the query that reads `table`; every other query returns no rows.
+  function failingOn(table: string, err: unknown) {
+    return {
+      executeRaw: async (sql: string) => {
+        if (new RegExp(`FROM ${table}\\b`).test(sql)) throw err;
+        return [];
+      },
+    };
+  }
+
   test('absent minion_jobs table → no error, no finding', async () => {
-    const engine = { executeRaw: async () => { throw new Error('relation "minion_jobs" does not exist'); } };
+    const engine = failingOn('minion_jobs', new Error('relation "minion_jobs" does not exist'));
     expect(await collectStalledJobs.collect(ctx(engine as never))).toEqual([]);
+  });
+
+  test('old brain without sources.last_sync_at or sources → no finding', async () => {
+    const noColumn = failingOn('sources', Object.assign(new Error('column "last_sync_at" does not exist'), { code: '42703' }));
+    expect(await collectStalledJobs.collect(ctx(noColumn as never))).toEqual([]);
+    const noTable = failingOn('sources', Object.assign(new Error('relation "sources" does not exist'), { code: '42P01' }));
+    expect(await collectStalledJobs.collect(ctx(noTable as never))).toEqual([]);
+  });
+
+  test('unexpected jobs-query failure → throws for runAdvisor', async () => {
+    const engine = failingOn('minion_jobs', Object.assign(new Error('permission denied for table minion_jobs'), { code: '42501' }));
+    await expect(collectStalledJobs.collect(ctx(engine as never))).rejects.toThrow('permission denied');
+  });
+
+  test('a different missing relation is not mistaken for an old brain', async () => {
+    const engine = failingOn('sources', Object.assign(new Error('relation "sources_v2" does not exist'), { code: '42P01', table_name: 'sources_v2' }));
+    await expect(collectStalledJobs.collect(ctx(engine as never))).rejects.toThrow('sources_v2');
   });
 
   test('reports stalled jobs and stale sync', async () => {
@@ -166,5 +288,15 @@ describe('renderAdvisorReport', () => {
   test('healthy brain renders the all-clear', () => {
     const txt = renderAdvisorReport({ version: '0.43.0.0', generated_at: 'x', findings: [], worst: null });
     expect(txt).toContain('looks healthy');
+  });
+
+  test('a failed collector is rendered as an incomplete check, never as healthy (#6936)', async () => {
+    const report = await withCollectors([throwingCollector], () => runAdvisor(ctx({})));
+    const txt = renderAdvisorReport(report);
+    expect(txt).not.toContain('looks healthy');
+    expect(txt).toContain('[WARN]');
+    expect(txt).toContain('throwing-check');
+    expect(txt).toContain('could not complete');
+    expect(txt).not.toContain('--apply <id>');
   });
 });

@@ -7,6 +7,11 @@
  * earlier stored version of the page produced and its current text dropped
  * are removals, not history (`timeline_orphans`, `extract timeline
  * --prune-orphans`), so they are not counted or materialized here.
+ *
+ * Only inline pages are classified and repaired: a segmented page (Wave B)
+ * keeps its body in segments and this repair re-publishes the whole body as
+ * one string. Segmented pages carrying timeline rows are counted and named
+ * as a residual (`segmentedTimelinePages`) instead.
  */
 import type { BrainEngine } from '../engine.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
@@ -43,7 +48,7 @@ async function classifyTimelinePage(engine: BrainEngine, page: TimelinePage, sto
 export async function recountTimelinePages(engine: BrainEngine, sourceIds: string[], ids: number[]) {
   if (ids.length === 0) return [];
   const pages = await engine.executeRaw<TimelinePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p
-    WHERE p.id = ANY($1::bigint[]) AND p.source_id=ANY($2::text[]) AND p.deleted_at IS NULL`, [ids, sourceIds]);
+    WHERE p.id = ANY($1::bigint[]) AND p.source_id=ANY($2::text[]) AND p.deleted_at IS NULL AND p.body_storage='inline'`, [ids, sourceIds]);
   const stored = await storedRowsByPage(engine, pages);
   const counted = [];
   for (const page of pages) counted.push({ id: page.id, ...await classifyTimelinePage(engine, page, stored.get(Number(page.id))) });
@@ -60,7 +65,7 @@ export async function scanTimelineHistory(engine: BrainEngine, sourceIds: string
   let cursor = afterId, inspected = 0, truncated = false;
   for (;;) {
     const batch = await engine.executeRaw<TimelinePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p
-      WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND p.id>$2
+      WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND p.id>$2 AND p.body_storage='inline'
         AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id=p.id AND t.event_page_id IS NULL)
       ORDER BY p.id LIMIT ${BATCH}`, [sourceIds, cursor]);
     const stored = await storedRowsByPage(engine, batch);
@@ -78,6 +83,33 @@ export async function scanTimelineHistory(engine: BrainEngine, sourceIds: string
   }
 }
 
+/** Slugs a segmented-page residual names (the counts cover every page). */
+export const SEGMENTED_SAMPLE = 10;
+
+/**
+ * Segmented pages carrying non-event timeline rows: this repair cannot classify or
+ * materialize them (it re-publishes the whole body as one string), so they are
+ * counted, with their rows, and the first SEGMENTED_SAMPLE are named.
+ */
+export async function segmentedTimelinePages(engine: BrainEngine, sourceIds: string[]): Promise<{ pages: number; rows: number; sample: string[] }> {
+  const [counts] = await engine.executeRaw<{ pages: number; rows: number }>(`SELECT count(DISTINCT p.id)::int AS pages, count(*)::int AS rows
+    FROM timeline_entries t JOIN pages p ON p.id=t.page_id
+    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND p.body_storage='segmented' AND t.event_page_id IS NULL`, [sourceIds]);
+  if (!counts?.pages) return { pages: 0, rows: 0, sample: [] };
+  const named = await engine.executeRaw<{ source_id: string; slug: string }>(`SELECT p.source_id, p.slug FROM pages p
+    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND p.body_storage='segmented'
+      AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id=p.id AND t.event_page_id IS NULL)
+    ORDER BY p.id LIMIT ${SEGMENTED_SAMPLE}`, [sourceIds]);
+  return { pages: Number(counts.pages), rows: Number(counts.rows), sample: named.map(page => `${page.source_id}:${page.slug}`) };
+}
+
+/** The sentence a preview or doctor prints for segmented pages carrying timeline rows. */
+export function segmentedTimelineNote(segmented: { pages: number; rows: number; sample: string[] }): string {
+  return `${segmented.rows} timeline row(s) on ${segmented.pages} segmented page(s) (${segmented.sample.join(', ')}${segmented.pages > segmented.sample.length ? ', …' : ''}) `
+    + 'are not checked for a bullet in their page or materialized: gbrain repair timeline re-publishes a whole body as one string, so it does not handle segmented pages, '
+    + 'and no command does yet. The rows are kept as-is.';
+}
+
 export const timelineRepair: RepairHandler = {
   kind: 'timeline',
   async plan(engine: BrainEngine, scope: RepairScope, after: RepairCursor | null) {
@@ -90,9 +122,12 @@ export const timelineRepair: RepairHandler = {
     // #6184: such rows are never rendered back (they would duplicate a section END marker); name the cleanup.
     const warnings = markup ? [`timeline_comment_markup: ${markup} timeline row(s) carry HTML comment markup and stay database-side; `
       + `preview the cleanup with gbrain repair timeline-comments${scope.source_ids.length === 1 ? ` --source ${scope.source_ids[0]}` : ''}.`] : [];
+    const segmented = await segmentedTimelinePages(engine, scope.source_ids);
+    if (segmented.pages) warnings.push(`segmented_pages: ${segmentedTimelineNote(segmented)}`);
     return { ...(warnings.length ? { warnings } : {}), items, residuals: {
       materializable_rows: pages.reduce((n, p) => n + p.materializable, 0),
       kept_unrenderable_rows: pages.reduce((n, p) => n + p.unrenderable, 0),
+      ...(segmented.pages ? { segmented_pages: segmented.pages, segmented_rows: segmented.rows } : {}),
     } };
   },
   async apply(ctx, item) {

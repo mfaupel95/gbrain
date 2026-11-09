@@ -5,6 +5,7 @@ import { JOB_CHILD_EXIT_USAGE } from '../../core/minions/worker-exit-codes.ts';
 import { CHILD_ENV } from '../../core/minions/job-isolation.ts';
 import { MinionWorker } from '../../core/minions/worker.ts';
 import { runChildJobEntry, writeChildBootstrapError } from '../../core/minions/run-child.ts';
+import { CHILD_PARENT_BUILD_ENV } from '../../core/minions/child-readiness.ts';
 
 export async function runJobsRunChild({ args, engine }: JobsCommandContext): Promise<void> {
   // Lazy: jobs.ts imports this module statically, so a static import back would be a cycle.
@@ -52,6 +53,7 @@ export async function runJobsRunChild({ args, engine }: JobsCommandContext): Pro
           lockToken,
           resultPath,
           parentPid: Number.isInteger(parentPidRaw) && parentPidRaw > 0 ? parentPidRaw : 0,
+          parentBuild: process.env[CHILD_PARENT_BUILD_ENV],
         },
         { resolveHandler: (name) => throwaway.getHandler(name) },
       );

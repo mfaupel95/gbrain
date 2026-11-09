@@ -45,7 +45,8 @@
 import { readdirSync, lstatSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { pathToSlug } from './sync.ts';
+import { pathToSlug, readMetafilePagesMode, unsyncableReason } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
 import { readSlugRootMode } from './sync-anchor.ts';
 import { git } from './sync-git.ts';
 
@@ -63,6 +64,8 @@ export interface MisroutedSample {
 export interface MisroutedResult {
   /** True when the FS walk hit the limit/timeout and the result is partial. */
   walk_truncated: boolean;
+  /** Which bound stopped the walk: the per-source file limit or the shared deadline; null when it finished. */
+  truncated_by?: 'files' | 'time' | null;
   /** Per-source breakdown: slugs that appear at (default, slug) but NOT at (X, slug). */
   count: number;
   sample: MisroutedSample[];
@@ -99,7 +102,7 @@ const SAMPLE_LIMIT = 5;
  * read errors on individual entries. Returns relative paths from `root`.
  *
  * Bounded by `limit` (max files) and `deadlineMs` (epoch ms). Returns early
- * with `truncated=true` if either bound is hit. An unreadable root sets
+ * with `truncated` naming the bound (`files` or `time`) if either is hit. An unreadable root sets
  * `rootUnreadable`; each unreadable directory below it counts in
  * `unreadableDirs`, so callers can tell "nothing to check" from "could not read".
  */
@@ -107,9 +110,9 @@ function walkMarkdownAndMdxFiles(
   root: string,
   limit: number,
   deadlineMs: number,
-): { files: { relPath: string }[]; truncated: boolean; rootUnreadable: boolean; unreadableDirs: number } {
+): { files: { relPath: string }[]; truncated: 'files' | 'time' | null; rootUnreadable: boolean; unreadableDirs: number } {
   const files: { relPath: string }[] = [];
-  let truncated = false;
+  let truncated: 'files' | 'time' | null = null;
   let unreadableDirs = 0;
   function walk(d: string): void {
     if (truncated) return;
@@ -139,7 +142,7 @@ function walkMarkdownAndMdxFiles(
       if (isDir) {
         // Time check on directory descent too, so a deep dependency-free
         // tree still respects the deadline even before any .md is found.
-        if (Date.now() >= deadlineMs) { truncated = true; return; }
+        if (Date.now() >= deadlineMs) { truncated = 'time'; return; }
         walk(full);
         continue;
       }
@@ -148,13 +151,13 @@ function walkMarkdownAndMdxFiles(
       if (entry.startsWith('_')) continue; // matches extract.ts convention
       files.push({ relPath: relative(root, full) });
       if (files.length >= limit) {
-        truncated = true;
+        truncated = 'files';
         return;
       }
       // Time check is cheap; do it on every push so a slow filesystem can't
       // run unbounded.
       if (Date.now() >= deadlineMs) {
-        truncated = true;
+        truncated = 'time';
         return;
       }
     }
@@ -166,7 +169,7 @@ function walkMarkdownAndMdxFiles(
     statSync(root); // probe readable; throws ENOENT/EACCES if not
     readdirSync(root);
   } catch {
-    return { files, truncated: false, rootUnreadable: true, unreadableDirs: 0 };
+    return { files, truncated: null, rootUnreadable: true, unreadableDirs: 0 };
   }
   walk(root);
   return { files, truncated, rootUnreadable: false, unreadableDirs };
@@ -179,28 +182,22 @@ function walkMarkdownAndMdxFiles(
  * Engine-agnostic: uses executeRaw with a VALUES clause. PGLite + Postgres
  * both support the shape.
  */
-async function batchProbeExistence(
+export async function batchProbeExistence(
   engine: BrainEngine,
   slugs: string[],
   sourceId: string,
 ): Promise<Map<string, Set<string>>> {
   if (slugs.length === 0) return new Map();
-  // Build a positional VALUES clause: ($1::text), ($2), ($3), ...
-  const valuePlaceholders = slugs.map((_, i) => `($${i + 1}::text)`).join(', ');
-  const sourceParamIdx = slugs.length + 1;
-  const sql = `
-    WITH candidates(slug) AS (VALUES ${valuePlaceholders})
+  // One array parameter, not one per slug: a source past 65,533 files exceeds the bind-parameter cap (#7388).
+  const rows = await engine.executeRaw<{ slug: string; source_id: string | null }>(`
+    WITH candidates(slug) AS (SELECT unnest($1::text[]))
     SELECT c.slug, p.source_id
     FROM candidates c
     LEFT JOIN pages p
       ON p.slug = c.slug AND p.deleted_at IS NULL
-         AND p.source_id IN ('default', $${sourceParamIdx}::text)
+         AND p.source_id IN ('default', $2::text)
     ORDER BY c.slug, p.source_id
-  `;
-  const rows = await engine.executeRaw<{ slug: string; source_id: string | null }>(
-    sql,
-    [...slugs, sourceId],
-  );
+  `, [slugs, sourceId]);
   const map = new Map<string, Set<string>>();
   for (const r of rows) {
     if (!map.has(r.slug)) map.set(r.slug, new Set());
@@ -244,20 +241,21 @@ export async function findMisroutedPages(
   const deadlineMs = Date.now() + timeoutMs;
 
   let totalCount = 0;
-  let walkTruncated = false;
+  let truncatedBy: MisroutedResult['truncated_by'] = null;
   const sample: MisroutedSample[] = [];
   const gitRootSkipped: string[] = [];
   const unreadable: MisroutedResult['unreadable_sources'] = [];
+  const metafilePages = await readMetafilePagesMode(engine);
 
   for (const src of sources) {
     if (src.id === 'default') continue;
     if (!src.local_path) continue;
     if (Date.now() >= deadlineMs) {
-      walkTruncated = true;
+      truncatedBy ??= 'time';
       break;
     }
     const { files, truncated, rootUnreadable, unreadableDirs } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
-    if (truncated) walkTruncated = true;
+    if (truncated) truncatedBy ??= truncated;
     if (rootUnreadable) unreadable.push({ source_id: src.id, reason: 'root_unreadable', dirs: 1 });
     else if (unreadableDirs > 0) unreadable.push({ source_id: src.id, reason: 'subdirs_unreadable', dirs: unreadableDirs });
     if (files.length === 0) continue;
@@ -271,7 +269,16 @@ export async function findMisroutedPages(
     }
 
     // Convert FS paths to canonical slugs (lowercased, extension stripped).
-    const slugs = Array.from(new Set(files.map(f => pathToSlug(prefix + f.relPath))));
+    // Sync refuses metafiles (root AGENTS.md/CLAUDE.md, README.md, ...), pruned
+    // dirs and malformed names, so they never become pages in this source and
+    // a same-slug page on default is not a misroute (#6681).
+    // A typed nested metafile is a page (GBRA-150), judged on its file below the source root.
+    const heads = diskMetafileHeads(src.local_path);
+    const metafilePage = metafilePagePredicate(metafilePages, path => heads(path.slice(prefix.length)), path => path.slice(prefix.length));
+    const slugs = Array.from(new Set(files
+      .map(f => prefix + f.relPath)
+      .filter(path => unsyncableReason(path, { strategy: 'markdown', metafilePage }) === null)
+      .map(path => pathToSlug(path))));
     const existenceMap = await batchProbeExistence(engine, slugs, src.id);
 
     for (const slug of slugs) {
@@ -290,7 +297,7 @@ export async function findMisroutedPages(
   }
 
   return {
-    walk_truncated: walkTruncated, count: totalCount, sample, git_root_skipped: gitRootSkipped,
+    walk_truncated: truncatedBy !== null, truncated_by: truncatedBy, count: totalCount, sample, git_root_skipped: gitRootSkipped,
     unreadable_sources: unreadable, limit, timeout_ms: timeoutMs,
   };
 }

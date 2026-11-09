@@ -182,6 +182,18 @@ describe('generic remote job authority', () => {
     await expect(jobsOperations.find(op => op.name === 'retry_job')!.handler(ctx(), { id: local.id })).rejects.toThrow('submitting principal');
   }));
 
+  test('#7241: a remote submit carrying __submitter never shows as a local submitter', () => isolated(async () => {
+    const operation = jobsOperations.find(op => op.name === 'submit_job')!;
+    await expect(operation.handler(ctx(), { name: 'lint', data: { __submitter: 'autopilot' } })).rejects.toThrow('unsupported');
+    const result = await operation.handler(ctx(), { name: 'lint', data: {} }) as Record<string, unknown>;
+    expect((await queue.getJob(result.id as number))?.data.__submitter).toBeUndefined();
+    await engine.executeRaw(`UPDATE minion_jobs SET data = data || '{"__submitter":"autopilot"}'::jsonb WHERE id = $1`, [result.id]);
+    const get = jobsOperations.find(op => op.name === 'get_job')!;
+    const host = { ...ctx(), remote: false, auth: undefined };
+    expect((await get.handler(host, { id: result.id }) as Record<string, unknown>).submitted_by)
+      .toEqual({ kind: 'mcp_client', id: 'client-a', principal_kind: 'oauth_client' });
+  }));
+
   test('legacy preview is inert, CAS detects changes, exact IDs retain scheduling and dependencies', () => isolated(async () => {
     const parent = await queue.add('maintenance', {});
     const child = await queue.add('lint', { dir: root }, { parent_job_id: parent.id, delay: 5000 });

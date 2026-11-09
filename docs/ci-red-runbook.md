@@ -48,6 +48,16 @@ response: a repair PR whose body says `Fixes #<issue>`.
   by hand with a comment naming the replacement, or replay E2E files:
   `gh workflow run e2e.yml --ref master -f full_corpus=true`, then
   `gh workflow run nightly-watch.yml -f run_id=<that run id> -f replay_issue=<issue>`.
+- **Reused full-suite runs:** a push run that reused an identical-tree full
+  run (a succeeded `reused-full-suite` job) is judged by the run its
+  `reuse.json` names, at the recorded attempt: its jobs and its complete
+  `ci-manifest` clear or confirm failures as if the push had run them. An
+  unreadable or mismatched record, a different tree, or a missing or
+  incomplete source manifest is incomplete evidence and clears nothing.
+- **Closed by hand:** a closed issue whose JSON block is still red ends that
+  incident. The watch records later runs on it as green (its body says it was
+  closed by hand) and never reopens it or opens a new issue for its failures;
+  only a new red push run opens a new incident.
 - **Serialization:** each watch queues on one group per repository, target
   workflow and track (`schedule` or `push`; a replay writes `push`). Before the
   first write it re-reads the issue and re-plans when the issue moved. When two
@@ -81,6 +91,10 @@ The nightly E2E workflow's `order-hunt` job (also `gh workflow run e2e.yml -f or
 - **Seed:** the UTC day number by default, so each night tries a different order; the seed and shard are in the step summary.
 - **A failure** is rerun alone. A file that passes alone is reported as `order-dependent test` with `bash scripts/run-e2e.sh <the files before it, in order> <file>` to replay it; bisect the files before it to find the one that leaks, and fix that file's teardown. A file that also fails alone is only a warning here, since the full E2E lanes report it.
 - The job is keyless and outside `e2e-status`, so it never blocks a PR; a red order hunt turns the E2E nightly red.
+
+## Paid lanes switch
+
+The repository variable `GBRAIN_PAID_LANES=0` switches every paid lane off: Tier 2 (LLM Skills) in `e2e.yml`, the hermes door's paid leg and the OpenCode credentialed lane in `heavy-tests.yml` (#5903). Use it on a fork or during a spend freeze; unset (or any other value) keeps the lanes on. Each lane writes a visible "paid lanes disabled" step summary, and `e2e-status` accepts Tier 2 as `skipped` only under that exact value, saying so in its own summary; any other skip, failure or cancellation still fails the aggregate (`test/paid-lanes-switch-5903.test.ts` runs the aggregate script with every combination). A run with the variable set is not green coverage of the paid lanes. Tier 2 runs keyed only on the nightly E2E schedule (and a `full_corpus` dispatch); elsewhere `e2e-status` accepts its skip with a "not run: keys withheld" notice, and a nightly run in which any Tier 2 test skipped fails (`scripts/require-executed-tests.ts`).
 
 ## CI failure manifest
 

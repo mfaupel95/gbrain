@@ -64,6 +64,7 @@ async function seed(engine: BrainEngine) {
   await addPage('dream', src, null, { dream_generated: true });
   await addPage('transcript', src, null, { transcript_import: { harness: 'codex', session_id: 's1' } });
   await addPage('extracted', src, null, { provenance: 'auto-extracted' });
+  await addPage('atom', src, null, { type: 'atom', extracted_by: 'extract_atoms-v0.41.2.1', source_slug: 'p/plain' });
   await addPage('plain', src, null);
   await addPage('connector', connector, null);
 
@@ -98,7 +99,7 @@ async function seed(engine: BrainEngine) {
   return { src, connector, pages, facts, take: Number(take!.id), entry: Number(entry!.id) };
 }
 type Fixture = Awaited<ReturnType<typeof seed>>;
-const EXPECTED_PAGES = { webhook: 'external_untrusted', mcp: 'agent_written', dream: 'agent_written', transcript: 'agent_written', extracted: 'agent_written', plain: 'unknown', connector: 'external_untrusted' };
+const EXPECTED_PAGES = { webhook: 'external_untrusted', mcp: 'agent_written', dream: 'agent_written', transcript: 'agent_written', extracted: 'agent_written', atom: 'agent_written', plain: 'unknown', connector: 'external_untrusted' };
 const EXPECTED_FACTS = {
   sync_request: 'operator_curated', put_page_request: 'agent_written', remote_request: 'agent_written', connector_request: 'external_untrusted',
   other_request: 'unknown', compacted_request: 'unknown', lane: 'agent_written', fenced_external: 'external_untrusted', plain: 'unknown', connector: 'external_untrusted',
@@ -216,7 +217,7 @@ describe('trust backfill dry run before the trust migration', () => {
     expect(Number(after!.n)).toBe(Number(before!.n));
     expect(report.schema).toBe('pre_trust');
     expect(report.tables.every(t => t.current === undefined)).toBe(true);
-    expect(report.projected).toEqual({ user_confirmed: 0, operator_curated: 1, tool_observed: 0, agent_written: 8, unknown: 4, external_untrusted: 6 });
+    expect(report.projected).toEqual({ user_confirmed: 0, operator_curated: 1, tool_observed: 0, agent_written: 9, unknown: 4, external_untrusted: 6 });
     expect(report.rows).toBe(Object.keys(f.pages).length + Object.keys(f.facts).length + 2);
     expect((await doctor(engine)).details).toEqual({ schema: 'pre_trust' });
     await expect(runTrustBackfill(engine, { log: quiet })).rejects.toMatchObject({ code: 'migrations_pending' });

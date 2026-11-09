@@ -28,6 +28,9 @@ import { installPageEmbeddings, installPageProjection, readProjectionSnapshot } 
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
+import { EFFECT_BYTES_SQL, RECEIPT_RESERVATION_FLOOR, retainedReceiptBytes } from '../src/core/persistence/receipt-bytes.ts';
+import type { WriteRequest } from '../src/core/persistence/model.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
 const signature = 'test:model:1536';
@@ -72,7 +75,7 @@ for (const kind of testBackends()) {
       await installPageProjection(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}` }], { seal: true });
       if (embedded) {
         const sealed = (await readProjectionSnapshot(engine, slug, sourceId))!;
-        expect(await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}`, embedding: vector(), model }], signature)).toBe(true);
+        expect((await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}`, embedding: vector(), model }], signature)).complete).toBe(true);
       }
       // Only embedding effects are due; Git and other effects of these writes wait.
       await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE kind<>'embedding'");
@@ -122,6 +125,23 @@ for (const kind of testBackends()) {
       expect(reembedded.filter(slug => !embedded.some(text => text.includes(`Body of ${slug}`)))).toEqual([]);
       expect(embedded.filter(text => /Body of mixed\/(noop-|stale-attempted)/.test(text))).toEqual([]);
       for (const p of [pending, ...Object.values(stale).filter(p => p.slug !== 'mixed/stale-unsealed')]) expect((await row(p.effectId)).state).toBe('committed');
+    });
+
+    check('#6696 (A1): after embed --stale, the bulk settle that finishes a request\'s last effect gives back its unused reservation', async () => {
+      await reset();
+      const p = await page('trueup/noop', true);
+      await engine.transaction(async tx => {
+        await declarePersistenceProtocol(tx);
+        await tx.executeRaw("UPDATE persistence_effects SET state='committed',outcome='{}'::jsonb WHERE request_id=$1::uuid AND kind<>'embedding'", [p.requestId]);
+      });
+      const reservation = async () => Number((await engine.executeRaw<{ n: string }>('SELECT terminal_reservation::text AS n FROM persistence_requests WHERE id=$1::uuid', [p.requestId]))[0]!.n);
+      expect(await reservation()).toBe(RECEIPT_RESERVATION_FLOOR);
+      await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=$1', [p.effectId]);
+      expect((await settleNoopEmbeddingEffects(engine, localHostId(), signature)).settled).toBe(1);
+      const [request] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [p.requestId]);
+      const [{ bytes }] = await engine.executeRaw<{ bytes: string }>(`SELECT SUM(${EFFECT_BYTES_SQL})::text AS bytes FROM persistence_effects WHERE request_id=$1::uuid`, [p.requestId]);
+      expect(await reservation()).toBe(retainedReceiptBytes(request!, { stage: 'terminal', effects: Number(bytes) }));
+      expect(await reservation()).toBeLessThan(RECEIPT_RESERVATION_FLOOR);
     });
 
     check('a settled no-op ends with the same row the runner leaves for one', async () => {
@@ -195,7 +215,7 @@ for (const kind of testBackends()) {
       expect(opened).toBe(0);
       // A stale effect that becomes a no-op behind the cursor is the runner's; a new no-op past it settles here.
       const sealed = (await readProjectionSnapshot(engine, stale[0]!.slug, stale[0]!.sourceId))!;
-      expect(await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${stale[0]!.slug}`, embedding: vector(), model }], signature)).toBe(true);
+      expect((await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${stale[0]!.slug}`, embedding: vector(), model }], signature)).complete).toBe(true);
       const fresh = await page('cursor/fresh', true);
       await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=ANY($1::text[]::bigint[])', [[stale[0]!.effectId, fresh.effectId]]);
       expect(await settleNoopEmbeddingEffects(engine, localHostId(), signature, second.cursor)).toMatchObject({ settled: 1, done: true });

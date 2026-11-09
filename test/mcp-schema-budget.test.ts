@@ -38,6 +38,21 @@
  * disclosure), get_write_request (poll cadence and final states),
  * add_timeline_entry (when no call is needed) and the instructions (write
  * guidance); the served list still fits 25,000 model-visible characters.
+ * Wave 16 (#6040 item 1): query and search both name people/companies/projects
+ * by topic as `query` work (+77, the measured routing fix), paid for by
+ * redundant words in unowned tool text (`(v1)` on six verb labels, `Optional;`
+ * on request_id, examples that repeat the description); the served list is
+ * measured at 24,768 and must keep SERVED_STARTER_MIN_HEADROOM free so the
+ * next description edit does not land on the ceiling again.
+ * GBRA-156 (harnesses re-fetch tools/list every turn): the served list was
+ * 26,546 bytes; the starter list now leaves out params MCP callers cannot use
+ * (local-only, server-set), legacy and duplicate params, admin, versioned
+ * skill-catalog, image and code-search params, and tuning or recovery knobs
+ * with safe defaults (a refusal that needs one names it). Dispatch accepts
+ * them on every surface and request_tools {tools} returns them; MEMORY VERB
+ * prefixes went too. Measured 19,489 bytes (17,737 model-visible characters,
+ * 4,037 tokens); every ceiling below came down with it, keeping room for the
+ * parallel search/query source_ids param.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -45,15 +60,19 @@ import { operations, type Operation } from '../src/core/operations.ts';
 import { filterOpsForSurface, STARTER_OPS } from '../src/mcp/surface.ts';
 import { buildToolDefs } from '../src/mcp/tool-defs.ts';
 import { stdioVisibleTools } from '../src/mcp/server.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
+import { buildMcpInstructions, GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
 import { cl100kAvailable, estimateTokens } from '../src/core/chunkers/token-estimate.ts';
 
-const SERVED_STARTER_MAX_CHARS = 25_000;
-const SERVED_STARTER_MAX_TOKENS = 5_700;
-/** The whole tools/list JSON, annotations included (25,735 measured at v0.60.46.0; traverse_graph's `hops` is full-surface-only, 25,941 measured; 26,402 once mute_notice, the dismissal for the coaching notices starter sessions receive, joined starter; 26,671 with #6007's put_page wait_ms param and write guidance, which carry the put_pages hint and the receipt poll rule starter agents need; 26,679 with delta's opaque `cursor` param, paid for by trimming delta's own descriptions, model-visible 24,985). */
-const SERVED_STARTER_MAX_JSON_CHARS = 26_700;
+const SERVED_STARTER_MAX_CHARS = 18_827; // GBRA-217: +120 for get_page `as_of` on starter (decision 9: valid-time reads for delegating agents; `reason` moved to the full surface to pay part of it); GST-927: +100 for get_page's one-window-selector rule (GPT-6.1 Sol sent lines, bytes and around_chunk_id together on 436 of 607 recorded calls); get_page's own text paid 3; GBRA-219 (#7795, GBRA-108 decision A): memory_conversation_mode joins starter (the per-conversation save switch, approved in the GBRA-219 plan), its description and the instructions clause trimmed first: +407 (18,507 served, 200 headroom kept); 18,609 served on the train (headroom 218)
+/** Headroom the served starter list must keep under the ceiling (wave 16: 24,998 of 25,000 left 2 characters; 200 is what the wave reaches without touching text other threads own, raised to 300 once the entity card and query/search trims land). */
+const SERVED_STARTER_MIN_HEADROOM = 200;
+const SERVED_STARTER_MAX_TOKENS = 4_300; // 4,244 measured on the GBRA-286 train
+/** The whole tools/list JSON, annotations included (25,735 measured at v0.60.46.0; traverse_graph's `hops` is full-surface-only, 25,941 measured; 26,402 once mute_notice, the dismissal for the coaching notices starter sessions receive, joined starter; 26,671 with #6007's put_page wait_ms param and write guidance, which carry the put_pages hint and the receipt poll rule starter agents need; 26,679 with delta's opaque `cursor` param, paid for by trimming delta's own descriptions, model-visible 24,985; 26,692 with recall's `question` param, paid for by trimming recall's own parameter text, model-visible 24,998; 24,996 after the #6446 merge, recall's grep text trimmed again). */
+const SERVED_STARTER_MAX_JSON_CHARS = 20_397; // GBRA-286 train: +81 for the agent-contract annotations its starter ops now declare (memory_conversation_mode readOnlyHint false + idempotentHint); GBRA-156: 19,431 measured; GST-927: +100 for get_page's one-window-selector rule; GBRA-217 get_page as_of: +100 (19,905 measured at the lane D merge); GBRA-219 (#7795, GBRA-108 decision A): +301 for memory_conversation_mode on starter, trimmed first; GBRA-216 (#7810, train merge): +15 for remember's typed-claim params (20,362 measured on the train)
+/** GBRA-156: the UTF-8 bytes of the served starter tools/list result (`{"tools":[...]}`, annotations included) that harnesses re-fetch every turn. */
+const SERVED_STARTER_MAX_RESULT_BYTES = 20_456; // GBRA-286 train: +81 for the same annotations; 26,546 before GBRA-156, 19,489 after; GST-927: +100 for get_page's one-window-selector rule; GBRA-217 get_page as_of: +100 (19,963 measured at the lane D merge); GBRA-219 (#7795, GBRA-108 decision A): memory_conversation_mode joins starter (the per-conversation save switch, approved in the GBRA-219 plan), its description and the instructions clause trimmed first: +360; GBRA-216 (#7810, train merge): +15 for remember's typed-claim params (20,421 measured on the train)
 /** 4,042 at the cost wave + 586 for the operator contract's error protocol, notice prefix and memory loop (F1); no schema guidance moved here. */
-const INSTRUCTIONS_MAX_CHARS = 4_868; // #6007: +240 for the issue-required write guidance (put_pages, wait_ms)
+const INSTRUCTIONS_MAX_CHARS = 5_219; // GBRA-219 (#7795, GBRA-108 decision A): memory_conversation_mode joins starter (the per-conversation save switch, approved in the GBRA-219 plan), its description and the instructions clause trimmed first: +111 for the switch clause at the maximal rendering; #6007: +240 for the issue-required write guidance (put_pages, wait_ms); Cat 40 Hard round 4: +107 for batching lists of names (entity names, keyword OR) and sending independent calls together; d5b: +70 for the brief naming the fields compact `entity names` rows carry (the maximal rendering, record types enrolled; +39 at the default) instead of a `referenced_by` walk batch mode cannot do; F4: +63 for instruction 7's governing rule (the record whose terms are in effect on the date asked about governs; page dates are named as page dates), 74 characters longer than the "prefer the newest governing source" sentence it replaces, 11 paid by cutting "the best-ranked excerpts" to "top excerpts" in the same clause
 const DESCRIPTION_HARD_CAP = 1_200;
 const PARAM_DESCRIPTION_HARD_CAP = 200;
 
@@ -62,15 +81,38 @@ const PARAM_DESCRIPTION_HARD_CAP = 200;
  * remember 1330 -> 1370: the additive `items` batch param (save up to 20 facts
  * before compaction), measured at 1,344 after its descriptions were shortened so the
  * served starter list stays under 25,000 next to #6007's put_page growth.
+ * search 1670 -> 1800: keyword OR across quoted names and the pointer to entity names (Cat 40 Hard
+ * round 4), paid for by trimming query, list_pages, capture, mute_notice and request_tools text.
+ * entity 470 -> 550: the additive `names` param (resolve up to 50 names in one
+ * call, Cat 40 Hard round 4), measured at 546 with the `name` example and part
+ * of the miss sentence trimmed so the served starter list stays under 25,000.
+ * add_timeline_entry 680 -> 730 (#5970, wave 15): the description names the
+ * correction route (edit its bullet via edit_page with expected_revision),
+ * measured at 720 after its own text was tightened; get_ingest_log,
+ * list_write_requests, traverse_graph and list_link_sources lost redundant
+ * words (no pinned phrase, every description still >= 60 characters) so the
+ * served starter list stays at or under 25,000.
+ * GBRA-156 lowered the budgets of every tool whose starter params or text it cut
+ * to the measured size plus 20-30 (search and query plus about 150, the room
+ * their parallel source_ids param needs).
+ * search 1800 -> 1830 (wave 16, #6040 item 1): the redirect reads
+ * `Concepts/landscape or people/companies/projects by topic: \`query\``, measured
+ * at 1,826. Without it Haiku 4.5 routes "all the people that work on X" to
+ * search (28/80 at temperature 1; 1/80 with the clause); the batching sentence
+ * `Name lists: entity names.` stays, so the growth is paid by other tools.
+ * get_page 600 -> 700 (GBRA-217, lane D merge): the starter `as_of` param (the edition in force on a date, and the rule
+ * that a reply without valid_time is the current page) on top of GST-927's one-window-selector rule, measured at 700.
+ * memory_conversation_mode 420 -> 470 (GBRA-286 train): the agent-contract annotations it now declares (readOnlyHint
+ * false, idempotentHint), measured at 470.
  */
 const TOOL_BUDGETS: Record<string, number> = {
-  add_timeline_entry: 680, cancel_job: 270, cancel_write_request: 350, capture: 1250, context_pack: 760,
-  delete_skill: 810, delta: 830, edit_page: 1090, entity: 470, find_anomalies: 520, forget: 560, get_agent_job: 270,
-  get_backlinks: 770, get_ingest_log: 280, get_page: 930, get_recent_salience: 660, get_skill: 910,
-  get_skill_asset: 790, get_write_request: 360, join_brain: 560, leave_brain: 540, list_brain_skillpack: 230,
-  list_link_sources: 220, list_pages: 1060, list_skills: 670, list_write_requests: 450, put_page: 1460,
-  mute_notice: 460, put_skill: 1420, query: 3100, recall: 1540, remember: 1370, request_tools: 560, resolve_slugs: 410, search: 1670,
-  submit_agent: 750, sync_brain_skills: 770, synthesize: 550, traverse_graph: 810, whoami: 230,
+  add_timeline_entry: 730, cancel_job: 270, cancel_write_request: 350, capture: 710, context_pack: 500,
+  delete_skill: 810, delta: 580, edit_page: 1040, entity: 550, find_anomalies: 400, forget: 530, get_agent_job: 270,
+  get_backlinks: 710, get_ingest_log: 280, get_page: 700, get_recent_salience: 450, get_skill: 490,
+  get_skill_asset: 530, get_write_request: 360, join_brain: 560, leave_brain: 540, list_brain_skillpack: 230,
+  list_link_sources: 220, list_pages: 850, list_skills: 400, list_write_requests: 370, put_page: 1090,
+  memory_conversation_mode: 470, mute_notice: 420, put_skill: 1420, query: 1700, recall: 840, remember: 940, request_tools: 530, resolve_slugs: 410, search: 1420,
+  submit_agent: 420, sync_brain_skills: 770, synthesize: 510, traverse_graph: 600, whoami: 230,
 };
 
 /** DX-14: phrases each tool's description must keep. */
@@ -123,18 +165,32 @@ async function served(publishSkills: boolean): Promise<Operation[]> {
 }
 
 describe('served starter tool list (Cat 40 configuration)', () => {
-  test('publish_skills on (the fresh-init default): 35 tools within 25,000 characters', async () => {
+  test('publish_skills on (the fresh-init default): 36 tools within the character ceiling', async () => {
     const ops = await served(true);
     expect(ops.map(o => o.name)).toContain('get_skill');
-    expect(ops.length).toBe(35);
+    expect(ops.length).toBe(36); // GBRA-219: +1, memory_conversation_mode
     expect(size(ops)).toBeLessThanOrEqual(SERVED_STARTER_MAX_CHARS);
     expect(json(ops)).toBeLessThanOrEqual(SERVED_STARTER_MAX_JSON_CHARS);
   });
 
-  test('publish_skills off: within 25,000 characters', async () => {
+  test('publish_skills off: within the character ceiling', async () => {
     const ops = await served(false);
     expect(ops.map(o => o.name)).not.toContain('get_skill');
     expect(size(ops)).toBeLessThanOrEqual(SERVED_STARTER_MAX_CHARS);
+  });
+
+  test('the served list keeps headroom under the ceiling, publish_skills on and off (wave 16)', async () => {
+    for (const publishSkills of [true, false]) {
+      const ops = await served(publishSkills);
+      expect(SERVED_STARTER_MAX_CHARS - size(ops), `publish_skills=${publishSkills}`).toBeGreaterThanOrEqual(SERVED_STARTER_MIN_HEADROOM);
+    }
+  });
+
+  test('the tools/list result stays within its byte budget, publish_skills on and off (GBRA-156)', async () => {
+    for (const publishSkills of [true, false]) {
+      const bytes = Buffer.byteLength(JSON.stringify({ tools: buildToolDefs(await served(publishSkills)) }));
+      expect(bytes, `publish_skills=${publishSkills}`).toBeLessThanOrEqual(SERVED_STARTER_MAX_RESULT_BYTES);
+    }
   });
 
   test('cl100k token ceiling', async () => {
@@ -144,6 +200,22 @@ describe('served starter tool list (Cat 40 configuration)', () => {
 
   test('initialize instructions stay at or below their recorded size', () => {
     expect(GBRAIN_MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX_CHARS);
+  });
+
+  // Per-arm renderings: all off (names-row off, no records, `newest`), names-row on / records off, F4 only
+  // (`in_effect`, names-row off, no records), and the maximal one (records enrolled, names-row on, `in_effect`) at 5,219.
+  test('every per-arm rendering stays at or below the recorded size; the maximal one is the recorded size', () => {
+    let max = 0;
+    for (const governingRule of ['newest', 'in_effect'] as const) {
+      for (const namesRow of [false, true]) {
+        for (const records of [false, true]) {
+          const size = buildMcpInstructions({ references: { namesRow, records }, governingRule }).length;
+          max = Math.max(max, size);
+          expect({ governingRule, namesRow, records, fits: size <= INSTRUCTIONS_MAX_CHARS }).toEqual({ governingRule, namesRow, records, fits: true });
+        }
+      }
+    }
+    expect(buildMcpInstructions({ references: { namesRow: true, records: true }, governingRule: 'in_effect' }).length).toBe(max);
   });
 });
 
@@ -185,6 +257,18 @@ describe('minimum guidance (DX-14)', () => {
       for (const field of ['fact', 'entity', 'provenance', 'kind', 'ttl', 'visibility']) {
         expect(items.description, `${surface}: ${field}`).toContain(field);
       }
+    }
+  });
+
+  test('starter search and query keep the params agents need to scope and page a call (GBRA-156)', () => {
+    const listed = (name: string) => Object.keys(buildToolDefs(filterOpsForSurface(operations, 'starter').filter(o => o.name === name))[0].inputSchema.properties);
+    expect(listed('search')).toEqual(expect.arrayContaining(['query', 'limit', 'offset', 'match', 'cursor', 'source_id', 'types', 'return_unit']));
+    expect(listed('query')).toEqual(expect.arrayContaining(['query', 'limit', 'offset', 'source_id', 'types', 'since', 'until', 'return_unit', 'expand']));
+    // where and min_trust were full-surface-only before GBRA-156 too: callable on starter, schema via request_tools {tools}.
+    for (const name of ['search', 'query']) {
+      expect(listed(name)).not.toContain('where');
+      expect(listed(name)).not.toContain('min_trust');
+      expect(Object.keys(operations.find(o => o.name === name)!.params)).toEqual(expect.arrayContaining(['where', 'min_trust']));
     }
   });
 

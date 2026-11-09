@@ -508,6 +508,8 @@ function installDeps(over: Partial<ConnectDeps> = {}): ConnectDeps {
     env: () => undefined, // tests control the env; real GBRAIN_REMOTE_TOKEN must not leak in
     registerOAuthClient: () => ({ ok: true, clientId: 'gbrain_cl_minted', clientSecret: 'gbrain_cs_minted' }),
     writeOpencodeRemoteEntry: (name) => ({ configPath: `/tmp/xdg/opencode/opencode.jsonc (${name})`, replacedPrior: false }),
+    writeInstructions: (agent, name, optOut, skillLoading, gbrainBin) => (optOut ? null : `write    instructions brain-first block for ${agent} '${name}'${skillLoading ? ` skill-loading=${skillLoading}` : ''}${gbrainBin ? ` gbrain-bin=${gbrainBin}` : ''}`),
+    writeTurnHook: (agent) => ({ lines: [`write    turn hook per-turn rule hook for ${agent}`], ok: true }),
     ...over,
   };
 }
@@ -524,6 +526,32 @@ describe('runConnect --install', () => {
     expect(r.err.join('\n')).toContain(LEARN_INSTRUCTION);
   });
 
+  test('--skill-loading and --gbrain-bin reach the instruction writer', async () => {
+    const seen: unknown[] = [];
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--token', 'gbrain_tok', '--install', '--yes', '--skill-loading', 'spring', '--gbrain-bin', '/opt/alice-example/gbrain'],
+      installDeps({ writeInstructions: (agent, name, optOut, skillLoading, gbrainBin) => { seen.push([skillLoading, gbrainBin]); return null; } }),
+    );
+    expect(r.exitCode).toBeUndefined();
+    expect(seen).toEqual([['spring', '/opt/alice-example/gbrain']]);
+  });
+
+  test('an unknown --skill-loading value is refused before anything is installed', async () => {
+    const seen: unknown[] = [];
+    const ran: string[][] = [];
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--token', 'gbrain_tok', '--install', '--yes', '--skill-loading', 'always'],
+      installDeps({
+        writeInstructions: (...a) => { seen.push(a); return null; },
+        runBinary: (_binary, argv) => { ran.push(argv); return { code: 0, stdout: '', stderr: '' }; },
+      }),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toContain("Unknown --skill-loading 'always'");
+    expect(seen).toEqual([]);
+    expect(ran).toEqual([]);
+  });
+
   test('probe failure warns + exits 1 + never echoes the token', async () => {
     const r = await runWithExitCapture(
       ['https://brain.example.com/mcp', '--token', 'gbrain_secret', '--install', '--yes'],
@@ -534,6 +562,16 @@ describe('runConnect --install', () => {
     expect(all).toMatch(/did not verify \(auth\)/);
     expect(all).not.toContain('gbrain_secret');
     expect(all).toContain(REDACTED);
+  });
+
+  test('a per-turn hook that does not load fails the install loudly (turn_hook_not_loaded)', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--token', 'gbrain_tok', '--install', '--yes'],
+      installDeps({ writeTurnHook: () => ({ lines: ['error turn_hook_not_loaded (hook_failed): the per-turn gbrain hook is not active'], ok: false }) }),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toContain('turn_hook_not_loaded');
+    expect(r.err.join('\n')).toMatch(/Verified/);
   });
 
   test('missing claude binary fails fast', async () => {

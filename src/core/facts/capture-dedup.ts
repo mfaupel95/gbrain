@@ -19,23 +19,29 @@
  * so a threshold can be measured before it ever deletes anything. A failed
  * dedup read inserts the candidate (fail open) and warns with the lane.
  * Explicit lanes (`remember`, extract_facts, sync) never pass through here.
+ * #7043: conversation-fact extraction reuses the exact-fingerprint rule with
+ * no time bound (`anchor: null`), skipping a candidate an active fact of the
+ * source already states (conversation-publication.ts).
  *
  * Read side (`collapseHotFacts`): rows with the same fingerprint on the same
  * entity, or on different entities when the claim names one of them,
  * collapse to the newest row, which carries every entity slug of its group.
+ * `collapseFactReads` applies it to reads that span sources and
+ * visibilities (recall, search's saved facts, #7043).
  */
 
-import type { BrainEngine, FactAttribution, FactRow } from '../engine.ts';
+import type { BrainEngine, FactAttribution, FactRow, FactVisibility } from '../engine.ts';
 import { corpusFileSessionId } from '../context/corpus-segments.ts';
 import { writeHeartbeat } from '../context/hook-heartbeat.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { cosineSimilarity } from './classify.ts';
+import { onOwnedMemoryPageSql } from '../access/member-facts.ts';
 
 export const CAPTURE_LANES = ['hook:writeback', 'sweep:corpus', 'hook:compact'] as const;
 export const CAPTURE_DEDUP_WINDOW_MS = 15 * 60 * 1000;
 /** Shadow-mode near-duplicate threshold (measured, never a drop). */
 export const NEAR_DUPLICATE_THRESHOLD = 0.92;
-/** Explicit lanes keep their pre-#5888 cosine rule. */
+/** The bar consolidate clusters untyped facts at (#6023). Explicit-lane supersession reads the per-model threshold instead (supersession-threshold.ts). */
 export const EXPLICIT_DUPLICATE_THRESHOLD = 0.95;
 const CAPTURE_DEDUP_SCAN_LIMIT = 50;
 
@@ -75,11 +81,37 @@ export type CosineVerdict = 'duplicate' | 'near_duplicate' | 'distinct';
 
 /**
  * The one cosine policy for every fact-write decision point. Capture lanes
- * never return `duplicate`; explicit lanes keep the 0.95 rule unchanged.
+ * never return `duplicate`. Explicit lanes return `duplicate` at or above
+ * `explicitThreshold`, the embedding model's calibrated supersession
+ * threshold (supersession-threshold.ts); null (an uncalibrated model) never
+ * returns `duplicate`.
  */
-export function cosineVerdict(source: string | null | undefined, score: number, claim: string, existing: string): CosineVerdict {
-  if (!isCaptureLane(source)) return score >= EXPLICIT_DUPLICATE_THRESHOLD ? 'duplicate' : 'distinct';
+export function cosineVerdict(source: string | null | undefined, score: number, claim: string, existing: string, explicitThreshold: number | null): CosineVerdict {
+  if (!isCaptureLane(source)) return explicitThreshold !== null && score >= explicitThreshold ? 'duplicate' : 'distinct';
   return score >= NEAR_DUPLICATE_THRESHOLD && !claimsDiverge(claim, existing) ? 'near_duplicate' : 'distinct';
+}
+
+/** #6333 shadow floor: same-page rewordings sit at cosine 0.86–0.93 (lane C), under every calibrated dedup threshold. */
+export const SAME_PAGE_REWORDING_THRESHOLD = 0.85;
+
+/**
+ * #6333 [UC2] shadow predicate, never a drop: would the deterministic rule
+ * "same source-qualified provenance (lane + session + visibility), cosine at
+ * or above SAME_PAGE_REWORDING_THRESHOLD, no diverging guard token" have
+ * treated `claim` as a duplicate of `existing`? The backstop counts it as
+ * `would_dedup_same_page` on explicit lanes only. Measured false positives
+ * (Lisbon→Porto, approved→rejected, email→phone, all invisible to
+ * claimsDiverge) are why the rule measures and does not act.
+ */
+export function wouldDedupSamePage(
+  ctx: { source: string | null | undefined; sessionId: string | null | undefined; visibility: FactVisibility },
+  existing: { source: string; source_session: string | null; visibility: FactVisibility; fact: string },
+  score: number,
+  claim: string,
+): boolean {
+  if (!ctx.source || !ctx.sessionId || isCaptureLane(ctx.source)) return false;
+  if (existing.source !== ctx.source || existing.source_session !== ctx.sessionId || existing.visibility !== ctx.visibility) return false;
+  return score >= SAME_PAGE_REWORDING_THRESHOLD && !claimsDiverge(claim, existing.fact);
 }
 
 function nameKey(text: string): string {
@@ -129,8 +161,10 @@ export interface CaptureScope {
   sourceId: string;
   lane: string;
   sessionId: string | null;
-  /** The source turn's own time when the lane knows it, else check time. */
-  anchor: Date;
+  /** The source turn's own time when the lane knows it, else check time; null drops the time bound (#7043). */
+  anchor: Date | null;
+  /** Ignore this page's own conversation-extractor rows: a replacement is about to clear them (#7043). */
+  replacingPage?: string;
 }
 export interface CaptureMatch { id: number; rule: 'same_entity' | 'named_entity'; }
 
@@ -141,10 +175,13 @@ export async function findCaptureDuplicate(scope: CaptureScope, candidate: Captu
     `SELECT id,entity_slug,source,source_session,created_at FROM facts WHERE source_id=$1 AND visibility=ANY($2::text[])
       AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($3) AND expired_at IS NULL AND (valid_until IS NULL OR valid_until>now())
       AND ($4::text IS NULL OR attributed_to IS NULL OR attributed_to=$4)
+      AND ($5::text IS NULL OR source_markdown_slug IS DISTINCT FROM $5 OR source NOT LIKE 'cli:extract-conversation-facts%')
+      AND NOT ${onOwnedMemoryPageSql('facts')}
       ORDER BY created_at DESC, id DESC LIMIT ${CAPTURE_DEDUP_SCAN_LIMIT}`,
-    [scope.sourceId, visibilities, candidate.fact, candidate.attributedTo ?? null]);
+    [scope.sourceId, visibilities, candidate.fact, candidate.attributedTo ?? null, scope.replacingPage ?? null]);
   const conversation = canonicalConversationKey(scope.sessionId);
-  const recent = rows.filter(row => Math.abs(new Date(row.created_at).getTime() - scope.anchor.getTime()) <= CAPTURE_DEDUP_WINDOW_MS
+  const anchor = scope.anchor;
+  const recent = anchor === null ? rows : rows.filter(row => Math.abs(new Date(row.created_at).getTime() - anchor.getTime()) <= CAPTURE_DEDUP_WINDOW_MS
     || conversation !== null && isCaptureLane(row.source) && canonicalConversationKey(row.source_session) === conversation);
   const same = recent.find(row => (row.entity_slug ?? null) === candidate.entitySlug);
   if (same) return { id: Number(same.id), rule: 'same_entity' };
@@ -166,7 +203,7 @@ export async function findNearDuplicate(scope: CaptureScope, candidate: CaptureC
     const score = cosineSimilarity(candidate.embedding, row.embedding);
     if (!best || score > best.score) best = { id: row.id, score, fact: row.fact };
   }
-  return best && cosineVerdict(scope.lane, best.score, candidate.fact, best.fact) === 'near_duplicate' ? best.id : null;
+  return best && cosineVerdict(scope.lane, best.score, candidate.fact, best.fact, null) === 'near_duplicate' ? best.id : null;
 }
 
 export interface CaptureDedupResult<T> { kept: T[]; duplicateIds: number[]; nearDuplicates: number; }
@@ -233,7 +270,9 @@ export function withCaptureDrops<R extends { inserted: number; duplicate: number
 }
 
 export type HotFactRow = FactRow & { fact_fingerprint?: string | null };
-export type CollapsedHotFact<R extends HotFactRow> = R & { entity_slugs?: string[] };
+/** What the collapse reads of a row. */
+export type CollapsibleFact = Pick<FactRow, 'id' | 'fact' | 'entity_slug' | 'attributed_to' | 'created_at'> & { fact_fingerprint?: string | null };
+export type CollapsedHotFact<R extends CollapsibleFact> = R & { entity_slugs?: string[] };
 
 /**
  * V2 hot-memory collapse: one representative (the newest row) per
@@ -243,7 +282,7 @@ export type CollapsedHotFact<R extends HotFactRow> = R & { entity_slugs?: string
  * assistant) also splits by speaker, so one never hides the other.
  */
 /** `members` (optional) receives raw row id -> emitted representative id, so delta can advance its facts keyset through raw rows. */
-export async function collapseHotFacts<R extends HotFactRow>(engine: BrainEngine, sourceId: string, rows: R[], members?: Map<number, number>): Promise<CollapsedHotFact<R>[]> {
+export async function collapseHotFacts<R extends CollapsibleFact>(engine: BrainEngine, sourceId: string, rows: R[], members?: Map<number, number>): Promise<CollapsedHotFact<R>[]> {
   const byFingerprint = new Map<string, R[]>();
   for (const row of rows) {
     const key = row.fact_fingerprint ?? `id:${row.id}`;
@@ -275,6 +314,64 @@ export async function collapseHotFacts<R extends HotFactRow>(engine: BrainEngine
     if (members) for (const r of cluster) members.set(r.id, newest.id);
     const slugs = [...new Set([newest.entity_slug, ...cluster.map(r => r.entity_slug)].filter((s): s is string => !!s))];
     out.push(slugs.length > 1 ? { ...newest, entity_slugs: slugs } : newest);
+  }
+  return out;
+}
+
+/** A row of a read that spans sources and visibilities; `created_at` may arrive as text from a raw read. */
+export type FactReadRow = Omit<CollapsibleFact, 'created_at'> & { source_id: string; visibility: string; created_at: Date | string;
+  expired_at?: Date | string | null; valid_until?: Date | string | null; entity_slugs?: string[]; collapsed_count?: number; collapsed_ids?: number[] };
+/** `collapsed_ids`: every row id the representative stands for (internal; callers drop it from responses). */
+export type CollapsedFactRead<R> = R & { entity_slugs?: string[]; collapsed_count?: number; collapsed_ids?: number[] };
+
+/**
+ * #7043: `collapseHotFacts` for recall and search. Active rows collapse only
+ * within one (source, visibility), so a remote caller's already-filtered rows
+ * never meet a hidden copy; expired or lapsed rows pass through unchanged.
+ * Rows without `fact_fingerprint` get it from one read of their text. Order
+ * is preserved by representative (the group's newest row, holding its
+ * first member's place); a representative standing for several rows carries
+ * `collapsed_count` and `collapsed_ids`, and `entity_slugs` when they name
+ * more than one entity. A row that is already a representative counts as the
+ * rows it stands for, so collapsing a merged list of two collapsed reads
+ * counts each row once. A failed fingerprint read returns the rows unchanged.
+ */
+export async function collapseFactReads<R extends FactReadRow>(engine: BrainEngine, rows: R[]): Promise<CollapsedFactRead<R>[]> {
+  const now = Date.now();
+  const active = rows.filter(r => !r.expired_at && (!r.valid_until || new Date(r.valid_until).getTime() > now));
+  if (active.length < 2) return rows;
+  const missing = active.filter(r => !r.fact_fingerprint);
+  let computed: string[] = [];
+  try {
+    if (missing.length) computed = (await engine.executeRaw<{ fp: string }>(
+      'SELECT gbrain_fact_fingerprint(c) AS fp FROM unnest($1::text[]) WITH ORDINALITY AS t(c, n) ORDER BY n', [missing.map(r => r.fact)])).map(r => r.fp);
+  } catch {
+    return rows;
+  }
+  const fingerprints = new Map(missing.map((r, i) => [r.id, computed[i]]));
+  const partitions = new Map<string, CollapsibleFact[]>();
+  for (const r of active) {
+    const key = `${r.source_id}\u0000${r.visibility}`;
+    partitions.set(key, [...(partitions.get(key) ?? []), { id: r.id, fact: r.fact, entity_slug: r.entity_slug, attributed_to: r.attributed_to,
+      created_at: new Date(r.created_at), fact_fingerprint: r.fact_fingerprint ?? fingerprints.get(r.id) ?? null }]);
+  }
+  const members = new Map<number, number>();
+  for (const [key, part] of partitions) await collapseHotFacts(engine, key.slice(0, key.indexOf('\u0000')), part, members);
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const groups = new Map<number, R[]>();
+  for (const [id, rep] of members) groups.set(rep, [...(groups.get(rep) ?? []), byId.get(id)!]);
+  const out: CollapsedFactRead<R>[] = [];
+  const emitted = new Set<number>();
+  for (const row of rows) {
+    const rep = members.get(row.id);
+    if (rep === undefined) { out.push(row); continue; }
+    if (emitted.has(rep)) continue;
+    emitted.add(rep);
+    const group = groups.get(rep)!;
+    const kept = byId.get(rep)!;
+    const slugs = [...new Set([kept.entity_slug, ...group.flatMap(r => r.entity_slugs ?? [r.entity_slug])].filter((s): s is string => !!s))];
+    const ids = [...new Set(group.flatMap(r => r.collapsed_ids ?? [r.id]))].sort((a, b) => a - b);
+    out.push({ ...kept, ...(slugs.length > 1 ? { entity_slugs: slugs } : {}), ...(ids.length > 1 ? { collapsed_count: ids.length, collapsed_ids: ids } : {}) });
   }
   return out;
 }

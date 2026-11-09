@@ -177,10 +177,10 @@ describe('#1972 — complete cooperative-abort coverage', () => {
     const body = src.slice(src.indexOf('export async function runCycle'));
     // Each long phase receives the signal (W0: the combined cycleSignal, so
     // phases also stop on lock-steal, not just external aborts).
-    expect(body).toContain('runPhaseExtract(engine, brainDir, dryRun, syncPagesAffected, cycleSignal, cycleSourceId)');
+    expect(body).toContain('runPhaseExtract(engine, brainDir, dryRun, sourceWindow?.slugs ?? syncPagesAffected, cycleSignal, cycleSourceId)');
     expect(body).toMatch(/runPhaseExtractFacts\([^)]*cycleSignal\)/);
     expect(body).toContain('signal: cycleSignal'); // consolidate opts
-    expect(body).toContain('runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId)'); // #5180 threads the source id after the signal
+    expect(body).toContain("runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId, { once: opts.onceForPhase === 'lint' })"); // #5180 threads the source id after the signal; #6369 the --once bypass after it
     // Reaper runs at cycle start.
     expect(body).toContain('reapDeadHolderLocks(engine)');
     // Terminal guard: the success stamp is gated on !aborted, and the report
@@ -233,7 +233,7 @@ describe('#4077 — synthesize/patterns cooperative-abort threading', () => {
     expect(postprocess).toBeGreaterThan(-1);
     expect(src.slice(postprocess, src.indexOf(');', postprocess))).toContain('signal: opts.signal');
     expect(src).toContain('if (!maintenance) await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal)');
-    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal)');
+    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal, fileHolds)');
   });
 
   test('patterns sibling threads the same signal through inline drain, wait, and reverse-write', async () => {
@@ -242,6 +242,6 @@ describe('#4077 — synthesize/patterns cooperative-abort threading', () => {
     expect(src).toContain('signal?: AbortSignal');
     expect(src).toMatch(/runSubagentsInline\([\s\S]{0,240}?opts\.signal/);
     expect(src).toMatch(/waitForCompletionRenewing\(queue, job\.id, \{[\s\S]*?signal: opts\.signal,/);
-    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal)');
+    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal, fileHolds)');
   });
 });

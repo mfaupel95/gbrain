@@ -1171,9 +1171,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
 
   // Chunkless-page safety net (embed --stale detection gap): a page with
   // non-empty content but zero content_chunks rows (e.g. a putPage-only
-  // write) must be found on BOTH engines identically, and quarantined /
-  // embed_skip pages (intentionally chunkless by design) must be excluded
-  // identically on both. Isolated under a dedicated source.
+  // write) must be found on BOTH engines identically, quarantined pages
+  // (chunkless by design) excluded and a chunkless embed_skip page with a
+  // body included (#7174) identically on both. Isolated under a dedicated source.
   test('chunkless-page-with-content detection: Postgres ↔ PGLite parity', async () => {
     const SRC = 'chunkless-parity';
     for (const eng of [pgEngine, pgliteEngine]) {
@@ -1193,20 +1193,20 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
         type: 'note', title: 'Quarantined', compiled_truth: 'junk content',
         frontmatter: { quarantine: { reason: 'junk_pattern', detail: 'parity fixture', assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
-      // cp/skipped: chunkless BY DESIGN — must be excluded.
+      // cp/skipped: embed_skip with no chunk rows — included (#7174: writes keep its chunks since #6722).
       await eng.putPage('cp/skipped', {
         type: 'note', title: 'Skipped', compiled_truth: 'x'.repeat(500),
         frontmatter: { embed_skip: { reason: 'oversized', bytes: 500, assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
     }
 
-    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
-    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
+    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
+    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
 
     const pgRows = await pgEngine.listChunklessPagesWithContent({ sourceId: SRC });
     const pgliteRows = await pgliteEngine.listChunklessPagesWithContent({ sourceId: SRC });
-    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub']);
-    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub']);
+    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
+    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
     expect(pgRows[0].compiled_truth).toBe('stub content, never chunked');
     expect(pgliteRows[0].compiled_truth).toBe(pgRows[0].compiled_truth);
 
@@ -2128,11 +2128,11 @@ describeBoth('Engine parity — traverseGraph / traversePaths (D7)', () => {
       'tg/b>tg/a:cycle-back@1',
       'tg/a>tg/b:cycle-fwd@2',
     ]);
-    // 'both' emits every touched edge in its natural direction; the cycle
-    // pair shows at depth 1 and again from b's frontier at depth 2.
+    // 'both' emits every touched edge once, in its natural direction, one
+    // hop past its shallower walked endpoint: the cycle pair at depth 1 only.
     expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 2, direction: 'both' }))).toEqual([
       'tg/a>tg/b:cycle-fwd@1', 'tg/b>tg/a:cycle-back@1',
-      'tg/a>tg/b:cycle-fwd@2', 'tg/b>tg/a:cycle-back@2', 'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
+      'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
     ]);
   });
 
@@ -2600,6 +2600,8 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
       bySession: texts(await eng.listFactsBySession(SRC, SESSION)),
       dupRecency: texts(await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed fact')),
       dupEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel })),
+      dupKeyword: (await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed future fact', { k: 5, arm: 'keyword' })).map(r => r.fact),
+      dupKeywordEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel, arm: 'keyword' })),
       history: texts(await eng.listFactsByEntity(SRC, ENTITY, { activeOnly: false })),
       supersessions: texts(await eng.listSupersessions(SRC)),
       health: {
@@ -2624,6 +2626,10 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
     expect(pg.dupRecency).toEqual(activeEntity);
     // Lapsed row is not a dedup candidate → a re-stated fact re-inserts fresh.
     expect(pg.dupEmbedding).toEqual(['ttl embed live']);
+    // C2 keyword arm: same active-row filters, ranked by shared terms (most shared first).
+    expect(pg.dupKeyword[0]).toBe('ttl future fact');
+    expect([...pg.dupKeyword].sort()).toEqual(activeEntity);
+    expect(pg.dupKeywordEmbedding).toEqual(['ttl embed live']);
     // History (activeOnly:false) still shows every row.
     expect(pg.history).toEqual([
       'ttl durable fact', 'ttl future fact', 'ttl lapsed fact',

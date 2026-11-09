@@ -40,10 +40,11 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { VERSION } from '../../version.ts';
-import { consumerIdentity, sameProcess } from './consumer-heartbeat.ts';
+import { consumerIdentity, consumerProvablyDead, sameProcess } from './consumer-heartbeat.ts';
 
 export type ClaimPhaseName = 'preparing' | 'publishing';
-export const WAITING_ON = ['git', 'fs', 'db', 'pool', 'unknown'] as const;
+/** #6405: `publication` is the publish phase's own wait (a stamp in `publishing` no longer reads `unknown`); #6288 `publication_deadline` is a publish past `persistence.publication_ceiling_ms`. */
+export const WAITING_ON = ['git', 'fs', 'db', 'pool', 'publication', 'publication_deadline', 'unknown'] as const;
 export type WaitingOn = typeof WAITING_ON[number];
 export interface ClaimPhaseClock {
   phase: ClaimPhaseName;
@@ -74,7 +75,7 @@ export interface ClaimPhaseClock {
  * The process that holds a claim, as the stamp records it. #6317: `nonce` (random per process) and `pid_ns` (the pid
  * namespace where readable) tell a reused pid or another container's pid from this process; an older owner stamps neither.
  */
-export interface ClaimOwner { kind: string; pid: number; version: string; nonce?: string; pid_ns?: string | null }
+export interface ClaimOwner { kind: string; pid: number; version: string; nonce?: string; pid_ns?: string | null; boot_id?: string | null; start?: string | null }
 /** #6317: the step / waiting_on / last_sql triple of a claim, as stamped and as read back. */
 export interface ClaimLastSql { label: string; age_ms: number | null }
 
@@ -88,7 +89,7 @@ export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, n
   clock.since = now;
   clock.step = null;
   clock.stepSince = now;
-  clock.waitingOn = 'unknown';
+  clock.waitingOn = phase === 'publishing' ? 'publication' : 'unknown';
 }
 /**
  * A preparer's step boundary: names the step and what its await waits on,
@@ -102,6 +103,18 @@ export function enterClaimStep(clock: ClaimPhaseClock | undefined, step: string,
   if (!clock) return;
   if (clock.step !== step) { clock.step = step; clock.stepSince = now; }
   clock.waitingOn = waitingOn;
+}
+/**
+ * #7436: runs a wait on something other than the database (a Git child process) inside the current step, with the
+ * stamp's `waiting_on` naming it until it ends; the step keeps its name, so a stall reads `step=link_resolution
+ * waiting_on=git` instead of blaming the last statement. Checks the preparation's cancellation first, like a step boundary.
+ */
+export async function waitingOnWhile<T>(clock: ClaimPhaseClock | undefined, waitingOn: WaitingOn, run: () => Promise<T>): Promise<T> {
+  clock?.signal?.throwIfAborted();
+  if (!clock) return run();
+  const prior = clock.waitingOn;
+  clock.waitingOn = waitingOn;
+  try { return await run(); } finally { if (clock.waitingOn === waitingOn) clock.waitingOn = prior; }
 }
 /** #6317: the label of a raw statement for the stamp: its first keyword and the first table it names; never text or parameters. */
 export function sqlLabel(sql: string): string {
@@ -125,7 +138,7 @@ export function isOwnerThisProcess(owner: Pick<ClaimOwner, 'pid' | 'nonce'> | nu
   return claimOwnerIsThisProcess(owner);
 }
 
-const OWNER_COMMANDS = new Set(['sync', 'serve', 'jobs', 'autopilot', 'mcp', 'dream', 'cycle', 'sources', 'migrate-graduation', 'put', 'import']);
+export const OWNER_COMMANDS: ReadonlySet<string> = new Set(['sync', 'serve', 'jobs', 'autopilot', 'mcp', 'dream', 'cycle', 'sources', 'migrate-graduation', 'put', 'import']);
 let ownerOverride: ClaimOwner | undefined;
 /** The gbrain command this process runs (`cli` when none is recognisable). */
 export function claimOwnerKind(): string {
@@ -133,15 +146,35 @@ export function claimOwnerKind(): string {
   const command = process.argv.slice(2).find(arg => !arg.startsWith('-'));
   return command && OWNER_COMMANDS.has(command) ? command : 'cli';
 }
+let oneShotCommand = false;
+/**
+ * GBRA-156: set by the CLI's shared-operation dispatch, which runs one operation and exits. The consumer such a process
+ * starts (service.ts) leaves its housekeeping off the write's path and rations it per host (housekeeping-turn.ts), and its
+ * pool opens a second connection beside the first (db.ts).
+ */
+export function markOneShotCommand(on = true): void { oneShotCommand = on; }
+export function isOneShotCommand(): boolean { return oneShotCommand; }
 /** The owning process for the stamp: the gbrain command this process runs (`cli` when none is recognisable), its pid, nonce, pid namespace and build. */
 export function claimOwner(): ClaimOwner {
   if (ownerOverride) return ownerOverride;
-  const { pid, nonce, pid_ns } = consumerIdentity();
-  return { kind: claimOwnerKind(), pid, version: VERSION, nonce, pid_ns };
+  const { pid, nonce, pid_ns, boot_id, start } = consumerIdentity();
+  return { kind: claimOwnerKind(), pid, version: VERSION, nonce, pid_ns, boot_id, start };
 }
 /** Whether a stamped owner is this process: the pid and, when the stamp carries one, the nonce (#6317: `owner_pid === process.pid` alone is not enough). */
 export function claimOwnerIsThisProcess(owner: Pick<ClaimOwner, 'pid' | 'nonce'> | null | undefined): boolean {
   return sameProcess(owner);
+}
+/**
+ * #6650: whether the claim stamped `raw` (a `claim_phase` value) was held by a process this one can prove dead
+ * (`consumerProvablyDead`: same boot and pid namespace, its pid gone or reused). A stamp without the markers, from
+ * an older owner, another host or container, is never provably dead.
+ */
+export function claimOwnerProvablyDead(raw: unknown): boolean {
+  const stamp = (typeof raw === 'string' ? safeJson(raw) : raw) as { owner?: Record<string, unknown> } | null;
+  const owner = stamp?.owner;
+  if (!owner || typeof owner.pid !== 'number') return false;
+  const text = (key: string) => typeof owner[key] === 'string' ? owner[key] as string : null;
+  return consumerProvablyDead({ pid: owner.pid, nonce: text('nonce'), pid_ns: text('pid_ns'), boot_id: text('boot_id'), start: text('start') });
 }
 /** Test seam. */
 export function setClaimOwnerForTest(owner: ClaimOwner | undefined): void { ownerOverride = owner; }
@@ -248,8 +281,9 @@ export function claimStateOf(row: ClaimRow, now = Date.now()): ClaimState | null
     why: 'Its files were being published; the publication recovery path restores or finishes them when the owning process scans its roots again (after a restart if it hung).' };
   if (row.claim_lapsed) return { phase: 'publication_transaction', claim_age_ms: claimAge, phase_age_ms: null, ...detail, resumes_on_its_own: true,
     why: 'Its claim lapsed while it was still running and nothing was published: a transaction holds the request row (renewals cannot reach it) or its owner is gone. It is requeued once that transaction ends or the owner process exits.' };
-  if (!own) return { phase: 'unrecorded', claim_age_ms: null, phase_age_ms: null, ...detail, resumes_on_its_own: false,
-    why: 'The owner has not recorded this claim\'s phase (a claim younger than one renewal, or an owner that predates phase recording).' };
+  // #6650: an undispatched group follower's stamp names its token and owner but no phase yet.
+  if (!own || (stamp!.phase !== 'preparing' && stamp!.phase !== 'publishing')) return { phase: 'unrecorded', claim_age_ms: claimAge, phase_age_ms: null, ...detail, resumes_on_its_own: false,
+    why: 'The owner has not recorded this claim\'s phase (a claim younger than one renewal, a group member its owner has not started yet, or an owner that predates phase recording).' };
   const phase = stamp!.phase === 'publishing' ? 'publishing' : 'preparing';
   return { phase, claim_age_ms: claimAge, phase_age_ms: age(stamp!.since, now), ...detail, resumes_on_its_own: false,
     why: `Its owner is still renewing the claim while it is ${phase === 'preparing' ? 'preparing the write' : 'publishing the write'}${step ? ` (step ${step}, waiting on ${detail.waiting_on})` : ''}, so the lease never lapses and nothing else on its root runs until that work settles or the owner restarts.` };

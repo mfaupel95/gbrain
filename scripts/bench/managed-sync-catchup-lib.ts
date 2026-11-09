@@ -133,14 +133,25 @@ export async function measureRtt(url: string, prepare = true): Promise<number> {
 }
 
 /** A loopback OpenAI `/v1/embeddings` stub: fixed latency, a concurrency cap answered with 429 + retry-after, deterministic vectors. */
-export function startEmbeddingStub(opts: { latencyMs: number; maxConcurrent: number; dims: number }): Promise<{ url: string; stats: { calls: number; inputs: number; limited: number }; close: () => void }> {
-  const stats = { calls: 0, inputs: 0, limited: 0 };
+/**
+ * Loopback OpenAI-compatible embeddings stub. `failWhile` answers 500 while it returns true (a provider outage);
+ * `onInputs` sees every input it embedded; `stats.requests` counts every request on any path.
+ */
+export function startEmbeddingStub(opts: { latencyMs: number; maxConcurrent: number; dims: number; failWhile?: () => boolean; onInputs?: (inputs: string[]) => void }): Promise<{ url: string; stats: { requests: number; calls: number; inputs: number; limited: number; failed: number }; close: () => void }> {
+  const stats = { requests: 0, calls: 0, inputs: 0, limited: 0, failed: 0 };
   let active = 0;
   const server: Server = createServer((req, res) => {
     let body = '';
+    stats.requests++;
     req.on('data', c => { body += c; });
     req.on('end', async () => {
       if (!req.url?.endsWith('/embeddings')) { res.writeHead(404).end(); return; }
+      if (opts.failWhile?.()) {
+        stats.failed++;
+        res.writeHead(500, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ error: { message: 'Internal server error (bench stub outage)', type: 'server_error', code: null } }));
+        return;
+      }
       if (active >= opts.maxConcurrent) {
         stats.limited++;
         res.writeHead(429, { 'content-type': 'application/json', 'retry-after-ms': '500', 'retry-after': '1' })
@@ -154,6 +165,7 @@ export function startEmbeddingStub(opts: { latencyMs: number; maxConcurrent: num
         const dims = parsed.dimensions ?? opts.dims;
         stats.calls++; stats.inputs += inputs.length;
         await Bun.sleep(opts.latencyMs);
+        opts.onInputs?.(inputs.map(String));
         const data = inputs.map((text, index) => {
           const v = new Array<number>(dims).fill(0);
           for (let i = 0; i < String(text).length; i++) v[(String(text).charCodeAt(i) * 31 + i) % dims] += 1;

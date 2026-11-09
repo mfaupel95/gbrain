@@ -36,6 +36,15 @@ export function autopilotLockPath(): string {
 }
 
 /**
+ * #7003: the daemon's heartbeat sidecar beside the lock. It records the daemon's own next tick (its adaptive interval),
+ * so autopilot status grades staleness from what the daemon scheduled rather than the caller's interval flag
+ * (src/core/autopilot-heartbeat.ts). The lock mtime stays the liveness signal.
+ */
+export function autopilotHeartbeatPath(): string {
+  return gbrainPath('autopilot.heartbeat.json');
+}
+
+/**
  * Written by the generated wrapper when it self-disables (its captured repo path
  * is gone). Read by the status command so a stopped daemon explains itself
  * instead of looking merely idle.
@@ -287,6 +296,15 @@ export function autopilotWrapperOwner(
  */
 export function autopilotPausedMarkerPath(): string {
   return join(gbrainPath(), 'autopilot-paused');
+}
+
+/**
+ * The daemon's latest brain-wide maintenance verdict (GBRA-130 C-6), written
+ * each full-cycle tick so the engine-free `autopilot --status` can exit 1 while
+ * maintenance is stalled without opening the database.
+ */
+export function autopilotGlobalMaintenanceVerdictPath(): string {
+  return join(gbrainPath(), 'autopilot-global-maintenance.json');
 }
 
 /**

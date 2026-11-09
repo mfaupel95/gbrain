@@ -80,7 +80,7 @@ describe('client capability grants', () => {
     const created = await memoryClient('provenance-audit-example');
     const grant = await readClientGrant(engine, created.clientId);
     expect(grant.surface).toBe('full');
-    expect(grant.surfaceSetBy).toBe('operator');
+    expect(grant.surfaceSetBy).toBe('install');
     const [row] = await engine.executeRaw('SELECT after_grant FROM oauth_grant_audit WHERE client_id = $1', [created.clientId]);
     const audit = row.after_grant as { allowedOperations: string[]; catalogProvenance: { version: number; operations: string[] } };
     expect(audit.catalogProvenance.version).toBe(1);
@@ -340,6 +340,13 @@ describe('client capability grants', () => {
     expect(parsed.repair).toBe(true);
     expect(parsed.dryRun).toBe(true);
     expect(() => parseRescopeGrantArgs(['--if-version', '-1'])).toThrow('non-negative');
+  });
+
+  test('#6993 no grant flag parses as print-only on both client spellings; --repair alone still refuses', () => {
+    expect(parseClientRescopeArgs('client-example', ['--json'])).toMatchObject({ printOnly: true, patch: {} });
+    expect(parseRescopeGrantArgs(['--json'])).toMatchObject({ printOnly: true, patch: {} });
+    expect(parseClientRescopeArgs('client-example', ['--sources', 'default']).printOnly).toBe(false);
+    expect(() => parseRescopeGrantArgs(['--repair'])).toThrow('with --repair');
   });
 
   test('operations all drops the snapshot and the profile; a csv still sets a snapshot', () => {

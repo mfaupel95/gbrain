@@ -18,8 +18,8 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { materializeTimeline, prepareCanonicalProjections } from './canonical-projections.ts';
 import { digest, sha256 } from './digest.ts';
 import { admitWriteInTransaction, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
-import { acquireWorktree, containsPath, getWorktreeBinding, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
-import { localHostId } from './identity.ts';
+import { acquireWorktree, containsPath, getWorktreeBinding, probeWorktreeWriter, readManagedMode, type WorktreeBinding } from './ownership.ts';
+import { hostIdFor } from './identity.ts';
 import { assertPersistenceAccepting, startPersistenceConsumer, waitForWrite, writeResponse } from './service.ts';
 import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import { AGENT_WRITE_WAIT_MS, configuredWriteWaitMs } from './write-wait.ts';
@@ -27,13 +27,17 @@ import { managedSyncAuthority, validateManagedSyncOptions, validateSyncAuthority
 import type { PreparedContentImport } from './prepared-import.ts';
 import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
-import { databaseOnlyPublication, prepareFileTarget } from './page-prepare.ts';
+import { databaseOnlyPublication, prepareFileTarget, preparePrivateTransition } from './page-prepare.ts';
+import { sourceCanonicalGit } from './git-door.ts';
+import { isPrivacyPrivatePage } from '../search/private-visibility.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 import { ownedGoogleReceipts, prepareGoogleReceiptPatch, type GoogleReceipts } from './connector-google-receipts.ts';
-import { connectorCheckpointKey, connectorIdentity, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
-import { readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
+import { connectorCheckpointKeys, connectorIdentity, connectorIdentityMatches, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
+import { connectorDirKey } from './connector-kinds.ts';
+import { CONNECTOR_PURGED_LIMIT, readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorPurgedItem, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
+import { connectorConfigDigest } from './connector-account-mismatch.ts';
 import { connectorAccountChanged, connectorFenceHint, docsAnchor, receiptDeliveredHint, CONNECTOR_INTENT_OUTDATED_OLD_HOST, CONNECTOR_INTENT_OUTDATED_PRE_UPGRADE } from './connector-errors.ts';
 import { inspectUnchanged, screeningRequest } from './noop-kernel.ts';
 import { conceptPreservationHold, preserveCanonicalFences } from '../cycle/concept-publication.ts';
@@ -44,6 +48,8 @@ import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
 import { readConnectorV2Cutoff } from './connector-checkpoint-migration.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
+import { intentCarriesPurgedContent } from './purged-intent.ts';
+import { PERSISTENCE_IPC_MAX_BYTES } from './ipc.ts';
 import type { GoogleSourceConfig } from '../google/types.ts';
 
 interface ConnectorLease { handle: DbLockHandle; signal: AbortSignal; }
@@ -62,11 +68,40 @@ export const connectorWaitBudget = { ms: CONNECTOR_WAIT_BUDGET_MS };
 const WAIT_RESERVE_MS = 1_000;
 const COMMIT_GRACE_MS = 1_000;
 const ITEM_WAIT_MS = 5_000;
+
+/**
+ * #6831: the pages guard refused this connector item because its content matches a page purge tombstone. That is the
+ * tombstone doing its job (the owner purged this content), so the item is skipped and recorded, never retried, and the
+ * rest of the run goes on. Every other failed receipt still fails the run or joins the retry set.
+ */
+const purgedRefusal = (row: WriteRequest) => row.state === 'failed' && row.error_code === 'purged_content';
 /**
  * Accepted-pending writes stop the sweep: the run ends partial with its pending
  * set recorded. A `write_pending` error, so direct session callers and
  * `rethrowConnectorWriteError` treat it like any accepted, unfinished write.
  */
+interface StoredCheckpoint { fingerprint: string; completed_keys: unknown[]; at: number | string }
+type GoogleCursorEntry = { generation?: number; state?: { gmail_backfill_done?: boolean; gmail_newest_ms?: number | null } | null };
+
+/**
+ * #6561: the cursor a run resumes from. Releases that hashed Google's default `contactsDir` saved it under what
+ * is now an alias key; nothing rewrites those rows on upgrade. The stable row is used unless an alias row was
+ * written after it and either the stable key has no row, or the alias cursor finished its Gmail backfill and the
+ * stable one did not or reached older mail. Once this release saves the stable row it is the newer one, so a
+ * reset or a reopened backfill never falls back. A resumed alias cursor takes a generation at or above the
+ * stable row's, so the next save still rises.
+ */
+export function resumeCheckpoint(stable: StoredCheckpoint | null, aliases: StoredCheckpoint[]): unknown[] {
+  const entry = (row: StoredCheckpoint) => (row.completed_keys[0] ?? {}) as GoogleCursorEntry;
+  const done = (row: StoredCheckpoint) => entry(row).state?.gmail_backfill_done === true;
+  const newest = (row: StoredCheckpoint) => Number(entry(row).state?.gmail_newest_ms ?? 0);
+  const newer = aliases.filter(alias => !stable || (Number(alias.at) > Number(stable.at) && done(alias) && (!done(stable) || newest(alias) > newest(stable))))
+    .sort((a, b) => Number(b.at) - Number(a.at))[0];
+  if (!newer) return stable?.completed_keys ?? [];
+  const generation = Math.max(Number(entry(newer).generation ?? 0), stable ? Number(entry(stable).generation ?? 0) : 0);
+  return [{ ...entry(newer), generation }, ...newer.completed_keys.slice(1)];
+}
+
 export class ConnectorWaitBudgetStop extends OperationError {
   constructor(row?: WriteRequest) {
     super('write_pending', 'The connector wait budget is spent with accepted writes still pending.',
@@ -139,8 +174,8 @@ function connectorPublicationRefusal(code: RegistryCode, message: string, row: W
 }
 
 /** The connector binding's owner and incarnation checks; returns the paths they prove present. */
-function checkedConnectorBinding(sourceId: string, source: ConnectorSource, binding: WorktreeBinding) {
-  if (binding.owner_host_id !== localHostId() || !binding.local_path || !binding.coordination_path) {
+function checkedConnectorBinding(engine: object, sourceId: string, source: ConnectorSource, binding: WorktreeBinding) {
+  if (binding.owner_host_id !== hostIdFor(engine) || !binding.local_path || !binding.coordination_path) {
     throw opError('owner_unavailable', 'The connector canonical owner is unavailable on this host.',
       `Source ${sourceId} is owned by another host or its worktree binding is incomplete; run its connector sync on the owner host that gbrain sources writer status --source ${sourceId} --json names.`,
       { fix: ownerStatusFix(sourceId, 'Shows which host owns the source and whether its binding records a local and coordination path.') });
@@ -153,13 +188,13 @@ function checkedConnectorBinding(sourceId: string, source: ConnectorSource, bind
   return { localPath: binding.local_path, coordinationPath: binding.coordination_path, sourcePath: source.local_path };
 }
 
-function connectorBindingRoot(sourceId: string, source: ConnectorSource, binding: WorktreeBinding | null): string | null {
+function connectorBindingRoot(engine: object, sourceId: string, source: ConnectorSource, binding: WorktreeBinding | null): string | null {
   if (!binding) return null;
-  const { localPath, coordinationPath, sourcePath } = checkedConnectorBinding(sourceId, source, binding);
+  const { localPath, coordinationPath, sourcePath } = checkedConnectorBinding(engine, sourceId, source, binding);
   assertPhysicalRoot(localPath, { worktreeId: binding.worktree_id, coordinationPath });
   try {
     const root = realpathSync(join(localPath, binding.relative_path));
-    const configured = source.config[source.config.kind === 'google' ? 'g_dir' : 'gh_dir'];
+    const configured = source.config[connectorDirKey(source.config.kind as ConnectorKind)];
     const directory = typeof configured === 'string' && configured.length > 0 ? configured : sourcePath;
     if (!containsPath(localPath, root) || !statSync(root).isDirectory() || realpathSync(sourcePath) !== root || realpathSync(directory) !== root) {
       throw new Error('root mismatch');
@@ -207,10 +242,33 @@ async function connectorFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 
   return { path, root, content, expectedBeforeHash: before };
 }
 
+/**
+ * G6: on a strict (canonical: git) source a private page is a declared database-only class and is never committed
+ * (docs/designs/GIT_CANONICAL_MEMORY.md), so a connector import of one (a calendar event the provider marks private,
+ * or a re-render of a page already private) publishes no file. Submission and publication decide it the same way.
+ */
+async function strictPrivateImport(engine: BrainEngine, sourceId: string, content: string, sourcePath: string, snapshot: PageSnapshot | null): Promise<boolean> {
+  const parsed = parseMarkdown(content, sourcePath);
+  const frontmatter = snapshot?.page.frontmatter.visibility === 'private' ? { ...parsed.frontmatter, visibility: 'private' } : parsed.frontmatter;
+  return isPrivacyPrivatePage({ type: parsed.type, frontmatter }) && await sourceCanonicalGit(engine, sourceId);
+}
+
+/**
+ * #7971: the file target of a strict private import, or null when the import is not one. A page turning private (its
+ * stored snapshot is live and public) gets the removal of the file it still has in the worktree or at HEAD, which the
+ * door commits with the publication (G7a, preparePrivateTransition), so the public file leaves HEAD and no private byte
+ * is committed. A page already private, or one without a file, publishes no file.
+ */
+async function strictPrivateFile(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, content: string, sourcePath: string,
+  snapshot: PageSnapshot | null): Promise<{ file: PreparedMutation['file'] } | null> {
+  if (!await strictPrivateImport(engine, row.source_id, content, sourcePath, snapshot)) return null;
+  const turning = snapshot && !snapshot.page.deleted_at && !isPrivacyPrivatePage({ type: snapshot.page.type, frontmatter: snapshot.page.frontmatter });
+  return { file: turning ? await preparePrivateTransition(engine, row, snapshot) : undefined };
+}
+
 export async function beginConnectorSync(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
   suppliedConfig: unknown, opts: SyncOpts & { resetCheckpoint?: boolean }, lease?: ConnectorLease): Promise<ManagedConnectorSync | null> {
-  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain?.enabled) return null;
+  if (!await readManagedMode(engine)) return null;
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
   if (opts.dryRun || opts.skipFailed || opts.srcSubpath || opts.exclude?.length || opts.includeHidden?.length ||
@@ -240,9 +298,9 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const authority = await managedSyncAuthority(engine, sourceId, source.incarnation, source.local_path ?? '');
   const binding = await getWorktreeBinding(engine, sourceId);
   // The locked acquisition re-stamps a device-only physical-root change (#5604) before the root is asserted.
-  if (binding) { checkedConnectorBinding(sourceId, source, binding); await probeWorktreeWriter(binding, engine); }
+  if (binding) { checkedConnectorBinding(engine, sourceId, source, binding); await probeWorktreeWriter(binding, engine); }
   else authority.writer.databaseOnlyReason = 'connector_database';
-  const canonicalRoot = connectorBindingRoot(sourceId, source, binding);
+  const canonicalRoot = connectorBindingRoot(engine, sourceId, source, binding);
   const session = new ManagedConnectorSync(engine, sourceId, identity, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true,
     opts.retryFailed === true, lease, opts.resetCheckpoint === true, opts.githubItem !== undefined, opts.full === true);
   await session.load();
@@ -258,8 +316,7 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
 export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
   config: unknown, opts: SyncOpts & { resetCheckpoint?: boolean }, work: (session: ManagedConnectorSync | null, opts: SyncOpts) => Promise<T>,
   onPending?: (result: T | null, session: ManagedConnectorSync) => T): Promise<T> {
-  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain?.enabled) {
+  if (!await readManagedMode(engine)) {
     if (opts.resetCheckpoint) throw new OperationError('invalid_params', '--reset-checkpoint applies to managed connector sources.',
       `This brain does not use managed persistence; re-walk this connector with: gbrain sync --source ${sourceId} --full`);
     // A preview never opens the autopilot dispatch gate (#5673).
@@ -283,7 +340,9 @@ export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string
       result = await work(session, options);
     } catch (error) {
       if (!(error instanceof ConnectorWaitBudgetStop)) {
-        if (error instanceof OperationError) await session.finish().catch(() => {});
+        // #6831: a run cut short by its caller's deadline or cancel is not a failure of the source.
+        const failure = combined.aborted ? undefined : error;
+        if (error instanceof OperationError || (failure && !(error instanceof LockStolenError))) await session.finish(failure).catch(() => {});
         throw error;
       }
       await session.finish();
@@ -297,7 +356,7 @@ export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string
   });
 }
 
-interface PendingWrite { entry: ConnectorPendingEntry; row: WriteRequest; bytes: number }
+interface PendingWrite { entry: ConnectorPendingEntry; row: WriteRequest; bytes: number; counted?: 'created' | 'updated' | 'deleted' }
 
 /** A connector sweep that ended with accepted writes pending, or stopped on its wait budget, reports `partial` / `writer_pending`. */
 export function pendingConnectorResult(result: SyncResult | null, session: ManagedConnectorSync): SyncResult {
@@ -307,7 +366,10 @@ export function pendingConnectorResult(result: SyncResult | null, session: Manag
 }
 
 export class ManagedConnectorSync {
+  /** The cursor this run resumes from and advances (the stable row, or a #6561 alias row the loader chose). */
   private checkpoint: unknown[] = [];
+  /** What the stable key holds: every checkpoint and page write compares against it, and writes go only there. */
+  private checkpointRow: unknown[] = [];
   private receipts: string[] = [];
   private retryApprovals = new Map<string, string>();
   /** Failed receipts a previous run ended with: retried automatically, without --retry-failed. */
@@ -327,19 +389,30 @@ export class ManagedConnectorSync {
   private pendingCheckpoint: ConnectorPendingEntry | null = null;
   /** Page slugs of held connector items: their terminal, recovery-free failed receipts leave the automatic retry set. */
   private heldSlugs = new Set<string>();
+  /** #6831: items this run skipped because their content matches a page purge tombstone. */
+  private purged: ConnectorPurgedItem[] = [];
+  /** #6831: whether the source holds any page purge tombstone (read once per run); only then are imports screened against them. */
+  private hasPagePurges = false;
+  /** #6831: the item whose failed receipt this run last reported, so a run that ends on it can name the item. */
+  private lastFailedItem: { slug: string; requestId: string } | null = null;
   /** True when this run ended with accepted writes pending, so its checkpoint did not advance. */
   deferred = false;
-  readonly counts: Omit<ConnectorRunCounts, 'finished_at' | 'pending' | 'stopped_on_wait_budget'> & { created: number; updated: number; deleted: number } = {
-    page_admissions: 0, skipped_unchanged: 0, checkpoint_admissions: 0, dropped_upstream: 0, created: 0, updated: 0, deleted: 0 };
+  readonly counts: Omit<ConnectorRunCounts, 'finished_at' | 'pending' | 'stopped_on_wait_budget'> & { created: number; updated: number; deleted: number; purged_skipped: number } = {
+    page_admissions: 0, skipped_unchanged: 0, checkpoint_admissions: 0, dropped_upstream: 0, created: 0, updated: 0, deleted: 0, purged_skipped: 0 };
   readonly checkpointKey: string;
+  /** The stable key plus its #6561 alias keys: retry approvals recorded under an alias still apply. */
+  private readonly checkpointKeys: string[];
   private readonly connector: ConnectorKind;
   constructor(private engine: BrainEngine, readonly sourceId: string, private identity: ConnectorIdentity,
     private source: ConnectorSource, private authority: SyncAuthority, private binding: WorktreeBinding | null,
     private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false,
     private lease?: ConnectorLease, private resetRequested = false, private targeted = false, private fullSweep = false) {
     this.connector = identity.kind;
-    this.checkpointKey = connectorCheckpointKey(sourceId, source.incarnation, identity);
+    this.checkpointKeys = connectorCheckpointKeys(sourceId, source.incarnation, identity);
+    this.checkpointKey = this.checkpointKeys[0]!;
   }
+  /** Whether this run publishes canonical files (a bound worktree root) rather than database-only rows. */
+  get bound(): boolean { return this.canonicalRoot !== null; }
   async assertLease(engine: BrainEngine): Promise<void> {
     if (!this.lease) return;
     this.lease.signal.throwIfAborted();
@@ -365,15 +438,19 @@ export class ManagedConnectorSync {
     }
     const limits = await readJournalLimits(this.engine);
     this.outstandingCap = Math.max(1, Math.min(90, limits.principalOutstanding - 10));
-    this.intentByteCap = Math.max(1024 ** 2, Math.floor(limits.principalIntentBytes / 2));
+    this.intentByteCap = Math.max(1024 ** 2, Math.floor(Math.min(limits.principalIntentBytes, PERSISTENCE_IPC_MAX_BYTES) / 2));
     this.connectorState = await readManagedConnectorState(this.engine, this.sourceId, this.source.incarnation);
+    this.hasPagePurges = (await this.engine.executeRaw('SELECT 1 FROM page_purges WHERE source_id=$1 LIMIT 1', [this.sourceId])).length > 0;
     await this.resolvePendingSet();
-    const [row] = await this.engine.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [this.checkpointKey]);
-    this.checkpoint = row?.completed_keys ?? [];
+    const rows = await this.engine.executeRaw<StoredCheckpoint>(`SELECT fingerprint,completed_keys,extract(epoch from updated_at)::float8 AS at
+      FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=ANY($1::text[])`, [this.checkpointKeys]);
+    const stable = rows.find(row => row.fingerprint === this.checkpointKey) ?? null;
+    this.checkpointRow = stable?.completed_keys ?? [];
+    this.checkpoint = resumeCheckpoint(stable, rows.filter(row => row.fingerprint !== this.checkpointKey));
     const pointers = await this.engine.executeRaw<{ completed_keys: ConnectorRetry[] }>(`SELECT completed_keys FROM op_checkpoints
-      WHERE op='managed-connector-retry' AND completed_keys->0->>'checkpointKey'=$1
+      WHERE op='managed-connector-retry' AND completed_keys->0->>'checkpointKey'=ANY($1::text[])
       AND completed_keys->0->>'principalId'=$2 AND completed_keys->0->>'principalKind'=$3`,
-    [this.checkpointKey, this.authority.writer.principal.id, this.authority.writer.principal.kind]);
+    [this.checkpointKeys, this.authority.writer.principal.id, this.authority.writer.principal.kind]);
     this.retryApprovals = new Map(pointers.map(row => [row.completed_keys[0].baseRequestId, row.completed_keys[0].requestId]));
   }
   /**
@@ -393,6 +470,7 @@ export class ManagedConnectorSync {
       if (row.state === 'committed') continue;
       if (entry.itemRef === CHECKPOINT_SLUG && !isTerminal(row)) { this.pendingCheckpoint = entry; this.blockedByCheckpoint = true; continue; }
       if (!isTerminal(row)) { this.pendingRows.set(row.id, { entry, row, bytes: 0 }); continue; }
+      if (purgedRefusal(row)) { this.skipPurged(entry.itemRef, row); continue; }
       this.autoRetry.add(entry.baseRequestId);
       this.carried.push(entry);
     }
@@ -405,12 +483,16 @@ export class ManagedConnectorSync {
   async assertAccount(resolved: ConnectorAccount | null): Promise<void> {
     if (this.blockedByCheckpoint) { this.stopped = true; throw new ConnectorWaitBudgetStop(); }
     const configured = this.identity.kind === 'google' ? (this.identity.config as GoogleSourceConfig).account : null;
-    if (resolved === null) throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured ?? 'the pinned account', null);
+    if (resolved === null) throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured ?? 'the pinned account', null));
     if (configured !== null && resolved.kind === 'google' && resolved.email !== configured) {
-      throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured, resolved);
+      throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured, resolved));
     }
     const pinned = this.connectorState.account;
-    if (pinned && !sameConnectorAccount(pinned, resolved)) throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, pinned, resolved);
+    if (pinned && !sameConnectorAccount(pinned, resolved)) throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, pinned, resolved));
+    if (this.connectorState.account_mismatch) {
+      this.connectorState = { ...this.connectorState, account_mismatch: null };
+      if (pinned) await this.writeState();
+    }
     if (!pinned) {
       const migrated = this.connectorState.upgrade_recovery === 'resumed';
       this.connectorState = { ...this.connectorState, account: resolved, pinned_at: new Date().toISOString(), continuity_unverified: migrated };
@@ -421,6 +503,17 @@ export class ManagedConnectorSync {
       }
     }
     if (this.resetRequested) await this.resetCheckpoint();
+  }
+  /**
+   * #6803: records the refusal in the connector state so autopilot stops
+   * dispatching this source until the operator repins it or changes its
+   * connector config. Best-effort: the refusal itself is what the caller sees.
+   */
+  private async accountRefused(error: OperationError): Promise<OperationError> {
+    this.connectorState = { ...this.connectorState, account_mismatch: { at: new Date().toISOString(),
+      detail: error.detail === 'account_unresolved' ? 'account_unresolved' : 'account_changed', config_digest: connectorConfigDigest(this.identity.config) } };
+    await this.writeState().catch(() => undefined);
+    return error;
   }
   /** `--reset-checkpoint`: resolve pending writes, then start from an empty cursor. Existing pages stay; the pin is kept. */
   private async resetCheckpoint(): Promise<void> {
@@ -435,7 +528,7 @@ export class ManagedConnectorSync {
       // The empty cursor keeps a rising generation, so the next save can never replay an older committed checkpoint receipt.
       const next = [{ generation: Number((this.checkpoint[0] as { generation?: number }).generation ?? 0) + 1, state: null }];
       await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null, { checkpointAfter: next, receipts: [], fresh: false });
-      this.checkpoint = next;
+      this.checkpoint = this.checkpointRow = next;
       this.receipts = [];
     }
     this.connectorState = { ...this.connectorState, upgrade_recovery: 'none', resumed_from: null };
@@ -454,7 +547,7 @@ export class ManagedConnectorSync {
     const binding = await getWorktreeBinding(engine, this.sourceId);
     if ((binding?.worktree_id ?? null) !== (this.binding?.worktree_id ?? null) ||
         String(binding?.owner_epoch) !== String(this.binding?.owner_epoch) ||
-        connectorBindingRoot(this.sourceId, source, binding) !== this.canonicalRoot) {
+        connectorBindingRoot(engine, this.sourceId, source, binding) !== this.canonicalRoot) {
       throw opError('source_changed', 'The connector ownership changed during the sweep.',
         `The owner binding or canonical root of ${this.sourceId} changed while this sweep ran; writes it already admitted keep their receipts. Inspect the owner before running gbrain sync --source ${this.sourceId} again.`,
         { fix: ownerStatusFix(this.sourceId, 'Shows the current owner, epoch and canonical root of the source.') });
@@ -463,7 +556,7 @@ export class ManagedConnectorSync {
   }
   private async retryBlocker(engine: BrainEngine): Promise<WriteRequest | undefined> {
     const [row] = await engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
-      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL))
+      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','deferred','running','recovering') OR r.recovery IS NOT NULL))
         OR EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.recovery IS NOT NULL
           AND (e.source_id=$1 OR e.worktree_id=$2::uuid)) ORDER BY r.sequence LIMIT 1`, [this.sourceId, this.binding?.worktree_id ?? null]);
     return row;
@@ -572,7 +665,8 @@ export class ManagedConnectorSync {
     // A targeted refresh must not move the cursor past a carried failure it did not revisit.
     const blocked = this.targeted && this.unreachedCarried().some(entry => entry.itemRef !== CHECKPOINT_SLUG);
     if (this.pendingRows.size || this.failedPending.length || blocked) { this.deferred = true; this.lastSaveCommitted = false; return; }
-    if (this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(state ?? null)) {
+    // A cursor resumed from an alias key is always saved once, so it moves to the stable key.
+    if (digest(this.checkpoint) === digest(this.checkpointRow) && this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(state ?? null)) {
       if (fresh) await this.stampFreshness(newestContentAt);
       this.receipts = [];
       this.lastSaveCommitted = true;
@@ -581,7 +675,7 @@ export class ManagedConnectorSync {
     const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state: structuredClone(state) }];
     await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null,
       { checkpointAfter: next, receipts: [...this.receipts], fresh, ...(newestContentAt ? { newestContentAt } : {}) });
-    this.checkpoint = next;
+    this.checkpoint = this.checkpointRow = next;
     this.receipts = [];
     this.lastSaveCommitted = true;
   }
@@ -622,7 +716,15 @@ export class ManagedConnectorSync {
     for (const [id, pending] of this.pendingRows) {
       const row = found.get(id);
       if (!row || row.state === 'committed') { this.pendingRows.delete(id); continue; }
-      if (isTerminal(row)) { this.pendingRows.delete(id); this.failedPending.push(pending.entry); continue; }
+      if (isTerminal(row)) {
+        this.pendingRows.delete(id);
+        if (!purgedRefusal(row)) this.failedPending.push(pending.entry);
+        else {
+          if (pending.counted) this.counts[pending.counted]--;
+          this.skipPurged(pending.entry.itemRef, row);
+        }
+        continue;
+      }
       pending.row = row;
     }
   }
@@ -676,8 +778,12 @@ export class ManagedConnectorSync {
       await this.refreshPending();
     }
   }
-  /** Records the run's pending set, counts and upgrade state; written only while the lease is held. */
-  async finish(): Promise<void> {
+  /**
+   * Records the run's pending set, counts and upgrade state; written only while the lease is held. `failure` is the
+   * error the run ended on (#6831): it is recorded with a count of runs in a row that ended that way. Only a complete
+   * run (its cursor saved, nothing pending or failed) clears it; a partial or wait-budget stop leaves it as it was.
+   */
+  async finish(failure?: unknown): Promise<void> {
     await this.refreshPending().catch(() => {});
     const now = new Date().toISOString();
     const outstanding = [...this.pendingRows.values()].map(pending => pending.entry);
@@ -694,10 +800,47 @@ export class ManagedConnectorSync {
       .map(entry => [entry.requestId, entry])).values()];
     if (outstanding.length || this.failedPending.length || this.pendingCheckpoint || this.stopped) this.deferred = true;
     const recovery = this.connectorState.upgrade_recovery === 'rewalking_once' && complete ? 'none' : this.connectorState.upgrade_recovery;
-    this.connectorState = { ...this.connectorState, pending, upgrade_recovery: recovery, last_run: {
+    const listed = new Set<string>();
+    const purgedItems = [...this.purged].reverse().concat(this.connectorState.purged_items ?? [])
+      .filter(entry => !listed.has(entry.slug) && !!listed.add(entry.slug)).slice(0, CONNECTOR_PURGED_LIMIT);
+    const receipt = failure instanceof OperationError ? failure.writeRequest : undefined;
+    const item = receipt && receipt.request_id === this.lastFailedItem?.requestId ? this.lastFailedItem : null;
+    const named = failure as { code?: unknown; message?: unknown } | undefined;
+    const lastFailure = failure ? { code: (failure instanceof OperationError ? failure.writeError : undefined) ?? (typeof named?.code === 'string' && named.code ? named.code : 'connector_error'),
+      message: typeof named?.message === 'string' ? named.message : String(failure), slug: item?.slug ?? null, request_id: item?.requestId ?? null,
+      at: now, consecutive: (this.connectorState.last_failure?.consecutive ?? 0) + 1 } : complete ? null : this.connectorState.last_failure ?? null;
+    this.connectorState = { ...this.connectorState, pending, upgrade_recovery: recovery, purged_items: purgedItems, last_failure: lastFailure, last_run: {
       page_admissions: this.counts.page_admissions, skipped_unchanged: this.counts.skipped_unchanged, pending: pending.length,
-      checkpoint_admissions: this.counts.checkpoint_admissions, stopped_on_wait_budget: this.stopped, dropped_upstream: this.counts.dropped_upstream, finished_at: now } };
+      checkpoint_admissions: this.counts.checkpoint_admissions, stopped_on_wait_budget: this.stopped, dropped_upstream: this.counts.dropped_upstream,
+      ...(this.counts.purged_skipped ? { purged_skipped: this.counts.purged_skipped } : {}), finished_at: now } };
     await this.writeState();
+  }
+  /**
+   * #6831: records a connector item skipped because its content matches a page purge tombstone, either screened out
+   * before admission (`row` null) or refused by the pages guard at publication. A refused receipt is not one the
+   * checkpoint waits on, and it never joins the automatic retry set. The item stays skipped on every run that lists the
+   * same content until the owner clears the tombstone (`gbrain pages unpurge <slug>`).
+   */
+  private skipPurged(slug: string, row: WriteRequest | null): void {
+    if (row) this.receipts = this.receipts.filter(id => id !== row.id);
+    this.counts.purged_skipped++;
+    this.purged.push({ slug, request_id: row?.request_id ?? null, at: new Date().toISOString() });
+    process.stderr.write(`[connector] ${this.sourceId}: skipped ${slug}: its content matches a page purge tombstone${row ? ` (request ${row.request_id})` : ''}; `
+      + `the rest of the sync continues. To let it back in: gbrain pages unpurge ${slug}\n`);
+  }
+  /**
+   * #6831: screens a page import against the source's page purge tombstones before admission, with the content hash
+   * the pages guard compares (`intentCarriesPurgedContent`), so a purged item that keeps being listed costs no refused
+   * receipt per run. A miss here (the publication renders different bytes, or a purge lands mid-run) still ends in the
+   * guard's refusal, which `submit` and the pending-set paths skip the same way.
+   */
+  private async carriesPurgedPage(slug: string, content: string | undefined): Promise<boolean> {
+    return this.hasPagePurges && this.purgedNow(slug, content);
+  }
+  /** Whether a page tombstone of the source matches this content now, read without the per-run presence shortcut. */
+  private async purgedNow(slug: string, content: string | undefined): Promise<boolean> {
+    if (!content) return false;
+    return intentCarriesPurgedContent(this.engine, { source_id: this.sourceId, slug, intent: { content } }, { facts: false, pages: true });
   }
   /**
    * Fix wave 4: marks connector items held by this run. Only their terminal,
@@ -731,7 +874,7 @@ export class ManagedConnectorSync {
     const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state }];
     try {
       await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null, { checkpointAfter: next, receipts: [], fresh: false });
-      this.checkpoint = next;
+      this.checkpoint = this.checkpointRow = next;
       return true;
     } catch {
       return false;
@@ -765,7 +908,8 @@ export class ManagedConnectorSync {
       if (kind === 'connector_v2_delete') {
         if (this.binding || prepared.noop !== true) return false;
       } else {
-        const verdict = await inspectUnchanged(this.engine, { prepared, snapshot, sourcePath, databaseOnly: !this.binding });
+        const databaseOnly = !this.binding || !prepared.file && await strictPrivateImport(this.engine, this.sourceId, intent.content ?? '', sourcePath ?? `${slug}.md`, snapshot);
+        const verdict = await inspectUnchanged(this.engine, { prepared, snapshot, sourcePath, databaseOnly });
         if (verdict.admitReason) return false;
       }
       await prepared.validate?.(this.engine);
@@ -788,8 +932,11 @@ export class ManagedConnectorSync {
       extra.googleReceipts = ownedGoogleReceipts(snapshot, (this.identity.config as GoogleSourceConfig).account, extra.googleReceipts!);
       sourcePath = snapshot!.page.source_path!;
     }
-    const file = kind === 'connector_v2_checkpoint' ? undefined : await connectorFileTarget(this.engine,
-      { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug }, snapshot, extra.content ?? null, sourcePath, this.canonicalRoot);
+    const target = { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug };
+    const strictPrivate = kind === 'connector_v2_import' && sourcePath && typeof extra.content === 'string'
+      ? await strictPrivateFile(this.engine, target, extra.content, sourcePath, snapshot) : null;
+    const file = kind === 'connector_v2_checkpoint' ? undefined : strictPrivate ? strictPrivate.file
+      : await connectorFileTarget(this.engine, target, snapshot, extra.content ?? null, sourcePath, this.canonicalRoot);
     if (file && sourcePath && resolve(file.path) !== resolve(this.canonicalRoot!, sourcePath)) {
       throw opError('source_changed', 'The connector source path no longer names its canonical file.',
         `The recorded path of ${slug} no longer resolves to its canonical file under the root of ${this.sourceId}, so nothing was submitted. Inspect the root and binding before running gbrain sync --source ${this.sourceId} again.`,
@@ -798,7 +945,7 @@ export class ManagedConnectorSync {
     const intent: ConnectorIntent = { kind, connector: this.connector, sourceRoot: this.source.local_path,
       configHash: this.identity.digest, syncAuthority: this.authority, expected_revision: snapshot?.revision ?? null,
       sourcePath, noEmbed: this.noEmbed, noSchemaPack: this.noSchemaPack, checkpointKey: this.checkpointKey,
-      checkpointBefore: kind === 'connector_v2_checkpoint' ? this.checkpoint : cursorOnly(this.checkpoint),
+      checkpointBefore: kind === 'connector_v2_checkpoint' ? this.checkpointRow : cursorOnly(this.checkpointRow),
       ownerEpoch: this.binding ? String(this.binding.owner_epoch) : null, canonicalRoot: this.canonicalRoot,
       filePath: file?.path ?? null, fileBeforeHash: file?.expectedBeforeHash ?? null, ...extra };
     const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined,
@@ -828,11 +975,17 @@ export class ManagedConnectorSync {
         { fix: ownerStatusFix(this.sourceId, 'Shows the source\'s receipts and any retained recovery before a retry is approved again.') });
       return { retry, input, row };
     };
+    const prior = await selected(this.engine);
+    let row = prior.row;
+    // #6831: a replayed purged refusal stays skipped (even under --retry-failed) while its tombstone stands; once the
+    // owner cleared it, the item gets one automatic retry through the guarded retry path below.
+    if (kind === 'connector_v2_import' && row && purgedRefusal(row) && row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId)) {
+      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      this.autoRetry.add(baseRequestId);
+    }
     const automatic = this.autoRetry.has(baseRequestId);
     const mayRetry = (row: WriteRequest | null) => (this.retryFailed || automatic) && row && ['failed', 'conflict'].includes(row.state) &&
       row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId);
-    const prior = await selected(this.engine);
-    let row = prior.row;
     let admitted = false;
     if (mayRetry(row)) {
       const failedRow = row!;
@@ -859,7 +1012,7 @@ export class ManagedConnectorSync {
           await this.refuseRetryBlocker(tx);
           const [checkpoint] = await tx.executeRaw<{ completed_keys: unknown[] }>(
             "SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1 FOR UPDATE", [this.checkpointKey]);
-          if (digest(checkpoint?.completed_keys ?? []) !== digest(this.checkpoint)) throw opError('revision_conflict', 'The connector cursor changed before retry approval.',
+          if (digest(checkpoint?.completed_keys ?? []) !== digest(this.checkpointRow)) throw opError('revision_conflict', 'The connector cursor changed before retry approval.',
             `Another run moved the connector cursor of ${this.sourceId} while this one re-approved ${slug}; nothing was admitted. Run gbrain sync --source ${this.sourceId} to continue from the new cursor.`,
             { fix: connectorSyncFix(this.sourceId, 'A new run reads the current cursor and resolves the recorded pending set first.') });
           const attempt = (current.retry?.attempt ?? 0) + 1;
@@ -886,6 +1039,10 @@ export class ManagedConnectorSync {
     } else if (!row) {
       if (page && !prior.retry && await this.unchanged(kind, slug, intent, snapshot, sourcePath)) {
         this.counts.skipped_unchanged++;
+        return { row: null, pending: false, created: false };
+      }
+      if (kind === 'connector_v2_import' && await this.carriesPurgedPage(slug, extra.content)) {
+        this.skipPurged(slug, null);
         return { row: null, pending: false, created: false };
       }
       row = await this.engine.transaction(async tx => {
@@ -919,6 +1076,8 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: false };
     }
     if (isTerminal(row)) {
+      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (row.state !== 'committed') this.lastFailedItem = { slug, requestId: row.request_id };
       writeResponse(row);
       this.receipts.push(row.id);
       if (row.outcome?.noop !== true) {
@@ -927,9 +1086,10 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: row.outcome?.status === 'created' };
     }
     this.receipts.push(row.id);
-    this.pendingRows.set(row.id, { row, bytes: Buffer.byteLength(JSON.stringify(intent)),
+    const counted = !snapshot ? 'created' : kind === 'connector_v2_delete' ? 'deleted' : 'updated';
+    this.pendingRows.set(row.id, { row, bytes: Buffer.byteLength(JSON.stringify(intent)), counted,
       entry: { itemRef: slug, requestId: row.request_id, baseRequestId, admittedAt: new Date(row.created_at).toISOString() } });
-    if (!snapshot) this.counts.created++; else if (kind === 'connector_v2_delete') this.counts.deleted++; else this.counts.updated++;
+    this.counts[counted]++;
     await this.makeRoom();
     return { row, pending: true, created: !snapshot };
   }
@@ -949,7 +1109,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     await validateSyncAuthority(tx, p.syncAuthority, row.slug);
     const [source] = await tx.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [row.source_id]);
     if (!source || source.archived || source.incarnation !== row.source_incarnation || source.config.kind !== p.connector ||
-        connectorIdentity(p.connector, source.config, source.local_path).digest !== p.configHash || source.local_path !== p.sourceRoot) {
+        !connectorIdentityMatches(connectorIdentity(p.connector, source.config, source.local_path), p.configHash) || source.local_path !== p.sourceRoot) {
       throw connectorPublicationRefusal('source_changed', 'The connector configuration changed after admission.', row,
         `The connector configuration, path or incarnation of ${row.source_id} changed after this write was admitted.`);
     }
@@ -958,7 +1118,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       throw connectorPublicationRefusal('source_changed', 'The connector ownership binding changed after admission.', row,
         `The owner binding of ${row.source_id} changed after this write was admitted.`);
     }
-    if (connectorBindingRoot(row.source_id, source, binding) !== p.canonicalRoot) throw connectorPublicationRefusal('source_changed', 'The connector canonical root changed after admission.', row,
+    if (connectorBindingRoot(engine, row.source_id, source, binding) !== p.canonicalRoot) throw connectorPublicationRefusal('source_changed', 'The connector canonical root changed after admission.', row,
       `The canonical root of ${row.source_id} changed after this write was admitted.`);
     if (p.filePath !== null && (!p.canonicalRoot || !isWriteTargetContained(p.filePath, p.canonicalRoot) || persistenceFileHash(p.filePath) !== p.fileBeforeHash)) {
       throw connectorPublicationRefusal('source_changed', 'The connector canonical file changed after admission.', row,
@@ -1053,7 +1213,9 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, snapshot, 'preserving');
   const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const page: Page = { ...(snapshot?.page ?? { id: 0, slug: row.slug, source_id: row.source_id, created_at: new Date(row.created_at), updated_at: new Date(row.created_at) }), ...ready.parsedPage };
-  const target = await connectorFileTarget(engine, row, snapshot, serializePageToMarkdown(page, tags), p.sourcePath, p.canonicalRoot);
+  const strictPrivate = await strictPrivateFile(engine, row, p.content, p.sourcePath, snapshot);
+  const target = strictPrivate ? strictPrivate.file
+    : await connectorFileTarget(engine, row, snapshot, serializePageToMarkdown(page, tags), p.sourcePath, p.canonicalRoot);
   // Google pages hold private mail: derived here from the stored connector, never submitted, so request ids are unchanged.
   const file = target && p.connector === 'google' ? { ...target, publishMode: 0o600 } : target;
   if (file && (file.path !== p.filePath || file.expectedBeforeHash !== p.fileBeforeHash)) throw connectorPublicationRefusal('source_changed', 'The connector canonical file changed during preparation.', row,

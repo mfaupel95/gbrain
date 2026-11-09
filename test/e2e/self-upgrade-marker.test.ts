@@ -21,6 +21,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VERSION } from '../../src/version.ts';
+import { writeChannelCache } from '../helpers/update-cache.ts';
 
 let home: string;
 let gbrainDir: string;
@@ -37,7 +38,7 @@ afterEach(() => {
 });
 
 function writeCache(line: string): void {
-  writeFileSync(join(gbrainDir, 'last-update-check'), line + '\n'); // mtime = now → fresh
+  writeChannelCache(gbrainDir, line, { channel: 'stable' }); // checked_at = now → fresh; stable is the default channel
 }
 
 function runGbrain(mode: string | undefined): { stdout: string; stderr: string; code: number } {
@@ -65,7 +66,16 @@ describe('self-upgrade marker on a real invocation', () => {
     writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
     const { stderr } = runGbrain('notify');
     expect(stderr).toContain(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
-    expect(stderr).toContain('Run: gbrain self-upgrade');
+    expect(stderr).not.toContain('Run: gbrain self-upgrade');
+  });
+
+  test('#7147: one banner per window across calls; a newer latest prints again at once', () => {
+    writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
+    const banners = (stderr: string) => stderr.split('\n').filter(line => line.startsWith('UPGRADE_AVAILABLE') || line.includes('available. Run: gbrain self-upgrade'));
+    expect(banners(runGbrain('notify').stderr)).toEqual([`UPGRADE_AVAILABLE ${VERSION} 0.99.0`]);
+    expect(banners(runGbrain('notify').stderr)).toEqual([]);
+    writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.1`);
+    expect(banners(runGbrain('notify').stderr)).toEqual([`UPGRADE_AVAILABLE ${VERSION} 0.99.1`]);
   });
 
   test('off mode → no marker (update checks disabled)', () => {
@@ -97,10 +107,20 @@ describe('self-upgrade marker on a real invocation', () => {
 
   test('active snooze for the version → no marker (notify mode honors snooze)', () => {
     writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
-    // snooze record: "<version> <level> <epoch-ms>" — fresh ts so it's active.
-    writeFileSync(join(gbrainDir, 'update-snoozed'), `0.99.0 1 ${Date.now()}\n`);
+    const now = Date.now();
+    writeFileSync(join(gbrainDir, 'update-snoozed.stable.json'), JSON.stringify({ version: '0.99.0', level: 1, ts: now, until: now + 86_400_000 }) + '\n');
     const { stderr } = runGbrain('notify');
     expect(stderr).not.toContain('UPGRADE_AVAILABLE');
+  });
+
+  test('GBRA-224: a legacy unpartitioned cache is never read, and the one-time channel notice prints once', () => {
+    writeFileSync(join(gbrainDir, 'last-update-check'), `UPGRADE_AVAILABLE ${VERSION} 0.99.0\n`);
+    writeChannelCache(gbrainDir, `UP_TO_DATE ${VERSION}`, { channel: 'stable' });
+    const first = runGbrain('notify').stderr;
+    expect(first).not.toContain('UPGRADE_AVAILABLE');
+    expect(first.split('\n').filter(l => l.startsWith('[gbrain notice release_channel]'))).toHaveLength(1);
+    expect(first).toContain('gbrain config set self_upgrade.channel alpha');
+    expect(runGbrain('notify').stderr).not.toContain('[gbrain notice release_channel]');
   });
 
   test('JUST_UPGRADED breadcrumb → one-time confirmation on stderr, then cleared', () => {

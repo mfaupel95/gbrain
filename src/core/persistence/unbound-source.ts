@@ -1,10 +1,14 @@
 import type { BrainEngine } from '../engine.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
+import { managedPersistenceEnabled } from './ownership.ts';
+import { isConnectorSourceKind } from './connector-identity.ts';
+import { detachRestoredPage } from './detached-pages.ts';
 
 /**
- * #5254: a Postgres page write to a filesystem source with no canonical owner.
- * Refused by default; `persistence.unbound_write=database_only` lets every
+ * #5254: a Postgres page write to a filesystem source with no canonical owner
+ * (#6449: also a PGLite write to a source activation listed database-only,
+ * where the automatic first-write claim is off). Refused by default; `persistence.unbound_write=database_only` lets every
  * page mutation (#5393) write a page with no recorded canonical file to the
  * database only. Those pages
  * carry `pages.database_only_reason='unbound_source'` so writes and sync after
@@ -18,6 +22,21 @@ export const UNBOUND_PUBLICATION_MESSAGE = 'The source was bound, or the page ga
 export const CONNECTOR_BOUND_HINT = 'Nothing was written. Read the page again and submit the write with a new request_id; the bound source publishes it to its canonical file.';
 export const CONNECTOR_BOUND_MESSAGE = 'The connector source gained a canonical owner after this database-only write was accepted.';
 export const UNBOUND_COLLISION_MESSAGE = 'A database-only page written while its source was unbound already uses this slug.';
+
+/**
+ * #6449: the rooted sources `writer activate` accepted without an owner because
+ * `sync.write_through` was off (activation.ts writes the list, deactivation
+ * clears it). A PGLite page write to one of them never runs the automatic
+ * first-write claim, so turning `sync.write_through` back on refuses with the
+ * claim named instead of starting to publish files into an unreviewed checkout.
+ */
+export const DATABASE_ONLY_SOURCES_KEY = 'persistence.database_only_sources';
+export async function readDatabaseOnlyActivatedSources(engine: Pick<BrainEngine, 'getConfig'>): Promise<string[]> {
+  try {
+    const parsed: unknown = JSON.parse(await engine.getConfig(DATABASE_ONLY_SOURCES_KEY) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch { return []; }
+}
 
 export function parseUnboundWriteValue(value: string): UnboundWritePolicy {
   if ((UNBOUND_WRITE_VALUES as readonly string[]).includes(value)) return value as UnboundWritePolicy;
@@ -82,6 +101,28 @@ export function unboundSourceError(sourceId: string, path: string | null, scope:
   return error;
 }
 
+export type UnboundWriteDecision = { kind: 'claim' } | { kind: 'database_only'; reason: 'connector_database' | 'unbound_source' };
+
+/**
+ * The one rule for a write-through write to a source with a checkout root but
+ * no worktree binding, shared by page writers and fact writers (#6608):
+ * a connector source is database-only by design and never claimed; PGLite
+ * claims the source automatically unless activation listed it database-only
+ * (#6449); otherwise a target with a recorded canonical file, or any
+ * `persistence.unbound_write` other than `database_only`, refuses with
+ * `unboundSourceError`, and the rest is written database-only (`unbound_source`).
+ * `path` names the checkout in the refusal; pass it only for trusted local callers.
+ */
+export async function decideUnboundWrite(engine: BrainEngine,
+  input: { sourceId: string; sourceKind: string | null; fileBacked: boolean; path: string | null }): Promise<UnboundWriteDecision> {
+  if (isConnectorSourceKind(input.sourceKind)) return { kind: 'database_only', reason: 'connector_database' };
+  if (engine.kind === 'pglite' && !(await readDatabaseOnlyActivatedSources(engine)).includes(input.sourceId)) return { kind: 'claim' };
+  if (input.fileBacked || await readUnboundWritePolicy(engine) !== 'database_only') {
+    throw unboundSourceError(input.sourceId, input.path, input.fileBacked ? 'file_backed' : 'database_only_eligible', !await managedPersistenceEnabled(engine));
+  }
+  return { kind: 'database_only', reason: 'unbound_source' };
+}
+
 export function unboundPublicationHint(sourceId: string): string {
   return `Source '${sourceId}' gained a canonical owner, or the page gained a canonical file, after this database-only write was accepted, so nothing was written. `
     + 'Read the page again and submit the write with a new request_id; a bound source publishes it to its canonical file.';
@@ -109,7 +150,13 @@ export async function assertUnboundPublication(tx: SqlEngine, row: Pick<WriteReq
   throw error;
 }
 
-export async function classifyUnboundPage(tx: SqlEngine, row: Pick<WriteRequest, 'authority' | 'source_id' | 'slug'>): Promise<void> {
+/**
+ * The publication's database-only stamp of the page it wrote: `unbound_source`
+ * for a write admitted that way, and `detached` (forgetting the recorded file)
+ * for a `restore_page` with `detach` (#6609, `detached-pages.ts`).
+ */
+export async function classifyUnboundPage(tx: SqlEngine, row: Pick<WriteRequest, 'authority' | 'source_id' | 'slug' | 'operation' | 'intent'>): Promise<void> {
+  await detachRestoredPage(tx, row);
   if (row.authority.databaseOnlyReason !== 'unbound_source') return;
   await tx.executeRaw("UPDATE pages SET database_only_reason='unbound_source' WHERE source_id=$1 AND slug=$2 AND database_only_reason IS NULL",
     [row.source_id, row.slug]);

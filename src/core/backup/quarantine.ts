@@ -55,6 +55,7 @@ export async function quarantineRestoredExecution(tx: BrainEngine, options: {
       const detached = {
         ...(typeof config.federated === 'boolean' ? { federated: config.federated } : {}),
         ...(typeof config.strategy === 'string' ? { strategy: config.strategy } : {}),
+        ...(config.qm_scope === true ? { qm_scope: true } : {}),
         syncEnabled: false, restore_detached: options.restoreId,
       };
       await tx.executeRaw('UPDATE sources SET local_path = NULL, config = $1::text::jsonb WHERE id = $2', [JSON.stringify(detached), row.id]);
@@ -67,6 +68,7 @@ export async function quarantineRestoredExecution(tx: BrainEngine, options: {
       let preserved = 0;
       for (const page of pages) {
         const rel = relativeBackupPath(source.local_path, page.source_path);
+        // origin-guard-ok: a restore rebases every origin of the source one-to-one onto the new root, so it creates no twin
         if (rel) await tx.executeRaw('UPDATE pages SET source_path = $1 WHERE id = $2', [confinedPath(rebased, rel), page.id]);
         else if (posix.isAbsolute(page.source_path) || win32.isAbsolute(page.source_path)) preserved++;
       }

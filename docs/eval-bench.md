@@ -31,6 +31,25 @@ Before repeating an approach, read its measured outcome and limitations:
   retrieval quality. The [experiment guide](eval/ANSWER_PACKET.md) records the
   reproducible setup and spending safeguards.
 
+- [Relative dates, reranker fusion, titled reranker documents, rank labels and tail trim: not adopted](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-21-external-ideas-wave-a.md).
+  Each was preregistered in gbrain-evals and run against the release default
+  on LongMemEval-S. Absolute date brackets beside relative phrases in
+  delivered conversation turns, with retrieval frozen: Sonnet 5.5 scored 460.5
+  vs 463 out of 500 (mean of 2 samples, inconclusive). The 60-question
+  synthetic date suite was at ceiling (60/60 in both arms), and a bracket
+  audit found 1 wrong out of 100. Reciprocal-rank fusion of the reranker and
+  first-pass orders (k=60, equal weights): recall_all@5 fell from 451 to 439
+  out of 470, and ranking-shapes hit@1 fell from 91.4% to 65.7%
+  ([wave B](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-21-external-ideas-wave-b-results.md)).
+  A page title and date in the reranker document: 450 vs 451 out of 470, with
+  no gain shown. Rank labels with blocks in date order: 462.5 vs 463
+  (inconclusive). None of these shipped. Trimming low-scoring blocks behind a
+  protected top 3 was non-inferior on Sonnet 5.5, GPT-6.1 Sol and Opus 5.5,
+  and cut delivered evidence by 36.6% on affected questions. It broke one
+  knowledge-update question, where the earlier value sat in a trimmed block
+  ([wave A2](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-21-external-ideas-wave-a2.md)).
+  It's a candidate, not shipped.
+
 - [What actually helps an AI use its memory?](research/answer-evidence/compendium.md)
   explains the relevant research in plain English, separates published findings
   from GBrain's measured failures, and ranks narrowly testable next experiments.
@@ -494,7 +513,7 @@ What the arms say:
   and autocut off, expansion costs thirteen questions against `balanced`
   (+2 / −15: multi-session −7, temporal −5) plus the Haiku call per query.
   `gbrain config set search.mode balanced` keeps the reranker and drops
-  expansion (`gbrain query` still expands in every mode unless `--no-expand`);
+  expansion (`gbrain query` no longer expands under `balanced` unless `--expand`);
   `gbrain config set search.expansion_variant_budget 0.25`
   recovers most of the loss if you keep it on.
 - **Slot starvation is not the miss class** (from the 2026-09-02 sibling run;
@@ -514,9 +533,17 @@ MemCog, Zep, Hindsight, ByteRover and Supermemory are LLM-judged answer
 accuracy, a different quantity that moves with the reader and judge model.
 gbrain's own judged answer-accuracy lane (`--judge`, "Judged answer accuracy"
 below) uses the official prompts and judge model with full protocol
-disclosure; its first number is 86.6% (433/500, v0.48.4.0, default Sonnet
-reader, gpt-4o judge — see "Judged answer accuracy" below), and it carries no
-SOTA claim because those competitor numbers are protocol-unmatched. Full report,
+disclosure. Its current number is **468/500 (93.6%)** with a Sonnet 5.5
+benchmark notes reader on the release retrieval at gbrain `c5fb0201`
+(v0.60.95.0, official gpt-4o judge), and Opus 5.5 answers 474/500 on the
+frozen 2026-09-29 retrieval (`a7cb37b`). Both use gbrain's benchmark reader,
+not production `think`. The lane's first number, 86.6% (433/500, v0.48.4.0),
+is invalid: its reader saw `answer_` session ids that mark the evidence (432/500
+with the leak removed). No SOTA claim either way, because other systems'
+numbers are protocol-unmatched. Reports:
+[current pin](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-07-longmemeval-w10a-current-pin.md),
+[frontier readers](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-07-longmemeval-w10b-reader-replay.md),
+[correction](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-29-longmemeval-opaque-qa.md). Full report,
 comparison table, and receipts:
 [gbrain-evals `docs/benchmarks/2026-05-07-longmemeval-s.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md).
 
@@ -563,6 +590,24 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
   --mode balanced --reranker on --autocut off \
   --output ~/lme-receipts/default.ndjson
 
+# Through the real operation instead of the core library: --via-operation query|search
+# runs each question as an agent's stdio MCP call would (remote, stdio, source
+# `default`), at the operation's own default limit and under the brain's resolved
+# search mode, so a receipt reproduces from a tagged gbrain. `query` expands by the
+# mode (off by default in all three modes) unless --op-expand on|off says otherwise. Each row's
+# `via_operation` records the context, the `expand` sent, model calls per
+# touchpoint, latency, the CRAG grade and the expansion outcome;
+# run_config.via_operation_summary has the tree, p50/p95 latency and model calls
+# per query. A run that expects expansion fails (exit 1) when any question did
+# not expand (`expansion_not_applied`); --expansion, --keyword-only and
+# --capture-pool are refused with it. The operation applies the remote page cap
+# (search.remote_page_cap, default 3), so recall past 3 pages is not comparable with
+# receipts from before it; set the cap to 0 to measure the uncapped list.
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  --retrieval-only --top-k 5 --by-type --no-trajectory \
+  --mode balanced --reranker on --via-operation query --op-expand off \
+  --output ~/lme-receipts/query-balanced-noexpand.ndjson
+
 # Embeddings are cached content-addressed at ~/.cache/gbrain-eval/longmemeval-embed.sqlite
 # (--embed-cache FILE to relocate, --no-embed-cache to disable), so every arm after
 # the first sees byte-identical vectors; run_config.cache.misses must be 0 for a
@@ -587,6 +632,22 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
 
 # The hypotheses in that file also score under LongMemEval's own evaluate_qa.py
 # (not bundled): python evaluate_qa.py ~/lme-receipts/judged.ndjson
+```
+
+### Pricing a run before it starts (`--call-plan`)
+
+`--call-plan FILE` writes gstack's eval call plan (wire format GSTACK_EVAL_CALLS v1)
+for the exact run the other flags describe and exits 0, with no provider call and
+no brain: one line per active lane (model, calls, input and output tokens, the
+per-call output cap), the gate command, the commit, and the preconditions the
+numbers rest on. `gstack-eval-plan price-gate` prices it. Counts are exact for the
+claim extractor and synopsis lanes and upper bounds elsewhere (reader context =
+the K largest sessions of each haystack); caches and retries are not subtracted.
+Lanes it cannot bound (`--decide*`, `--via-operation`) refuse.
+
+```bash
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  --mode tokenmax --judge --call-plan ~/lme-receipts/tokenmax-judge.calls
 ```
 
 ### Judged answer accuracy (`--judge`)
@@ -620,11 +681,24 @@ verdict is unaffected. Gold and hypothesis sit inside a data-boundary wrapper
 (disclosed deviation). Every row carries the provider-reported reader and
 judge snapshot ids and the reader prompt sha.
 
-**Result (2026-09-06, v0.48.4.0, 500/500 judged, 0 judge errors, `complete: true`):**
+**Current result (2026-10-06, gbrain `c5fb0201` / v0.60.95.0, measured in gbrain-evals):**
+468/500 (93.6%, exact 95% interval 91.1–95.6%) under the official judge with a
+`claude-sonnet-5-5` benchmark notes reader (3,500 output tokens, low effort),
+opaque session ids, release retrieval. Opus 5.5 on the frozen 2026-09-29
+retrieval: 474/500; GPT-6.1 Sol: 464/500. Benchmark reader, not production
+`think`. Details and per-question receipts:
+[W10a](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-07-longmemeval-w10a-current-pin.md),
+[W10b](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-10-07-longmemeval-w10b-reader-replay.md).
+
+**Invalid first result, kept for the record (2026-09-06, v0.48.4.0, 500/500 judged, 0 judge errors, `complete: true`).**
+The reader saw `answer_` session ids that mark the evidence; with opaque ids
+the same configuration scores 432/500
+([correction](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-29-longmemeval-opaque-qa.md)).
+Do not cite this table as gbrain's answer accuracy:
 
 | Slice | Correct | Accuracy |
 |---|---|---|
-| **All 500 (headline)** | **433/500** | **86.6%** (95% CI 83.6–89.6, question-sampling only) |
+| All 500 (invalid) | 433/500 | 86.6% (95% CI 83.6–89.6, question-sampling only) |
 | Non-abstention 470 | 404/470 | 86.0% |
 | Abstention 30 | 29/30 | 96.7% |
 | single-session-assistant | 56/56 | 100.0% |
@@ -733,7 +807,24 @@ reader pins and the judge pins all land on one receipt.
   `--yes` (exit 2); at run time the lane soft-stops at the cap and stamps the
   remaining rows `judge_skipped: "budget"`. An unpriced judge model requires
   `--max-usd off`. Reader spend is not metered here — wrap a paid receipt in
-  `scripts/eval-spend-guard.sh`.
+  `scripts/eval-spend-guard.sh`. The guard runs the command in its own
+  process group and stops the whole group (helpers and grandchildren
+  included) on interruption, after the kill grace, and when the command
+  exits leaving processes behind. A process group cannot read the terminal,
+  so a terminal stdin is replaced with EOF and the guard prints a notice;
+  pipe or redirect input if the command needs any (piped and file stdin pass
+  through). No eval entrypoint reads stdin; a TTY-only Ctrl-C grace window
+  (such as `eval suspected-contradictions`' cost notice) proceeds as it does
+  off a terminal, and Ctrl-C reaches the guard, which stops the run. While
+  the command runs, the guard keeps a lease in `<ledger>.leases/`. If a
+  guard is SIGKILLed and its process group may still be running, the next
+  guard on that host reports it on stderr with the lease path, the pgid and
+  the commands to inspect (`ps -o pid,pgid,cmd -g <pgid>`) and stop it
+  (`kill -TERM -- -<pgid>`), and records a cost-0 `status: "unknown"`
+  ledger row, once. It stops nothing itself, and that run's reservation
+  stays counted at the estimate. The lease is kept as `<lease>.reported`
+  and retired by a later guard once the group has exited (or by
+  `rm <lease>.reported`).
 
 Row fields with `--judge`: exactly one of `judge_correct` / `judge_error`
 (+ `judge_error_detail`) / `judge_skipped`, plus `judge_model`,
@@ -1207,7 +1298,11 @@ bun test test/nightly-quality-probe.test.ts
 score for your brain. It answers the 10 committed questions in
 `test/fixtures/longmemeval-nightly.jsonl` from an isolated in-memory
 benchmark brain, with your search mode, reranker and model routes, and has
-three judges grade the answers. A PASS says the retrieval-plus-answer
+three judges grade the answers. It uses the direct reader (`--reader-mode
+direct`, the original terse prompt and 512-token budget), because the judges
+grade directness and the default notes reader's notes and reasoning would be
+graded as the answer (#6627). Standalone `gbrain eval longmemeval` runs keep
+the notes default. A PASS says the retrieval-plus-answer
 pipeline and the judges work end to end tonight; it says nothing about the
 pages in your own brain. The fixture is embedded in the gbrain binary, so
 source checkouts and compiled installs run the same probe.

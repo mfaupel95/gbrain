@@ -237,6 +237,19 @@ describe('WaiterOnlyConsumer mode machine', () => {
     expect(forced.consumer.mode).toBe('full');
     await forced.consumer.stop();
   });
+  test('#6543: a forced consumer logs two_consumers_on_host once when a live serve of this host consumes beside it, and nothing when none does', async () => {
+    forceOwnConsumer('opted_out');
+    const beside = harness({ kind: 'sync', rows: () => [row({ kind: 'serve', pid: 4242 })] });
+    beside.consumer.start();
+    await beside.consumer.stop();
+    expect(beside.consumer.mode).toBe('full');
+    expect(beside.logs.filter(line => line.includes('reason=two_consumers_on_host'))).toEqual([
+      'phase=consumer_probe reason=two_consumers_on_host message="this sync process consumes beside serve pid 4242 on this host (forced:opted_out); both claim writes until one exits"']);
+    const alone = harness({ kind: 'sync', rows: () => [row({ kind: 'serve', renewed_age_ms: CONSUMER_LAPSED_MS + 1 }), row({ kind: 'jobs', pid: 7 })] });
+    alone.consumer.start();
+    await alone.consumer.stop();
+    expect(alone.logs.filter(line => line.includes('two_consumers_on_host'))).toEqual([]);
+  });
   test('promote() turns a waiter into a full consumer in place', async () => {
     const h = harness({ rows: () => [row()] });
     h.consumer.start();

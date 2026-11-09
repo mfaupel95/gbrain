@@ -4,12 +4,15 @@ import { fileURLToPath } from 'node:url';
 import { OperationError } from '../ops/contract.ts';
 import { isRelativeFileUri, resolveSourceLocalFilePath, sourceGitScope } from '../markdown.ts';
 import { screeningPath } from '../persistence/screening-paths.ts';
-import { localHostId } from '../persistence/identity.ts';
+import { hostIdFor } from '../persistence/identity.ts';
 import type { SqlEngine, WriteRequest } from '../persistence/model.ts';
 import { canonicalFilesystemPath } from '../persistence/root-registry.ts';
 
-export type KnowledgePublicationTarget = Pick<WriteRequest, 'source_id' | 'source_incarnation' | 'slug' | 'target_kind'>;
-export interface KnowledgePublicationFile { path: string; root: string; }
+export type KnowledgePublicationTarget = Pick<WriteRequest, 'source_id' | 'source_incarnation' | 'slug' | 'target_kind'> & Partial<Pick<WriteRequest, 'intent' | 'operation'>>;
+export interface KnowledgePublicationFile { path: string; root: string; expectedBeforeHash?: string | null }
+
+/** The maintenance intent that soft-deletes an approved ghost page (`gbrain repair ghost-pages`, `file-drift --prefer file`). */
+export const GHOST_RETIREMENT_INTENT = 'managed_maintenance_retire_ghost_page';
 
 interface PackRoot {
   source_id: string;
@@ -27,6 +30,45 @@ function reserved(path: string): boolean {
 function reject(): never {
   throw new OperationError('skill_bundle_required', 'Knowledge writes cannot change the canonical shared skillpack.',
     'Use put_skill with the catalog expected_revision and complete approved file bundle; an existing pack requires host-authorized adoptSharedSkillpack adoption. Imported skill text remains knowledge data, not published instructions.');
+}
+
+/**
+ * #6910: whether a source-relative path is a member of the source's adopted shared skillpack: `skillpack.json`, a file of a
+ * live skill's current revision, or a path under a live skill's `skills/<name>/` directory.
+ */
+export async function sharedPackMember(engine: SqlEngine, sourceId: string, sourceIncarnation: string, paths: string[]): Promise<boolean> {
+  const normalized = paths.map(path => path.split(sep).join('/'));
+  if (normalized.some(path => path.toLowerCase() === 'skillpack.json')) return true;
+  const [row] = await engine.executeRaw<{ member: boolean }>(`SELECT EXISTS (SELECT 1 FROM shared_skill_heads h
+      JOIN shared_skill_revisions r ON r.source_id=h.source_id AND r.source_incarnation=h.source_incarnation AND r.pack_id=h.pack_id AND r.name=h.name AND r.revision=h.revision
+      WHERE h.source_id=$1 AND h.source_incarnation=$2::uuid AND NOT h.deleted AND (
+        EXISTS (SELECT 1 FROM jsonb_array_elements(r.files) f WHERE f->>'path' = ANY($3::text[]))
+        OR EXISTS (SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(p, 'skills/' || h.name || '/')))) AS member`, [sourceId, sourceIncarnation, normalized]);
+  return row?.member === true;
+}
+
+/**
+ * #6910: the retirement of an approved ghost page that is not a pack member changes no pack file: its file is already gone and
+ * the prepared target expects no bytes (filesystem publication refuses a file that appears), so it is a database-only soft
+ * delete of a legacy knowledge page. A pack member's page stays refused.
+ */
+async function retiresNonMemberGhost(engine: SqlEngine, row: KnowledgePublicationTarget, preparedFile?: KnowledgePublicationFile): Promise<boolean> {
+  const ghost = row.intent?.kind === GHOST_RETIREMENT_INTENT ? row.intent.ghost as { path?: unknown } | undefined : undefined;
+  if (typeof ghost?.path !== 'string' || (preparedFile && preparedFile.expectedBeforeHash !== null)) return false;
+  return !(await sharedPackMember(engine, row.source_id, row.source_incarnation, [ghost.path, `${row.slug}.md`]));
+}
+
+/**
+ * #7345: the retention purge of an expired tombstone that is not a pack member and expects no file bytes is a database-only
+ * hard delete of a legacy knowledge page, as #6910's ghost retirement is a database-only soft delete. A pack member's
+ * tombstone, or one whose file is still on disk (the purge would remove it), stays refused.
+ */
+async function purgesNonMemberTombstone(engine: SqlEngine, row: KnowledgePublicationTarget, preparedFile?: KnowledgePublicationFile): Promise<boolean> {
+  if (row.operation !== 'delete_page' || row.intent?.purge !== true || row.intent.retention !== true || (preparedFile && preparedFile.expectedBeforeHash !== null)) return false;
+  const [tombstone] = await engine.executeRaw<{ source_path: string | null }>(
+    'SELECT source_path FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NOT NULL', [row.source_id, row.slug]);
+  if (!tombstone) return false;
+  return !(await sharedPackMember(engine, row.source_id, row.source_incarnation, [...(tombstone.source_path ? [tombstone.source_path] : []), `${row.slug}.md`]));
 }
 
 const packsInTransaction = new WeakMap<object, Promise<PackRoot[]>>();
@@ -50,7 +92,7 @@ function sharedPacks(engine: SqlEngine): Promise<PackRoot[]> {
       h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
       JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation
       LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation
-      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [localHostId()]);
+      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [hostIdFor(engine)]);
   };
   if ((engine as { _pageTransaction?: boolean })._pageTransaction !== true) return read();
   let cached = packsInTransaction.get(engine);
@@ -69,6 +111,7 @@ export async function assertKnowledgePublicationAllowed(
   if (row.target_kind === 'skill_bundle') return;
   const packs = await sharedPacks(engine);
   if (!packs.length) return;
+  if (await retiresNonMemberGhost(engine, row, preparedFile) || await purgesNonMemberTombstone(engine, row, preparedFile)) return;
   const ownPack = packs.find(pack => pack.source_id === row.source_id && pack.source_incarnation === row.source_incarnation);
   if (ownPack && reserved(row.slug)) reject();
   const roots = [...new Set(packs.flatMap(pack => [

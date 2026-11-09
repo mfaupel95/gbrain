@@ -15,7 +15,7 @@ import { importFromContent } from '../src/core/import-file.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
-import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { prepareConnectorMutation } from '../src/core/persistence/connector-sync.ts';
@@ -23,7 +23,7 @@ import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { claimNextWrite } from '../src/core/persistence/journal.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
-import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, sourceCheckpoint, connectorPendingSet } from './helpers/connector-fixture.ts';
+import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, sourceCheckpoint, connectorPendingSet, withPausedOwnerBudget } from './helpers/connector-fixture.ts';
 
 const { home, engines, env, source, boundSource, setup, teardown } = createConnectorFixture();
 beforeAll(setup, 120_000);
@@ -77,14 +77,16 @@ test('public GitHub sync imports real pages without a Git cursor or filesystem p
   }
 }), 120_000);
 
-test('Google pagination failure never advances a checkpoint; tombstones delete only the selected source', async () => withEnv(env, async () => {
+test('Google pagination failure keeps the landed page and resumes at the failed one, never advancing the sync cursor; tombstones delete only the selected source', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await source(engine, googleConfig);
     let fail = true;
     let deleted = false;
+    const listed: (string | null)[] = [];
     const fetcher = async (url: string) => {
       if (url.includes('/settings/sendAs')) return json({ sendAs: [] });
       const u = new URL(url);
+      if (!u.searchParams.has('syncToken') && u.pathname.endsWith('/connections')) listed.push(u.searchParams.get('pageToken'));
       if (u.searchParams.has('syncToken')) return json({ connections: deleted ? [{ resourceName: 'people/first', metadata: { deleted: true } }] : [], nextSyncToken: 'contacts-next' });
       if (!u.searchParams.has('pageToken')) return json({ connections: [contact('first', 'First Example')], nextPageToken: 'second' });
       if (fail) return json({ error: { message: 'fixture pagination failure' } }, 400);
@@ -92,10 +94,14 @@ test('Google pagination failure never advances a checkpoint; tombstones delete o
     };
     const cfg = parseGoogleSourceConfig(googleConfig, f.dir);
     expect((await runGoogleSync(engine, f.id, cfg, options, withGoogleAccount(fetcher))).status).toBe('partial');
-    expect(await sourceCheckpoint(engine, f.id)).toHaveLength(0);
-    expect(await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1', [f.id])).toHaveLength(0);
+    // #8906: the page that landed stays, and the re-list resumes at the page that failed.
+    expect(await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1', [f.id])).toEqual([{ slug: 'people/first-example' }]);
+    expect(cursorOf(await sourceCheckpoint(engine, f.id)).flat().map(({ state }) => state?.contacts_sync_token ?? null)).toEqual([null]);
     fail = false;
-    expect((await runGoogleSync(engine, f.id, cfg, options, withGoogleAccount(fetcher))).added).toBe(2);
+    listed.length = 0;
+    expect((await runGoogleSync(engine, f.id, cfg, options, withGoogleAccount(fetcher))).added).toBe(1);
+    expect(listed).toEqual(['second']);
+    expect((await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE source_id=$1 ORDER BY slug', [f.id])).map((r) => r.slug)).toEqual(['people/first-example', 'people/second-example']);
     const other = await source(engine, googleConfig);
     expect((await runGoogleSync(engine, other.id, parseGoogleSourceConfig(googleConfig, other.dir), options, withGoogleAccount(fetcher))).added).toBe(2);
     deleted = true;
@@ -260,9 +266,9 @@ test('paused connector owner returns one stable receipt and resident restart con
     const cfg = parseGitHubSourceConfig(githubConfig, f.dir);
     const run = () => runGitHubSync(engine, f.id, cfg, options, githubFetch());
     // #5600: an accepted pending write is progress; the run ends partial with the receipt in its pending set.
-    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => run())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [pending] = await connectorPendingSet(engine, f.id);
-    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => run())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     expect((await connectorPendingSet(engine, f.id)).map(entry => entry.requestId)).toEqual([pending.requestId]);
     const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1', [f.id]);
     expect(rows).toHaveLength(1);
@@ -388,7 +394,7 @@ test('a file edit after bound connector admission survives resident replay and p
     const checkpoint = await sourceCheckpoint(engine, f.id);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
     body = 'New API body';
-    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => run())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [accepted] = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND state='queued' ORDER BY sequence LIMIT 1", [f.id]);
     await disposePersistenceConsumer(engine);
     const path = join(f.dir, 'gh/acme-example/app/1.md');
@@ -441,7 +447,7 @@ test('resident publication revalidates accepted connector revisions, incarnation
     const binding = await claimWorktree(engine, f.id, f.dir);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding.worktree_id]);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-    expect(await runGitHubSync(engine, f.id, parseGitHubSourceConfig(githubConfig, f.dir), options, githubFetch())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => runGitHubSync(engine, f.id, parseGitHubSourceConfig(githubConfig, f.dir), options, githubFetch()))).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [accepted] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1', [f.id]);
     await disposePersistenceConsumer(engine);
     const [writer] = await engine.executeRaw<{ grant_ceiling: unknown }>('SELECT grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid', [accepted.principal_id]);
@@ -517,10 +523,16 @@ test('a fact withdrawn between bound connector preparation and publication leave
     await run();
     await disposePersistenceConsumer(engine);
     const slug = 'gh/acme-example/app/1', path = join(f.dir, `${slug}.md`);
-    const original = readFileSync(path, 'utf8'), before = (await engine.readPageSnapshot(slug, { sourceId: f.id }))!;
+    // GBRA-221: a provider body can no longer bring a live fence (renders neutralize it), so the claim reaches the
+    // prepared import the way brain-added facts do: a stored fence the connector carries into the re-render.
+    expect(await writeSingleFact(engine, f.id, { fact: claim, kind: 'fact', entity: slug, visibility: 'world', provenance: 'test evidence', remote: false }))
+      .toMatchObject({ status: 'inserted' });
+    await disposePersistenceConsumer(engine);
+    expect(readFileSync(path, 'utf8')).toContain(claim);
+    const original = readFileSync(path, 'utf8');
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
-    body = `Facts: ${renderFactsTable([{ rowNum: 1, claim, kind: 'fact', confidence: 1, visibility: 'world', notability: 'medium', active: true, context: 'test evidence' }])}`;
-    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    body = 'Updated bound body';
+    expect(await withPausedOwnerBudget(() => run())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     await disposePersistenceConsumer(engine);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='active' WHERE id=$1::uuid", [f.binding.worktree_id]);
     const claimed = (await claimNextWrite(engine, localHostId()))!;
@@ -531,6 +543,7 @@ test('a fact withdrawn between bound connector preparation and publication leave
       tx.insertFact({ fact: claim, source: 'remember', visibility: 'world' }, { source_id: f.id }), TEST_WRITE_ATTRIBUTION));
     await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => recordFactWithdrawal(tx, fact.id, f.id, true), TEST_WRITE_ATTRIBUTION));
     const boundaries: string[] = [];
+    const before = (await engine.readPageSnapshot(slug, { sourceId: f.id }))!;
     const outcome = await publishMutation(engine, claimed, prepared, localHostId(), {
       boundary: async name => { boundaries.push(name); }, fileBoundary: name => { boundaries.push(name); } });
     expect(outcome).toMatchObject({ state: 'conflict', error_code: 'revision_conflict' });

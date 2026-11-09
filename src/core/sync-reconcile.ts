@@ -3,9 +3,10 @@
  * gate) + sync deadline/stall resolution (#1633, #1950). Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { execFileSync } from 'child_process';
+import { execFileSync } from './spawn.ts';
 import { parseDurationSeconds } from './sync-concurrency.ts';
 import { resolveStallAbortSecondsFromEnv } from './stall-env.ts';
+import { gitChildEnv } from './git-env.ts';
 
 /**
  * #2828 full-sync reconcile safety-valve thresholds. A reconcile that would
@@ -15,6 +16,87 @@ import { resolveStallAbortSecondsFromEnv } from './stall-env.ts';
  */
 export const MASS_RECONCILE_RATIO = 0.5;
 export const MASS_RECONCILE_MIN_PAGES = 20;
+
+/**
+ * #7130: absolute caps on what one sync run deletes (a managed pass, a classic full reconcile, a working-tree sync), on
+ * top of the 50% valve, which a large source never trips (19,325 deletes were 4% of a 478k-page source). A run over
+ * either cap withholds its deletes like the valve does.
+ * `sync.max_deletes` (default 500) is a count; `sync.max_delete_ratio` (default 0.01) a share of the source's file-backed
+ * pages, applied only to a pass deleting more than `SYNC_DELETE_RATIO_FLOOR` pages so that a small brain's ordinary
+ * deletion of a folder is not withheld. A source overrides either with `sync.max_deletes.source.<id>` /
+ * `sync.max_delete_ratio.source.<id>`.
+ */
+export const DEFAULT_SYNC_MAX_DELETES = 500;
+export const DEFAULT_SYNC_MAX_DELETE_RATIO = 0.01;
+export const SYNC_DELETE_RATIO_FLOOR = 50;
+export const SYNC_MAX_DELETES_KEY = 'sync.max_deletes';
+export const SYNC_MAX_DELETE_RATIO_KEY = 'sync.max_delete_ratio';
+
+export interface SyncDeleteCaps { maxDeletes: number; maxDeleteRatio: number }
+/** Which limit a pass's deletes went over: the #2828 valve (`mass_ratio`), or a #7130 cap. */
+export type SyncDeleteTrip = 'mass_ratio' | 'max_deletes' | 'max_delete_ratio';
+
+/** A stored cap value, or null when it is unset or not a valid value (the default then applies). */
+export function parseSyncDeleteCap(key: typeof SYNC_MAX_DELETES_KEY | typeof SYNC_MAX_DELETE_RATIO_KEY, raw: string | null | undefined): number | null {
+  const text = raw?.trim();
+  if (!text) return null;
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < 0) return null;
+  if (key === SYNC_MAX_DELETES_KEY) return Number.isInteger(value) ? value : null;
+  return value <= 1 ? value : null;
+}
+
+/** `gbrain config set`'s refusal of an invalid #7130 delete-safety value (null: valid). */
+export function deleteSafetyConfigRefusal(key: string, value: string): string | null {
+  if (key === 'purge.retention_hours') return parsePurgeRetentionHours(value) === null ? `purge.retention_hours must be a whole number of hours, at least ${MIN_PURGE_RETENTION_HOURS}; nothing was written.` : null;
+  if (key.startsWith('sync.apply_held_deletions')) return ['true', 'false'].includes(value.trim().toLowerCase()) ? null : `${key} must be true or false; nothing was written.`;
+  const base = key.startsWith(SYNC_MAX_DELETES_KEY + '.') || key === SYNC_MAX_DELETES_KEY ? SYNC_MAX_DELETES_KEY : SYNC_MAX_DELETE_RATIO_KEY;
+  if (parseSyncDeleteCap(base, value) !== null) return null;
+  return base === SYNC_MAX_DELETES_KEY ? `${key} must be a whole number of pages, 0 or more; nothing was written.` : `${key} must be a number from 0 to 1 (a share of the source's file-backed pages); nothing was written.`;
+}
+
+/**
+ * #7130: how long a soft-deleted page waits before the autopilot purge phase may purge it (`purge.retention_hours`,
+ * default 72). The setting only lengthens the window: every soft delete promises a 72-hour restore (the 'restore_72h'
+ * undo of an automatic repair, the recovery window sync deletes document), so no value below 72 is accepted. The manual
+ * `gbrain pages purge-deleted` takes its own `--older-than`, under consent.
+ */
+export const DEFAULT_PURGE_RETENTION_HOURS = 72;
+export const MIN_PURGE_RETENTION_HOURS = 72;
+export function parsePurgeRetentionHours(raw: string | null | undefined): number | null {
+  const text = raw?.trim();
+  if (!text) return null;
+  const value = Number(text);
+  return Number.isInteger(value) && value >= MIN_PURGE_RETENTION_HOURS ? value : null;
+}
+export async function readPurgeRetentionHours(engine: { getConfig(key: string): Promise<string | null> }): Promise<number> {
+  return parsePurgeRetentionHours(await engine.getConfig('purge.retention_hours')) ?? DEFAULT_PURGE_RETENTION_HOURS;
+}
+
+/** The caps in effect for `sourceId`: its own key, else the brain's, else the default. */
+export async function readSyncDeleteCaps(engine: { getConfig(key: string): Promise<string | null> }, sourceId: string): Promise<SyncDeleteCaps> {
+  const maxDeletes = parseSyncDeleteCap(SYNC_MAX_DELETES_KEY, await engine.getConfig(`sync.max_deletes.source.${sourceId}`))
+    ?? parseSyncDeleteCap(SYNC_MAX_DELETES_KEY, await engine.getConfig(SYNC_MAX_DELETES_KEY)) ?? DEFAULT_SYNC_MAX_DELETES;
+  const maxDeleteRatio = parseSyncDeleteCap(SYNC_MAX_DELETE_RATIO_KEY, await engine.getConfig(`sync.max_delete_ratio.source.${sourceId}`))
+    ?? parseSyncDeleteCap(SYNC_MAX_DELETE_RATIO_KEY, await engine.getConfig(SYNC_MAX_DELETE_RATIO_KEY)) ?? DEFAULT_SYNC_MAX_DELETE_RATIO;
+  return { maxDeletes, maxDeleteRatio };
+}
+
+/** The limit `deletes` deletions out of `reconcilable` file-backed pages go over, or null. */
+export function syncDeleteTrip(deletes: number, reconcilable: number, caps: SyncDeleteCaps): SyncDeleteTrip | null {
+  if (deletes <= 0) return null;
+  if (reconcilable > MASS_RECONCILE_MIN_PAGES && deletes > reconcilable * MASS_RECONCILE_RATIO) return 'mass_ratio';
+  if (deletes > caps.maxDeletes) return 'max_deletes';
+  if (deletes > SYNC_DELETE_RATIO_FLOOR && deletes > reconcilable * caps.maxDeleteRatio) return 'max_delete_ratio';
+  return null;
+}
+
+/** What a trip means, in the words status and the dry run use. */
+export function syncDeleteTripText(trip: SyncDeleteTrip, caps: SyncDeleteCaps): string {
+  if (trip === 'mass_ratio') return `more than ${Math.round(MASS_RECONCILE_RATIO * 100)}% of its file-backed pages`;
+  if (trip === 'max_deletes') return `more than sync.max_deletes (${caps.maxDeletes}) pages`;
+  return `more than sync.max_delete_ratio (${caps.maxDeleteRatio}) of its file-backed pages`;
+}
 
 /**
  * Normalize path separators so a page whose stored `source_path` was written
@@ -88,7 +170,7 @@ export function listEverCommittedPaths(repoPath: string): Set<string> | null {
       'git',
       ['-C', repoPath, '-c', 'core.quotepath=off', 'log', '--all', '--no-renames',
         '--diff-filter=A', '--format=', '--name-only'],
-      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+      { env: gitChildEnv(), encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
     );
   } catch {
     return null;
@@ -214,12 +296,12 @@ export function resolveSyncHardDeadline(
  * and the stderr line announcing it.
  */
 export function syncWatchdogPlan(args: string[], res: HardDeadlineResolution): {
-  watchdog: { deadlineMs: number; graceMs: number; label: string; heartbeatMs: number; progressWindowMs?: number; stopNotice: string };
+  watchdog: { deadlineMs: number; graceMs: number; label: string; heartbeatMs: number; progressWindowMs?: number; stopNotice: string; progressSignal: 'committed'; stallNotice: string };
   armedLine: string;
 } {
   return {
     watchdog: { deadlineMs: res.deadlineMs, graceMs: res.graceMs, label: 'sync-watchdog', heartbeatMs: 60_000,
-      progressWindowMs: res.progressWindowMs, stopNotice: syncDeadlineStopNotice(args, res) },
+      progressWindowMs: res.progressWindowMs, stopNotice: syncDeadlineStopNotice(args, res), progressSignal: 'committed', stallNotice: syncDeadlineStallNotice(args, res) },
     armedLine: `[sync-watchdog] hard deadline armed: ${Math.round(res.deadlineMs / 1000)}s + ${Math.round(res.graceMs / 1000)}s grace (${res.reason})` +
       (res.progressWindowMs ? `; extends while the sync keeps progressing (stops after ${Math.round(res.progressWindowMs / 1000)}s without progress)` : '') +
       '; disable with --no-hard-deadline\n',
@@ -268,6 +350,30 @@ export function syncDeadlineStopNotice(args: string[], res: HardDeadlineResoluti
       progress_window_seconds: windowSec, cause, resume_command: resume, fix });
   }
   return `gbrain sync stopped (code=sync_deadline_stop): ${cause}. ${fix}`;
+}
+
+/**
+ * GBRA-133 PR 3a: the stdout notice the sync watchdog prints when a progress-aware deadline passes and the run committed
+ * nothing (no page written, deleted or renamed, no cursor advanced; screening unchanged files and legacy-sweep slices do
+ * not count). The run is a stall, not progress: `code`, `why` and an agent-operator `fix` (read-only sync status, which
+ * names what the run is stuck on) instead of the resume line, since rerunning the same way commits nothing again.
+ */
+export function syncDeadlineStallNotice(args: string[], res: HardDeadlineResolution): string {
+  const deadlineSec = Math.round(res.deadlineMs / 1000);
+  const source = args.find((_, i) => args[i - 1] === '--source');
+  const status = ['gbrain', 'sync', 'status', ...(source ? ['--source', source] : []), '--json'];
+  const resume = syncResumeCommand(args);
+  const message = `The ${deadlineSec}s sync deadline (${res.reason}) passed and the run committed nothing.`;
+  const why = 'No page was written, deleted or renamed and no sync cursor advanced before the deadline (screening unchanged files and legacy-sweep slices '
+    + 'are not progress), so the run stopped as a stall instead of extending. Rerunning the same way is unlikely to commit either; sync status names what '
+    + `the source is stuck on (read-only). Fix what it names, then rerun: ${resume}`;
+  const fix = { next: 'run', argv: status, command: status.join(' '), actor: 'agent', consent: [], requires_exclusive: false,
+    why: 'Read-only: the source\'s state, holds, last error and the next step.', verify: { argv: status } };
+  if (args.includes('--json')) {
+    return JSON.stringify({ status: 'stalled', code: 'sync_deadline_stalled', message, why, reason: res.reason, deadline_seconds: deadlineSec, committed: 0,
+      resume_command: resume, docs: 'docs/guides/error-codes.md#sync_deadline_stalled', fix });
+  }
+  return `gbrain sync stopped (code=sync_deadline_stalled): ${message} ${why} Fix: ${fix.command}`;
 }
 
 /**
